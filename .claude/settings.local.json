@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pandoc \"/Users/beauxtaylor/Downloads/3:21:26 constitution.docx\" -o /tmp/constitution_output.md)",
+      "Bash(pandoc \"/Users/beauxtaylor/Documents/The Constitution/1 - The Constitution.docx\" -o /tmp/old_constitution.md)"
+    ]
+  }
+}

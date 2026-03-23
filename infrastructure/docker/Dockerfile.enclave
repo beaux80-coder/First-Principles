@@ -1,0 +1,72 @@
+# Enclave image for F1 Clinical Quality Engine (Nitro Enclave EIF)
+#
+# Constitution: "Runs inside a cryptographically isolated Trusted Execution
+# Environment (TEE) with remote attestation, ensuring zero logical pathway
+# to any system containing financial data."
+#
+# This image contains ONLY clinical modules. Zero financial modules are
+# packaged. The resulting EIF (Enclave Image File) is measured by the
+# Nitro Security Module, and its PCR values are included in the attestation
+# document that any external party can verify.
+#
+# Build: docker build -f infrastructure/docker/Dockerfile.enclave -t beneflex-enclave .
+# Convert to EIF: nitro-cli build-enclave --docker-uri beneflex-enclave --output-file enclave.eif
+
+FROM python:3.11-slim AS enclave
+
+WORKDIR /app
+
+# Install only clinical dependencies (no stripe, no boto3 for payment, etc.)
+RUN pip install --no-cache-dir \
+    sqlalchemy>=2.0.25 \
+    cryptography>=42.0 \
+    scikit-learn>=1.3.0 \
+    onnxruntime>=1.16.0 \
+    tokenizers>=0.15.0 \
+    httpx>=0.26.0
+
+# Copy ONLY clinical engine code — zero financial modules
+COPY app/__init__.py app/__init__.py
+COPY app/compat.py app/compat.py
+COPY app/database.py app/database.py
+COPY app/encryption.py app/encryption.py
+
+# Clinical engine (F1)
+COPY app/services/__init__.py app/services/__init__.py
+COPY app/services/clinical_engine.py app/services/clinical_engine.py
+COPY app/services/clinical_nlp.py app/services/clinical_nlp.py
+COPY app/services/clinical_guidelines_ingester.py app/services/clinical_guidelines_ingester.py
+
+# TEE infrastructure
+COPY app/tee/ app/tee/
+
+# Clinical models ONLY
+COPY app/models/__init__.py app/models/__init__.py
+COPY app/models/clinical_determination.py app/models/clinical_determination.py
+COPY app/models/clinical_guideline.py app/models/clinical_guideline.py
+
+# ONNX model for clinical NLP (if available)
+# COPY models/clinical_bert_quantized.onnx models/clinical_bert_quantized.onnx
+
+# === VERIFICATION ===
+# These files must NOT be in the image. If any exist, the build is invalid.
+# Financial modules are explicitly excluded:
+# - app/services/benchmark.py (pricing)
+# - app/services/price_discovery.py (pricing)
+# - app/models/price_data.py (financial)
+# - app/models/price_comparison.py (financial)
+# - app/models/employer.py (financial: baseline_cost_pepm)
+# - app/models/claim.py (financial: amount_billed, amount_paid)
+
+# Verify no financial modules are present
+RUN python -c "\
+import os; \
+forbidden = ['benchmark.py', 'price_discovery.py', 'price_data.py', \
+             'price_comparison.py', 'employer.py', 'claim.py', 'payment.py']; \
+found = []; \
+[found.append(f) for f in forbidden \
+ if os.path.exists(f'app/services/{f}') or os.path.exists(f'app/models/{f}')]; \
+assert not found, f'ENCLAVE IMAGE COMPROMISED: financial modules found: {found}'; \
+print('Enclave image verified: zero financial modules present')"
+
+ENTRYPOINT ["python", "-m", "app.tee.enclave_server"]
