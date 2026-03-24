@@ -2029,10 +2029,16 @@ def _ingest_providers_batch(
     batch: list[dict],
     existing_npis: set[str],
 ) -> int:
-    """Insert a batch of provider dicts, skipping duplicates by NPI."""
-    from app.models.provider import Provider, ProviderType
+    """Insert a batch of provider dicts, skipping duplicates by NPI.
 
-    new_providers = []
+    Uses INSERT OR IGNORE via raw SQL for SQLite, or catches IntegrityError
+    for other backends, to handle any NPIs that slip through the in-memory
+    dedup set (e.g., NPIs appearing multiple times in the CSV).
+    """
+    from app.models.provider import Provider, ProviderType
+    import uuid as _uuid
+
+    new_records = []
     for p in batch:
         if p["npi"] in existing_npis:
             continue
@@ -2043,19 +2049,69 @@ def _ingest_providers_batch(
         except ValueError:
             pt = ProviderType.other
 
-        new_providers.append(Provider(
-            npi=p["npi"],
-            name=p["name"],
-            provider_type=pt,
-            state=p["state"],
-            specialties=p["specialties"],
-        ))
+        new_records.append({
+            "provider_id": str(_uuid.uuid4()),
+            "npi": p["npi"],
+            "name": p["name"],
+            "provider_type": pt.value,
+            "state": p["state"],
+            "specialties": json.dumps(p["specialties"]) if p["specialties"] else None,
+            "outcome_data_points": 0,
+        })
 
-    if new_providers:
-        db.bulk_save_objects(new_providers)
-        db.commit()
+    if not new_records:
+        return 0
 
-    return len(new_providers)
+    # Use INSERT OR IGNORE for SQLite to skip duplicates silently
+    from app.config import settings
+    if settings.database_url.startswith("sqlite"):
+        from sqlalchemy import text
+        insert_sql = text("""
+            INSERT OR IGNORE INTO providers
+            (provider_id, npi, name, provider_type, state, specialties, outcome_data_points)
+            VALUES (:provider_id, :npi, :name, :provider_type, :state, :specialties, :outcome_data_points)
+        """)
+        try:
+            db.execute(insert_sql, new_records)
+            db.commit()
+        except Exception:
+            db.rollback()
+            # Fall back to one-by-one
+            for rec in new_records:
+                try:
+                    db.execute(insert_sql, rec)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+    else:
+        # PostgreSQL or other — use bulk_save_objects with error handling
+        providers = []
+        for rec in new_records:
+            try:
+                pt = ProviderType(rec["provider_type"])
+            except ValueError:
+                pt = ProviderType.other
+            providers.append(Provider(
+                npi=rec["npi"],
+                name=rec["name"],
+                provider_type=pt,
+                state=rec["state"],
+                specialties=json.loads(rec["specialties"]) if rec["specialties"] else None,
+            ))
+        try:
+            db.bulk_save_objects(providers)
+            db.commit()
+        except Exception:
+            db.rollback()
+            # Fall back to one-by-one
+            for prov in providers:
+                try:
+                    db.add(prov)
+                    db.commit()
+                except Exception:
+                    db.rollback()
+
+    return len(new_records)
 
 
 def _download_nppes_bulk_csv(db: Session) -> int:
