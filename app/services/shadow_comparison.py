@@ -256,26 +256,33 @@ def get_shadow_report(db: Session, employer_id: uuid.UUID) -> dict:
     auto_count = 0
     adjudicated_count = 0
 
+    total_carrier_oop = 0.0
+
     for claim in shadow_claims:
         billed = float(claim.amount_billed)
         system_paid = float(claim.amount_paid) if claim.amount_paid is not None else billed
-        # Use billed as carrier estimate (in production, stored from carrier data)
-        carrier_est = billed
+
+        # Use stored carrier data when available (from shadow comparisons)
+        carrier_data = claim.shadow_carrier_data or {}
+        carrier_est = carrier_data.get("carrier_total_cost", billed)
+        carrier_oop = carrier_data.get("carrier_oop", 0.0)
 
         total_billed += billed
         total_system_paid += system_paid
         total_carrier_est += carrier_est
+        total_carrier_oop += carrier_oop
 
         bt = claim.benefit_type.value
         if bt not in benefit_type_agg:
             benefit_type_agg[bt] = {
                 "claims": 0, "billed": 0.0,
-                "system_paid": 0.0, "carrier_est": 0.0,
+                "system_paid": 0.0, "carrier_est": 0.0, "carrier_oop": 0.0,
             }
         benefit_type_agg[bt]["claims"] += 1
         benefit_type_agg[bt]["billed"] += billed
         benefit_type_agg[bt]["system_paid"] += system_paid
         benefit_type_agg[bt]["carrier_est"] += carrier_est
+        benefit_type_agg[bt]["carrier_oop"] += carrier_oop
 
         if claim.auto_adjudicated is True:
             auto_count += 1
@@ -284,7 +291,7 @@ def get_shadow_report(db: Session, employer_id: uuid.UUID) -> dict:
 
     # Round aggregates and compute savings per benefit type
     for agg in benefit_type_agg.values():
-        for key in ("billed", "system_paid", "carrier_est"):
+        for key in ("billed", "system_paid", "carrier_est", "carrier_oop"):
             agg[key] = round(agg[key], 2)
         agg["savings"] = round(agg["carrier_est"] - agg["system_paid"], 2)
         agg["savings_pct"] = (
@@ -292,6 +299,7 @@ def get_shadow_report(db: Session, employer_id: uuid.UUID) -> dict:
                   / agg["carrier_est"] * 100, 1)
             if agg["carrier_est"] > 0 else 0.0
         )
+        agg["oop_eliminated"] = round(agg["carrier_oop"], 2)
 
     total_savings = total_carrier_est - total_system_paid
     savings_pct = (
@@ -343,8 +351,13 @@ def get_shadow_report(db: Session, employer_id: uuid.UUID) -> dict:
         },
 
         "employee_impact": {
-            "total_oop_eliminated": round(total_billed - total_system_paid, 2),
+            "total_carrier_oop": round(total_carrier_oop, 2),
+            "total_oop_eliminated": round(total_carrier_oop, 2),
             "zero_cost_sharing": True,
+            "note": (
+                "Under beneflex, employees pay $0 out-of-pocket. Under the carrier, "
+                f"employees would have paid ${round(total_carrier_oop, 2):,.2f} total."
+            ),
         },
 
         "by_benefit_type": benefit_type_agg,
@@ -393,14 +406,18 @@ def get_shadow_confidence(db: Session, employer_id: uuid.UUID) -> dict:
             "message": "No shadow claims yet. Submit carrier claims to begin analysis.",
         }
 
-    # Compute per-claim savings
+    # Compute per-claim savings using stored carrier data
     per_claim_savings = []
+    per_claim_oop_eliminated = []
     for claim in shadow_claims:
         billed = float(claim.amount_billed)
         system_paid = float(claim.amount_paid) if claim.amount_paid is not None else billed
-        carrier_est = billed  # carrier total cost estimate
+        carrier_data = claim.shadow_carrier_data or {}
+        carrier_est = carrier_data.get("carrier_total_cost", billed)
+        carrier_oop = carrier_data.get("carrier_oop", 0.0)
         savings = carrier_est - system_paid
         per_claim_savings.append(savings)
+        per_claim_oop_eliminated.append(carrier_oop)
 
     # Statistical analysis
     mean_savings = sum(per_claim_savings) / n
