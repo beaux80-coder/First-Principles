@@ -12,6 +12,7 @@ This module measures:
 """
 
 import logging
+import time as _time
 from datetime import datetime, UTC
 from typing import Any
 
@@ -24,6 +25,10 @@ from app.models.clinical_determination import ClinicalDetermination
 
 logger = logging.getLogger(__name__)
 
+# In-memory cache for expensive pipeline metrics (10-minute TTL)
+_METRICS_CACHE: dict = {}
+_METRICS_CACHE_TTL = 600
+
 
 def measure_public_data_coverage(db: Session) -> dict[str, Any]:
     """Measure public data pipeline coverage metrics.
@@ -31,44 +36,68 @@ def measure_public_data_coverage(db: Session) -> dict[str, Any]:
     Constitution F8 metrics:
     - Data points per period by type, source, benefit type
     - Public data coverage: % of U.S. hospitals/insurers ingested
+
+    Optimized for large datasets (11M+ rows) using approximate counts
+    and existence checks instead of full-table scans. Results are cached
+    for 10 minutes.
     """
-    total = db.query(func.count(PriceData.price_id)).scalar() or 0
+    cache_key = "public_data_coverage"
+    cached = _METRICS_CACHE.get(cache_key)
+    if cached and (_time.time() - cached["_ts"]) < _METRICS_CACHE_TTL:
+        return cached["data"]
 
+    from sqlalchemy import text
+
+    # Approximate total using MAX(rowid) -- O(1) on SQLite
+    total = db.execute(text(
+        "SELECT MAX(rowid) FROM price_data"
+    )).scalar() or 0
+
+    # GROUP BY source is bounded by number of source types (< 10)
+    # but still scans full table; use raw SQL for speed
     by_source = {}
-    for source_row in db.query(PriceData.source, func.count(PriceData.price_id)).group_by(PriceData.source).all():
-        by_source[source_row[0].value if hasattr(source_row[0], 'value') else str(source_row[0])] = source_row[1]
+    for source, cnt in db.execute(text(
+        "SELECT source, COUNT(*) FROM price_data GROUP BY source"
+    )).fetchall():
+        by_source[source] = cnt
 
-    by_state = db.query(func.count(func.distinct(PriceData.state))).filter(
-        PriceData.state.isnot(None)
-    ).scalar() or 0
+    by_state = db.execute(text(
+        "SELECT COUNT(DISTINCT state) FROM price_data WHERE state IS NOT NULL"
+    )).scalar() or 0
 
-    unique_hospitals = db.query(func.count(func.distinct(PriceData.provider_name))).filter(
-        PriceData.source == PriceSource.hospital_transparency
-    ).scalar() or 0
+    # Approximate unique hospitals using LIMIT on subquery
+    unique_hospitals = db.execute(text(
+        "SELECT COUNT(*) FROM ("
+        "  SELECT DISTINCT provider_name FROM price_data"
+        "  WHERE source = 'hospital_transparency'"
+        "  LIMIT 50000"
+        ")"
+    )).scalar() or 0
 
-    unique_services = db.query(func.count(func.distinct(PriceData.service_code))).scalar() or 0
+    # Approximate unique services using LIMIT
+    unique_services = db.execute(text(
+        "SELECT COUNT(*) FROM ("
+        "  SELECT DISTINCT service_code FROM price_data LIMIT 50000"
+        ")"
+    )).scalar() or 0
 
-    # Benefit type coverage
+    # Benefit type coverage using EXISTS (fast)
     benefit_types_with_data = set()
-    # Health: hospital transparency, Medicare
     if by_source.get("hospital_transparency", 0) > 0 or by_source.get("medicare_physician_fee", 0) > 0:
         benefit_types_with_data.add("health")
-    # Dental
     if by_source.get("dental_fee_schedule", 0) > 0:
         benefit_types_with_data.add("dental")
-    # Mental health
     if by_source.get("samhsa_mental_health", 0) > 0:
         benefit_types_with_data.add("mental_health")
-    # Pharmacy (health adjacent)
     if by_source.get("nadac_pharmacy", 0) > 0:
         benefit_types_with_data.add("pharmacy")
-    # Vision — check for vision-related service codes
-    vision_count = db.query(func.count(PriceData.price_id)).filter(
-        PriceData.service_code.like("920%") | PriceData.service_code.like("921%") | PriceData.service_code.like("922%")
-    ).scalar() or 0
-    if vision_count > 0:
+    # Vision — use EXISTS instead of COUNT
+    has_vision = db.execute(text(
+        "SELECT 1 FROM price_data WHERE service_code LIKE '920%' "
+        "OR service_code LIKE '921%' OR service_code LIKE '922%' LIMIT 1"
+    )).fetchone()
+    if has_vision:
         benefit_types_with_data.add("vision")
-    # State Medicaid covers multiple types
     if by_source.get("state_medicaid", 0) > 0:
         benefit_types_with_data.update(["health", "dental", "mental_health"])
 
@@ -92,6 +121,7 @@ def measure_public_data_coverage(db: Session) -> dict[str, Any]:
     db.add(metric)
     db.commit()
 
+    _METRICS_CACHE[cache_key] = {"data": metric.details, "_ts": _time.time()}
     return metric.details
 
 
@@ -207,25 +237,39 @@ def measure_data_completeness(db: Session) -> dict[str, Any]:
 
 
 def get_pipeline_dashboard(db: Session) -> dict[str, Any]:
-    """Full F8 data pipeline dashboard — all metrics in one view."""
-    return {
+    """Full F8 data pipeline dashboard — all metrics in one view.
+
+    Cached for 10 minutes to avoid repeated expensive queries.
+    """
+    cache_key = "pipeline_dashboard"
+    cached = _METRICS_CACHE.get(cache_key)
+    if cached and (_time.time() - cached["_ts"]) < _METRICS_CACHE_TTL:
+        return cached["data"]
+
+    result = {
         "public_coverage": measure_public_data_coverage(db),
         "data_completeness": measure_data_completeness(db),
         "sources_ingested": _list_ingested_sources(db),
     }
+    _METRICS_CACHE[cache_key] = {"data": result, "_ts": _time.time()}
+    return result
 
 
 def _list_ingested_sources(db: Session) -> list[dict]:
-    """List all data sources with record counts and last ingestion time."""
+    """List all data sources with record counts and last ingestion time.
+
+    Uses raw SQL GROUP BY which is bounded by the number of source types.
+    """
+    from sqlalchemy import text
     sources = []
-    for source_val, count, latest in db.query(
-        PriceData.source,
-        func.count(PriceData.price_id),
-        func.max(PriceData.ingested_at),
-    ).group_by(PriceData.source).all():
+    rows = db.execute(text(
+        "SELECT source, COUNT(*) as cnt, MAX(ingested_at) as latest "
+        "FROM price_data GROUP BY source"
+    )).fetchall()
+    for source_val, count, latest in rows:
         sources.append({
-            "source": source_val.value if hasattr(source_val, 'value') else str(source_val),
+            "source": str(source_val),
             "records": count,
-            "last_ingested": latest.isoformat() if latest else None,
+            "last_ingested": str(latest) if latest else None,
         })
     return sources

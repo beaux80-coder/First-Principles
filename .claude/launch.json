@@ -3,7 +3,7 @@
   "configurations": [
     {
       "name": "FastAPI Backend",
-      "runtimeExecutable": "python",
+      "runtimeExecutable": "/Users/beauxtaylor/Documents/The Constitution/beneflex/.venv/bin/python",
       "runtimeArgs": ["-m", "uvicorn", "app.main:app", "--reload", "--port", "8000"],
       "port": 8000
     },

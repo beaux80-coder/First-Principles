@@ -17,6 +17,7 @@ Uses gradient boosting ensemble on F8 data with features:
 
 import logging
 import math
+import time
 from collections import defaultdict
 from datetime import datetime, UTC
 from typing import Any
@@ -40,6 +41,10 @@ from app.services.cross_type_analytics import (
 from app.services.ml_models import price_regression_by_state, provider_clustering
 
 logger = logging.getLogger(__name__)
+
+# Cache for expensive PriceData aggregations (10-minute TTL)
+_PRICE_CACHE: dict = {}
+_PRICE_CACHE_TTL = 600
 
 # ---------------------------------------------------------------------------
 # Feature engineering helpers
@@ -173,40 +178,61 @@ def _extract_employer_features(
         features["state_avg_provider_quality"] = 3.0
 
     # --- Population-level price data (F8 public layer) ---
-    # Average price for this benefit type's service codes in employer's state
+    # Use cached sampled averages to avoid full-table scans on 11M+ rows
     prefixes = BENEFIT_TYPE_PREFIXES.get(benefit_type.value, [])
     if state and prefixes:
-        from sqlalchemy import or_
-        code_filters = [PriceData.service_code.like(f"{p}%") for p in prefixes]
-        avg_price = (
-            db.query(func.avg(PriceData.price))
-            .filter(
-                or_(*code_filters),
-                PriceData.state == state,
-                PriceData.channel == "cash",
+        cache_key = f"state_benefit_avg_{state}_{benefit_type.value}"
+        cached = _PRICE_CACHE.get(cache_key)
+        if cached and (time.time() - cached["_ts"]) < _PRICE_CACHE_TTL:
+            features["state_benefit_avg_price"] = cached["val"]
+        else:
+            from sqlalchemy import or_
+            code_filters = [PriceData.service_code.like(f"{p}%") for p in prefixes]
+            subq = (
+                db.query(PriceData.price)
+                .filter(or_(*code_filters), PriceData.state == state, PriceData.channel == "cash")
+                .limit(10_000)
+                .subquery()
             )
-            .scalar()
-        )
-        features["state_benefit_avg_price"] = float(avg_price) if avg_price else 0.0
+            avg_price = db.query(func.avg(subq.c.price)).scalar()
+            val = float(avg_price) if avg_price else 0.0
+            features["state_benefit_avg_price"] = val
+            _PRICE_CACHE[cache_key] = {"val": val, "_ts": time.time()}
     else:
         features["state_benefit_avg_price"] = 0.0
 
-    # Medicare baseline rate (population reference)
-    medicare_avg = (
-        db.query(func.avg(PriceData.price))
-        .filter(PriceData.source == PriceSource.medicare_physician_fee)
-        .scalar()
-    )
-    features["medicare_baseline"] = float(medicare_avg) if medicare_avg else 0.0
-
-    # NADAC pharmacy baseline
-    if benefit_type in (BenefitType.health, BenefitType.mental_health):
-        nadac_avg = (
-            db.query(func.avg(PriceData.price))
-            .filter(PriceData.source == PriceSource.nadac_pharmacy)
-            .scalar()
+    # Medicare baseline rate (cached, sampled)
+    cached_medicare = _PRICE_CACHE.get("medicare_baseline")
+    if cached_medicare and (time.time() - cached_medicare["_ts"]) < _PRICE_CACHE_TTL:
+        features["medicare_baseline"] = cached_medicare["val"]
+    else:
+        subq = (
+            db.query(PriceData.price)
+            .filter(PriceData.source == PriceSource.medicare_physician_fee)
+            .limit(100_000)
+            .subquery()
         )
-        features["nadac_pharmacy_avg"] = float(nadac_avg) if nadac_avg else 0.0
+        medicare_avg = db.query(func.avg(subq.c.price)).scalar()
+        val = float(medicare_avg) if medicare_avg else 0.0
+        features["medicare_baseline"] = val
+        _PRICE_CACHE["medicare_baseline"] = {"val": val, "_ts": time.time()}
+
+    # NADAC pharmacy baseline (cached, sampled)
+    if benefit_type in (BenefitType.health, BenefitType.mental_health):
+        cached_nadac = _PRICE_CACHE.get("nadac_pharmacy_avg")
+        if cached_nadac and (time.time() - cached_nadac["_ts"]) < _PRICE_CACHE_TTL:
+            features["nadac_pharmacy_avg"] = cached_nadac["val"]
+        else:
+            subq = (
+                db.query(PriceData.price)
+                .filter(PriceData.source == PriceSource.nadac_pharmacy)
+                .limit(100_000)
+                .subquery()
+            )
+            nadac_avg = db.query(func.avg(subq.c.price)).scalar()
+            val = float(nadac_avg) if nadac_avg else 0.0
+            features["nadac_pharmacy_avg"] = val
+            _PRICE_CACHE["nadac_pharmacy_avg"] = {"val": val, "_ts": time.time()}
     else:
         features["nadac_pharmacy_avg"] = 0.0
 

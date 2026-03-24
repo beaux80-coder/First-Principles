@@ -5,9 +5,13 @@ possible and would improve performance but hasn't been evaluated?"
 
 These models run on the 5M+ price records currently in the pipeline and
 produce outputs that improve downstream functions immediately.
+
+Optimized for large datasets (11M+ rows) using sampled queries and
+in-memory caching to avoid full-table scans on SQLite.
 """
 
 import logging
+import time
 from collections import defaultdict
 
 from sqlalchemy import func, and_, or_
@@ -17,20 +21,30 @@ from app.models.price_data import PriceData, PriceSource
 
 logger = logging.getLogger(__name__)
 
+# In-memory cache (10-minute TTL)
+_CACHE: dict = {}
+_CACHE_TTL = 600
+
 
 def price_regression_by_state(db: Session) -> dict:
     """Price regression: predict prices for services/states with sparse data.
 
     Uses dense-data states to estimate prices for sparse-data states.
     Feeds F2 (Price Discovery) and F6A (Benchmark accuracy).
+
+    Optimized: samples up to 500k rows instead of scanning full table.
     """
-    # Get average prices by service code and state (hospital transparency)
-    state_service_prices = (
+    cache_key = "price_regression_by_state"
+    cached = _CACHE.get(cache_key)
+    if cached and (time.time() - cached["_ts"]) < _CACHE_TTL:
+        return cached["data"]
+
+    # Sample up to 500k rows for the GROUP BY
+    sample_subq = (
         db.query(
             PriceData.state,
             PriceData.service_code,
-            func.avg(PriceData.price).label("avg_price"),
-            func.count(PriceData.price_id).label("record_count"),
+            PriceData.price,
         )
         .filter(
             and_(
@@ -39,12 +53,25 @@ def price_regression_by_state(db: Session) -> dict:
                 PriceData.state.isnot(None),
             )
         )
-        .group_by(PriceData.state, PriceData.service_code)
+        .limit(500_000)
+        .subquery()
+    )
+
+    state_service_prices = (
+        db.query(
+            sample_subq.c.state,
+            sample_subq.c.service_code,
+            func.avg(sample_subq.c.price).label("avg_price"),
+            func.count().label("record_count"),
+        )
+        .group_by(sample_subq.c.state, sample_subq.c.service_code)
         .all()
     )
 
     if not state_service_prices:
-        return {"status": "no_data", "predictions": 0}
+        result = {"status": "no_data", "predictions": 0}
+        _CACHE[cache_key] = {"data": result, "_ts": time.time()}
+        return result
 
     # Build a state-service price matrix
     prices_by_service = defaultdict(dict)
@@ -71,19 +98,15 @@ def price_regression_by_state(db: Session) -> dict:
             state_cost_index[state_code] = sum(indices) / len(indices)
 
     # Predict missing prices: for services where a state has no data,
-    # use national average × state cost index
+    # use national average x state cost index
     predictions = 0
-    predicted_prices = {}
-
     for service, nat_avg in national_avgs.items():
         existing_states = set(prices_by_service[service].keys())
-        for state_code, cost_idx in state_cost_index.items():
+        for state_code in state_cost_index:
             if state_code not in existing_states:
-                predicted_price = round(nat_avg * cost_idx, 2)
-                predicted_prices[(state_code, service)] = predicted_price
                 predictions += 1
 
-    return {
+    result = {
         "status": "complete",
         "services_modeled": len(national_avgs),
         "states_with_cost_index": len(state_cost_index),
@@ -91,26 +114,40 @@ def price_regression_by_state(db: Session) -> dict:
         "state_cost_indices": {k: round(v, 3) for k, v in sorted(state_cost_index.items())},
         "feeds": ["F2 (Price Discovery — sparse data estimation)", "F6A (Benchmark accuracy for all states)"],
     }
+    _CACHE[cache_key] = {"data": result, "_ts": time.time()}
+    return result
 
 
 def provider_clustering(db: Session) -> dict:
     """Cluster providers by price pattern and quality rating.
 
     Groups hospitals into cost-quality tiers for F4 (Provider Selection).
+
+    Optimized: samples prices, limits quality records.
     """
-    # Get hospitals with both prices and quality ratings
-    hospital_prices = dict(
-        db.query(
-            PriceData.provider_name,
-            func.avg(PriceData.price).label("avg_price"),
-        )
+    cache_key = "provider_clustering"
+    cached = _CACHE.get(cache_key)
+    if cached and (time.time() - cached["_ts"]) < _CACHE_TTL:
+        return cached["data"]
+
+    # Sample hospital prices (GROUP BY provider_name on full table is expensive)
+    price_subq = (
+        db.query(PriceData.provider_name, PriceData.price)
         .filter(
             and_(
                 PriceData.source == PriceSource.hospital_transparency,
                 PriceData.channel == "cash",
             )
         )
-        .group_by(PriceData.provider_name)
+        .limit(200_000)
+        .subquery()
+    )
+    hospital_prices = dict(
+        db.query(
+            price_subq.c.provider_name,
+            func.avg(price_subq.c.price).label("avg_price"),
+        )
+        .group_by(price_subq.c.provider_name)
         .all()
     )
 
@@ -122,13 +159,16 @@ def provider_clustering(db: Session) -> dict:
                 PriceData.price > 0,
             )
         )
+        .limit(10_000)
         .all()
     )
 
     if not hospital_prices or not hospital_ratings:
-        return {"status": "insufficient_data", "clusters": []}
+        result = {"status": "insufficient_data", "clusters": []}
+        _CACHE[cache_key] = {"data": result, "_ts": time.time()}
+        return result
 
-    # Fuzzy match hospital names: normalize to uppercase, strip common suffixes
+    # Fuzzy match hospital names
     def _normalize(name: str) -> str:
         n = name.upper().strip()
         for suffix in [" HOSPITAL", " MEDICAL CENTER", " MED CTR", " MED CENTER",
@@ -140,12 +180,10 @@ def provider_clustering(db: Session) -> dict:
     norm_prices = {_normalize(k): k for k in hospital_prices}
     norm_ratings = {_normalize(k): k for k in hospital_ratings}
 
-    # Match on normalized names
     both_norm = set(norm_prices.keys()) & set(norm_ratings.keys())
     both_prices = {norm_prices[n] for n in both_norm}
     both_ratings = {norm_ratings[n] for n in both_norm}
 
-    # Also try substring matching for remaining
     unmatched_prices = set(hospital_prices.keys()) - both_prices
     unmatched_ratings = set(hospital_ratings.keys()) - both_ratings
     for pn in list(unmatched_prices):
@@ -155,7 +193,6 @@ def provider_clustering(db: Session) -> dict:
             if pn_norm in rn_norm or rn_norm in pn_norm:
                 both_prices.add(pn)
                 both_ratings.add(rn)
-                # Map price name to rating name
                 hospital_ratings[pn] = hospital_ratings[rn]
                 unmatched_ratings.discard(rn)
                 break
@@ -163,14 +200,13 @@ def provider_clustering(db: Session) -> dict:
     both = both_prices
 
     if not both:
-        return {"status": "no_overlap", "hospitals_with_prices": len(hospital_prices),
-                "hospitals_with_ratings": len(hospital_ratings)}
+        result = {"status": "no_overlap", "hospitals_with_prices": len(hospital_prices),
+                  "hospitals_with_ratings": len(hospital_ratings)}
+        _CACHE[cache_key] = {"data": result, "_ts": time.time()}
+        return result
 
-    # Simple clustering: high/medium/low cost × high/medium/low quality
     price_values = [float(hospital_prices[h]) for h in both]
     price_median = sorted(price_values)[len(price_values) // 2]
-    price_p25 = sorted(price_values)[len(price_values) // 4]
-    price_p75 = sorted(price_values)[3 * len(price_values) // 4]
 
     clusters = {
         "high_quality_low_cost": [],
@@ -196,7 +232,7 @@ def provider_clustering(db: Session) -> dict:
             "quality_rating": int(rating),
         })
 
-    return {
+    result = {
         "status": "complete",
         "hospitals_analyzed": len(both),
         "clusters": {k: {"count": len(v), "sample": v[:3]} for k, v in clusters.items()},
@@ -205,6 +241,8 @@ def provider_clustering(db: Session) -> dict:
                    f"these are the providers the system would prioritize.",
         "feeds": ["F4 (Provider Selection — quality-weighted cost optimization)"],
     }
+    _CACHE[cache_key] = {"data": result, "_ts": time.time()}
+    return result
 
 
 def run_all_models(db: Session) -> dict:

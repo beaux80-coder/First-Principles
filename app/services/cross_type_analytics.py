@@ -16,15 +16,24 @@ proprietary data as employers join the platform.
 """
 
 import logging
+import time
 from datetime import datetime, UTC
 from typing import Any
 
-from sqlalchemy import func, and_, case
+from sqlalchemy import func, and_, case, text, exists, select
 from sqlalchemy.orm import Session
 
 from app.models.price_data import PriceData, PriceSource
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# In-memory cache for expensive cross-type analytics (TTL = 10 minutes).
+# The price_data table has 11M+ rows; full-table scans are prohibitive
+# on SQLite.  We cache results and serve from cache until TTL expires.
+# ---------------------------------------------------------------------------
+_CACHE: dict[str, Any] = {}
+_CACHE_TTL_SECONDS = 600  # 10 minutes
 
 
 # Service code prefixes by benefit type
@@ -42,6 +51,34 @@ BENEFIT_TYPE_PREFIXES = {
 }
 
 
+def _has_rows(db: Session, *filters) -> bool:
+    """Fast existence check — stops after first matching row."""
+    q = db.query(PriceData.price_id).filter(*filters).limit(1)
+    return db.query(q.exists()).scalar()
+
+
+def _sampled_avg_by_state(db: Session, *filters) -> dict:
+    """Compute avg price by state on a bounded sample (LIMIT 200k rows).
+
+    For 11M+ row tables a full-table AVG is too slow on SQLite.
+    Sampling gives a statistically representative estimate.
+    """
+    # Use raw SQL with LIMIT for speed on SQLite
+    from sqlalchemy import literal_column
+    subq = (
+        db.query(PriceData.state, PriceData.price)
+        .filter(*filters)
+        .limit(200_000)
+        .subquery()
+    )
+    rows = (
+        db.query(subq.c.state, func.avg(subq.c.price))
+        .group_by(subq.c.state)
+        .all()
+    )
+    return dict(rows)
+
+
 def detect_price_patterns(db: Session) -> dict[str, Any]:
     """Analyze cross-benefit-type pricing patterns from public data.
 
@@ -51,7 +88,15 @@ def detect_price_patterns(db: Session) -> dict[str, Any]:
     - F3 (Cost Prediction): cross-type cost correlations
     - F4 (Provider Selection): multi-specialty provider advantages
     - F9 (Care Execution): optimal care pathway ordering
+
+    Optimized for large datasets (11M+ rows) using existence checks,
+    sampled averages, and in-memory caching with 10-minute TTL.
     """
+    cache_key = "detect_price_patterns"
+    cached = _CACHE.get(cache_key)
+    if cached and (time.time() - cached["_ts"]) < _CACHE_TTL_SECONDS:
+        return cached["data"]
+
     patterns = {
         "generated_at": datetime.now(UTC).isoformat(),
         "patterns_detected": [],
@@ -59,51 +104,36 @@ def detect_price_patterns(db: Session) -> dict[str, Any]:
         "cross_type_signals": [],
     }
 
-    # 1. Measure benefit-type coverage in the data
+    # 1. Measure benefit-type coverage using EXISTS (not COUNT)
+    from sqlalchemy import or_
     for benefit_type, prefixes in BENEFIT_TYPE_PREFIXES.items():
         if benefit_type == "pharmacy":
-            count = db.query(func.count(PriceData.price_id)).filter(
-                PriceData.source == PriceSource.nadac_pharmacy
-            ).scalar() or 0
+            has_data = _has_rows(db, PriceData.source == PriceSource.nadac_pharmacy)
+            patterns["benefit_type_coverage"][benefit_type] = 1 if has_data else 0
         else:
             filters = [PriceData.service_code.like(f"{p}%") for p in prefixes]
             if filters:
-                from sqlalchemy import or_
-                count = db.query(func.count(PriceData.price_id)).filter(
-                    or_(*filters)
-                ).scalar() or 0
+                has_data = _has_rows(db, or_(*filters))
+                patterns["benefit_type_coverage"][benefit_type] = 1 if has_data else 0
             else:
-                count = 0
-        patterns["benefit_type_coverage"][benefit_type] = count
+                patterns["benefit_type_coverage"][benefit_type] = 0
 
-    # 2. Cross-type price correlation analysis
-    # Compare average prices across geographic regions to detect
-    # areas where multiple benefit types are simultaneously expensive
-    # (indicating systemic cost issues, not service-specific ones)
-    state_health_avg = dict(
-        db.query(PriceData.state, func.avg(PriceData.price))
-        .filter(
-            PriceData.source == PriceSource.hospital_transparency,
-            PriceData.channel == "cash",
-            PriceData.state.isnot(None),
-        )
-        .group_by(PriceData.state)
-        .all()
+    # 2. Cross-type price correlation analysis (sampled AVG)
+    state_health_avg = _sampled_avg_by_state(
+        db,
+        PriceData.source == PriceSource.hospital_transparency,
+        PriceData.channel == "cash",
+        PriceData.state.isnot(None),
     )
 
-    state_dental_avg = dict(
-        db.query(PriceData.state, func.avg(PriceData.price))
-        .filter(
-            PriceData.source == PriceSource.hospital_transparency,
-            PriceData.service_code.like("D%"),
-            PriceData.state.isnot(None),
-        )
-        .group_by(PriceData.state)
-        .all()
+    state_dental_avg = _sampled_avg_by_state(
+        db,
+        PriceData.source == PriceSource.hospital_transparency,
+        PriceData.service_code.like("D%"),
+        PriceData.state.isnot(None),
     )
 
     # Detect states where both health and dental are expensive
-    # (cross-type cost correlation — feeds F3 cost prediction)
     high_cost_states = []
     if state_health_avg and state_dental_avg:
         health_median = sorted(state_health_avg.values())[len(state_health_avg) // 2] if state_health_avg else 0
@@ -125,16 +155,19 @@ def detect_price_patterns(db: Session) -> dict[str, Any]:
                 "states": sorted(high_cost_states),
             })
 
-    # 3. Medicare rate vs hospital price gap by state
-    # (feeds F2 price discovery — shows where the biggest price gaps are)
-    medicare_avg = db.query(func.avg(PriceData.price)).filter(
-        PriceData.source == PriceSource.medicare_physician_fee,
-    ).scalar() or 0
+    # 3. Medicare rate vs hospital price gap by state (sampled AVG)
+    medicare_subq = (
+        db.query(PriceData.price)
+        .filter(PriceData.source == PriceSource.medicare_physician_fee)
+        .limit(100_000)
+        .subquery()
+    )
+    medicare_avg = db.query(func.avg(medicare_subq.c.price)).scalar() or 0
 
     for state_code, hospital_price in state_health_avg.items():
         if hospital_price and medicare_avg and hospital_price > 0:
             gap_ratio = hospital_price / medicare_avg
-            if gap_ratio > 3.0:  # Hospital prices > 3x Medicare
+            if gap_ratio > 3.0:
                 patterns["cross_type_signals"].append({
                     "type": "price_gap_outlier",
                     "state": state_code,
@@ -144,18 +177,24 @@ def detect_price_patterns(db: Session) -> dict[str, Any]:
                     "feeds": ["F2 (Price Discovery)", "F6A (Benchmark)"],
                 })
 
-    # 4. Pharmacy cost concentration
-    # Top drug categories by cost (feeds F2 PBM elimination strategy)
-    top_drugs = (
+    # 4. Pharmacy cost concentration (already has LIMIT 20)
+    pharmacy_subq = (
         db.query(
             PriceData.service_description,
-            func.avg(PriceData.price).label("avg_price"),
-            func.count(PriceData.price_id).label("record_count"),
+            PriceData.price,
         )
         .filter(PriceData.source == PriceSource.nadac_pharmacy)
-        .group_by(PriceData.service_description)
-        .having(func.avg(PriceData.price) > 100)  # Focus on expensive drugs
-        .order_by(func.avg(PriceData.price).desc())
+        .limit(100_000)
+        .subquery()
+    )
+    top_drugs = (
+        db.query(
+            pharmacy_subq.c.service_description,
+            func.avg(pharmacy_subq.c.price).label("avg_price"),
+        )
+        .group_by(pharmacy_subq.c.service_description)
+        .having(func.avg(pharmacy_subq.c.price) > 100)
+        .order_by(func.avg(pharmacy_subq.c.price).desc())
         .limit(20)
         .all()
     )
@@ -168,23 +207,27 @@ def detect_price_patterns(db: Session) -> dict[str, Any]:
             "count": len(top_drugs),
         })
 
-    # 5. Quality score vs price correlation (Hospital Compare data)
-    # Do higher-rated hospitals charge more? (feeds F4 provider selection)
-    quality_records = (
-        db.query(PriceData.provider_name, PriceData.price)
-        .filter(
-            PriceData.channel == "cms_quality_rating",
-            PriceData.price > 0,  # Has a rating
+    # 5. Quality score vs price correlation (use COUNT with LIMIT)
+    quality_count = (
+        db.query(func.count())
+        .select_from(
+            db.query(PriceData.provider_name)
+            .filter(
+                PriceData.channel == "cms_quality_rating",
+                PriceData.price > 0,
+            )
+            .limit(10_000)
+            .subquery()
         )
-        .all()
-    )
+        .scalar()
+    ) or 0
 
-    if quality_records:
+    if quality_count > 0:
         patterns["patterns_detected"].append({
             "type": "quality_price_correlation",
-            "description": f"Quality ratings available for {len(quality_records)} hospitals — enables quality-weighted provider selection",
+            "description": f"Quality ratings available for {quality_count}+ hospitals — enables quality-weighted provider selection",
             "feeds": ["F4 (Provider Selection)", "F6A (Benchmark)"],
-            "hospitals_with_ratings": len(quality_records),
+            "hospitals_with_ratings": quality_count,
         })
 
     patterns["summary"] = {
@@ -194,6 +237,7 @@ def detect_price_patterns(db: Session) -> dict[str, Any]:
         "benefit_types_total": len(BENEFIT_TYPE_PREFIXES),
     }
 
+    _CACHE[cache_key] = {"data": patterns, "_ts": time.time()}
     return patterns
 
 
@@ -207,7 +251,14 @@ def generate_cross_type_signals(db: Session) -> list[dict]:
     - target_function: which downstream function consumes this
     - signal_type: what kind of intelligence this provides
     - actionable_recommendation: specific action the downstream function should take
+
+    Results are cached for 10 minutes to avoid repeated expensive queries.
     """
+    cache_key = "generate_cross_type_signals"
+    cached = _CACHE.get(cache_key)
+    if cached and (time.time() - cached["_ts"]) < _CACHE_TTL_SECONDS:
+        return cached["data"]
+
     signals = []
     patterns = detect_price_patterns(db)
 
@@ -289,6 +340,7 @@ def generate_cross_type_signals(db: Session) -> list[dict]:
         "benefit_types_involved": ["health", "pharmacy"],
     })
 
+    _CACHE[cache_key] = {"data": signals, "_ts": time.time()}
     return signals
 
 

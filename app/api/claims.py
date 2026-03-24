@@ -71,9 +71,19 @@ def submit_claim(req: ClaimSubmitRequest, db: Session = Depends(get_db)):
         )
 
     # Create the claim record
+    # Validate UUID formats
+    try:
+        employer_uuid = uuid.UUID(req.employer_id)
+        employee_uuid = uuid.UUID(req.employee_id)
+    except ValueError:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid employer_id or employee_id format. Must be valid UUIDs.",
+        )
+
     claim = Claim(
-        employer_id=uuid.UUID(req.employer_id),
-        employee_id=uuid.UUID(req.employee_id),
+        employer_id=employer_uuid,
+        employee_id=employee_uuid,
         provider_id=uuid.UUID(req.provider_id) if req.provider_id else None,
         service_id=uuid.UUID(req.service_id) if req.service_id else None,
         benefit_type=benefit_type,
@@ -90,7 +100,17 @@ def submit_claim(req: ClaimSubmitRequest, db: Session = Depends(get_db)):
         ),
     )
     db.add(claim)
-    db.flush()  # Get the claim_id assigned
+    try:
+        db.flush()  # Get the claim_id assigned
+    except Exception as e:
+        db.rollback()
+        error_msg = str(e).lower()
+        if "foreign key" in error_msg or "constraint" in error_msg:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid employer_id or employee_id: referenced entity does not exist.",
+            )
+        raise HTTPException(status_code=500, detail=f"Failed to create claim: {e}")
 
     logger.info(
         "Claim %s submitted: benefit_type=%s, amount=%.2f, mode=%s",

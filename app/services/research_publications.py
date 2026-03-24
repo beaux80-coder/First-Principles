@@ -12,7 +12,7 @@ without exposing any proprietary data.
 
 from datetime import datetime, UTC
 
-from sqlalchemy import func, and_
+from sqlalchemy import func, and_, text
 from sqlalchemy.orm import Session
 
 from app.models.price_data import PriceData, PriceSource
@@ -30,7 +30,12 @@ def generate_research_report(db: Session) -> dict:
 
     NO proprietary data: no verified prices, no provider scores, no outcome
     models, no negotiated rates, no employer-specific data.
+
+    Optimized for large datasets (11M+ rows) using sampled averages
+    and approximate counts to avoid full-table scans.
     """
+    from sqlalchemy import text
+
     report = {
         "generated_at": datetime.now(UTC).isoformat(),
         "methodology": "All findings derived from publicly available CMS data and anonymized, "
@@ -38,9 +43,9 @@ def generate_research_report(db: Session) -> dict:
         "findings": [],
     }
 
-    # 1. Geographic price variation (public transparency data only)
-    state_avg_prices = dict(
-        db.query(PriceData.state, func.avg(PriceData.price))
+    # 1. Geographic price variation (sampled AVG for speed)
+    sample_subq = (
+        db.query(PriceData.state, PriceData.price)
         .filter(
             and_(
                 PriceData.source == PriceSource.hospital_transparency,
@@ -48,7 +53,12 @@ def generate_research_report(db: Session) -> dict:
                 PriceData.state.isnot(None),
             )
         )
-        .group_by(PriceData.state)
+        .limit(200_000)
+        .subquery()
+    )
+    state_avg_prices = dict(
+        db.query(sample_subq.c.state, func.avg(sample_subq.c.price))
+        .group_by(sample_subq.c.state)
         .all()
     )
 
@@ -73,17 +83,27 @@ def generate_research_report(db: Session) -> dict:
             "source": "CMS Hospital Price Transparency files (public)",
         })
 
-    # 2. Medicare vs hospital price gap (public data only)
-    medicare_avg = db.query(func.avg(PriceData.price)).filter(
-        PriceData.source == PriceSource.medicare_physician_fee,
-    ).scalar()
+    # 2. Medicare vs hospital price gap (sampled AVGs)
+    medicare_subq = (
+        db.query(PriceData.price)
+        .filter(PriceData.source == PriceSource.medicare_physician_fee)
+        .limit(100_000)
+        .subquery()
+    )
+    medicare_avg = db.query(func.avg(medicare_subq.c.price)).scalar()
 
-    hospital_national_avg = db.query(func.avg(PriceData.price)).filter(
-        and_(
-            PriceData.source == PriceSource.hospital_transparency,
-            PriceData.channel == "cash",
+    hospital_subq = (
+        db.query(PriceData.price)
+        .filter(
+            and_(
+                PriceData.source == PriceSource.hospital_transparency,
+                PriceData.channel == "cash",
+            )
         )
-    ).scalar()
+        .limit(200_000)
+        .subquery()
+    )
+    hospital_national_avg = db.query(func.avg(hospital_subq.c.price)).scalar()
 
     if medicare_avg and hospital_national_avg:
         ratio = float(hospital_national_avg) / float(medicare_avg)
@@ -100,17 +120,20 @@ def generate_research_report(db: Session) -> dict:
             "source": "CMS Hospital Price Transparency files and Medicare Physician Fee Schedule (public)",
         })
 
-    # 3. Pharmacy cost concentration (NADAC — public data)
-    total_drugs = db.query(func.count(func.distinct(PriceData.service_code))).filter(
-        PriceData.source == PriceSource.nadac_pharmacy,
-    ).scalar() or 0
+    # 3. Pharmacy cost concentration (approximate distinct counts)
+    total_drugs = db.execute(text(
+        "SELECT COUNT(*) FROM ("
+        "  SELECT DISTINCT service_code FROM price_data"
+        "  WHERE source = 'nadac_pharmacy' LIMIT 50000"
+        ")"
+    )).scalar() or 0
 
-    high_cost_drugs = db.query(func.count(func.distinct(PriceData.service_code))).filter(
-        and_(
-            PriceData.source == PriceSource.nadac_pharmacy,
-            PriceData.price > 100,
-        )
-    ).scalar() or 0
+    high_cost_drugs = db.execute(text(
+        "SELECT COUNT(*) FROM ("
+        "  SELECT DISTINCT service_code FROM price_data"
+        "  WHERE source = 'nadac_pharmacy' AND price > 100 LIMIT 50000"
+        ")"
+    )).scalar() or 0
 
     if total_drugs > 0:
         report["findings"].append({
@@ -127,7 +150,7 @@ def generate_research_report(db: Session) -> dict:
             "source": "CMS NADAC (National Average Drug Acquisition Cost) — public",
         })
 
-    # 4. Benchmark query volume (anonymized, aggregated)
+    # 4. Benchmark query volume (small table, no optimization needed)
     total_queries = db.query(func.count(BenchmarkQuery.query_id)).scalar() or 0
     if total_queries > 0:
         avg_employee_count = db.query(func.avg(
@@ -146,12 +169,14 @@ def generate_research_report(db: Session) -> dict:
             "source": "Anonymized, aggregated benchmark queries",
         })
 
-    # 5. Data pipeline coverage
-    total_records = db.query(func.count(PriceData.price_id)).scalar() or 0
-    unique_services = db.query(func.count(func.distinct(PriceData.service_code))).scalar() or 0
-    states_covered = db.query(func.count(func.distinct(PriceData.state))).filter(
-        PriceData.state.isnot(None)
-    ).scalar() or 0
+    # 5. Data pipeline coverage (approximate counts)
+    total_records = db.execute(text("SELECT MAX(rowid) FROM price_data")).scalar() or 0
+    unique_services = db.execute(text(
+        "SELECT COUNT(*) FROM (SELECT DISTINCT service_code FROM price_data LIMIT 50000)"
+    )).scalar() or 0
+    states_covered = db.execute(text(
+        "SELECT COUNT(DISTINCT state) FROM price_data WHERE state IS NOT NULL"
+    )).scalar() or 0
 
     report["findings"].append({
         "title": "Public Pricing Data Coverage",
