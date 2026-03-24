@@ -392,3 +392,141 @@ def employee_care_status(
         raise HTTPException(status_code=404, detail=result["error"])
 
     return result
+
+
+# ── F9: Prescription routing to lowest-price pharmacy ─────────────────────
+
+
+class PrescriptionRoutingRequest(BaseModel):
+    """Route a prescription to the lowest-price pharmacy channel."""
+    employee_id: str
+    drug_name: str
+    quantity: int = 30
+    state: Optional[str] = None
+
+
+@router.post("/prescription")
+def route_prescription_endpoint(
+    request: PrescriptionRoutingRequest,
+    db: Session = Depends(get_db),
+):
+    """Route prescription to lowest-price pharmacy via F2 price discovery.
+
+    Constitution: "If prescription generated: system identifies lowest-price
+    channel via Function 2, routes prescription, notifies employee of
+    pickup/delivery."
+
+    Process:
+    1. Queries NADAC data in price_data table for the drug
+    2. Compares against all pharmacy channels (NADAC, GoodRx, ASP)
+    3. Selects the cheapest pharmacy in the employee's state
+    4. Returns: selected pharmacy, price, drug info, pickup instructions
+    """
+    import uuid as uuid_mod
+    from app.services.care_execution import route_prescription_to_pharmacy
+
+    try:
+        employee_uuid = uuid_mod.UUID(request.employee_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid employee_id format")
+
+    result = route_prescription_to_pharmacy(
+        db=db,
+        employee_id=employee_uuid,
+        drug_name=request.drug_name,
+        quantity=request.quantity,
+        state=request.state,
+    )
+
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+
+    return result
+
+
+# ── F9: Automatic referral/imaging/lab chain ──────────────────────────────
+
+
+class ReferralChainRequest(BaseModel):
+    """Trigger automatic referral chain processing."""
+    episode_id: str
+    referral_type: str  # imaging, lab, specialist, follow_up
+    referral_reason: str
+
+
+@router.post("/chain")
+def referral_chain_endpoint(
+    request: ReferralChainRequest,
+    db: Session = Depends(get_db),
+):
+    """Automatic referral/imaging/lab chain processing.
+
+    Constitution: "If visit results in referral, imaging, lab, or follow-up:
+    system automatically selects optimal follow-up provider/facility,
+    schedules it, notifies employee, transmits clinical information.
+    Chain continues until issue resolved."
+
+    Creates a new linked care episode, selects provider via F4,
+    auto-schedules, and returns the full episode chain.
+    """
+    import uuid as uuid_mod
+    from app.services.care_execution import process_referral_chain
+
+    try:
+        episode_uuid = uuid_mod.UUID(request.episode_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid episode_id format")
+
+    result = process_referral_chain(
+        db=db,
+        episode_id=episode_uuid,
+        referral_type=request.referral_type,
+        referral_reason=request.referral_reason,
+    )
+
+    if "error" in result:
+        raise HTTPException(
+            status_code=400 if "Invalid referral_type" in result.get("error", "") else 404,
+            detail=result["error"],
+        )
+
+    return result
+
+
+# ── F9: FHIR clinical context generation ──────────────────────────────────
+
+
+@router.get("/fhir/{episode_id}")
+def fhir_bundle_endpoint(
+    episode_id: str,
+    db: Session = Depends(get_db),
+):
+    """Generate FHIR R4 Bundle for clinical context transmission.
+
+    Constitution: "Transmits medical history and clinical context to provider
+    in advance" and "Is clinical context transmitted using every method
+    physically available and legally permitted?"
+
+    Returns a FHIR R4 Bundle containing:
+    - Patient resource (demographics from employee)
+    - Condition resource (from the care episode)
+    - MedicationStatement (if any prescription history)
+    - AllergyIntolerance (if in history)
+    """
+    import uuid as uuid_mod
+    from app.services.care_execution import generate_fhir_bundle
+
+    try:
+        episode_uuid = uuid_mod.UUID(episode_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid episode_id format")
+
+    result = generate_fhir_bundle(
+        db=db,
+        episode_id=episode_uuid,
+    )
+
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+
+    return result

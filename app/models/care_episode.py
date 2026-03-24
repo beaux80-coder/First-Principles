@@ -77,10 +77,17 @@ class CareEpisode(Base):
     appointment_missed: Mapped[bool] = mapped_column(Boolean, default=False)
     follow_up_count: Mapped[int] = mapped_column(Integer, default=0)
     last_follow_up_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Referral chain linkage — links child episodes to parent for auto-chaining
+    parent_episode_id: Mapped[uuid.UUID | None] = mapped_column(
+        GUID(), ForeignKey("care_episodes.episode_id"), nullable=True
+    )
+    referral_type: Mapped[str | None] = mapped_column(String(50), nullable=True)
     # Prescription routing
     prescription_routed: Mapped[bool] = mapped_column(Boolean, default=False)
     prescription_channel: Mapped[str | None] = mapped_column(String(100), nullable=True)
     prescription_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    prescription_drug_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    prescription_pharmacy_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     # Provider concern flag
     provider_concern_flag: Mapped[bool] = mapped_column(Boolean, default=False)
     provider_concern_note: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -91,3 +98,7 @@ class CareEpisode(Base):
 
     employee = relationship("Employee", back_populates="care_episodes")
     provider = relationship("Provider", foreign_keys=[provider_id])
+    parent_episode = relationship(
+        "CareEpisode", remote_side="CareEpisode.episode_id",
+        foreign_keys=[parent_episode_id], backref="child_episodes",
+    )

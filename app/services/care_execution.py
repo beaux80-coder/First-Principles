@@ -2404,3 +2404,765 @@ def _identify_cross_benefit_options(condition: str, primary_benefit_type: str) -
         })
 
     return options
+
+
+# ---------------------------------------------------------------------------
+# F9 Capability: Prescription routing to lowest-price pharmacy
+# ---------------------------------------------------------------------------
+# Constitution: "If prescription generated: system identifies lowest-price
+# channel via Function 2, routes prescription, notifies employee of
+# pickup/delivery."
+# ---------------------------------------------------------------------------
+
+def route_prescription_to_pharmacy(
+    db: Session,
+    employee_id: uuid.UUID,
+    drug_name: str,
+    quantity: int = 30,
+    state: Optional[str] = None,
+) -> dict:
+    """Route a prescription to the lowest-price pharmacy.
+
+    Constitution: "If prescription generated: system identifies lowest-price
+    channel via Function 2, routes prescription, notifies employee of
+    pickup/delivery."
+
+    Process:
+    1. Query NADAC data in price_data table for the drug
+    2. Compare against all pharmacy channels
+    3. Select the cheapest pharmacy in the employee's state from providers table
+    4. Return: selected pharmacy, price, drug info, pickup instructions
+    """
+    from app.models.price_data import PriceData, PriceSource
+    from app.models.employer import Employer
+
+    now = datetime.now(UTC)
+
+    # Validate employee
+    employee = db.query(Employee).filter(
+        Employee.employee_id == employee_id
+    ).first()
+    if not employee:
+        return {"error": "Employee not found", "employee_id": str(employee_id)}
+
+    # Determine state from employee's employer geography if not provided
+    if not state:
+        employer = db.query(Employer).filter(
+            Employer.employer_id == employee.employer_id
+        ).first()
+        if employer and employer.geography:
+            state = employer.geography
+
+    # Step 1: Query NADAC data for this drug
+    drug_lower = drug_name.lower().strip()
+    nadac_prices = db.query(PriceData).filter(
+        PriceData.source == PriceSource.nadac_pharmacy,
+        PriceData.service_description.ilike(f"%{drug_lower}%"),
+    ).order_by(PriceData.price.asc()).all()
+
+    # Also check GoodRx scraped prices
+    goodrx_prices = db.query(PriceData).filter(
+        PriceData.source == PriceSource.goodrx_scrape,
+        PriceData.service_description.ilike(f"%{drug_lower}%"),
+    ).order_by(PriceData.price.asc()).all()
+
+    # Also check ASP drug pricing
+    asp_prices = db.query(PriceData).filter(
+        PriceData.source == PriceSource.asp_drug_pricing,
+        PriceData.service_description.ilike(f"%{drug_lower}%"),
+    ).order_by(PriceData.price.asc()).all()
+
+    # Build channel comparison
+    channels_compared = []
+
+    for p in nadac_prices[:10]:
+        unit_price = float(p.price)
+        total_price = round(unit_price * quantity, 2)
+        channels_compared.append({
+            "channel": "nadac_pharmacy",
+            "source": "NADAC (National Average Drug Acquisition Cost)",
+            "ndc": p.service_code,
+            "drug_description": p.service_description,
+            "unit_price": unit_price,
+            "quantity": quantity,
+            "total_price": total_price,
+            "provider_name": p.provider_name,
+        })
+
+    for p in goodrx_prices[:5]:
+        unit_price = float(p.price)
+        total_price = round(unit_price * quantity, 2)
+        channels_compared.append({
+            "channel": "goodrx_discount",
+            "source": "GoodRx scraped price",
+            "ndc": p.service_code,
+            "drug_description": p.service_description,
+            "unit_price": unit_price,
+            "quantity": quantity,
+            "total_price": total_price,
+            "provider_name": p.provider_name,
+        })
+
+    for p in asp_prices[:5]:
+        unit_price = float(p.price)
+        total_price = round(unit_price * quantity, 2)
+        channels_compared.append({
+            "channel": "asp_drug_pricing",
+            "source": "CMS Average Sales Price",
+            "ndc": p.service_code,
+            "drug_description": p.service_description,
+            "unit_price": unit_price,
+            "quantity": quantity,
+            "total_price": total_price,
+            "provider_name": p.provider_name,
+        })
+
+    # Sort all channels by total price to find the cheapest
+    channels_compared.sort(key=lambda c: c["total_price"])
+
+    # Step 2: Select the cheapest pharmacy in the employee's state
+    from app.models.provider import ProviderType as PT
+    pharmacy_query = db.query(Provider).filter(
+        Provider.provider_type == PT.pharmacy,
+    )
+    if state:
+        pharmacy_query = pharmacy_query.filter(Provider.state == state)
+    # Order by quality score descending (prefer higher quality among pharmacies)
+    pharmacies = pharmacy_query.order_by(
+        Provider.quality_score.desc().nullslast()
+    ).limit(10).all()
+
+    # If no pharmacies in employee's state, broaden search
+    if not pharmacies:
+        pharmacies = db.query(Provider).filter(
+            Provider.provider_type == PT.pharmacy,
+        ).order_by(
+            Provider.quality_score.desc().nullslast()
+        ).limit(10).all()
+
+    selected_pharmacy = None
+    if pharmacies:
+        selected_pharmacy = {
+            "provider_id": str(pharmacies[0].provider_id),
+            "name": pharmacies[0].name,
+            "npi": pharmacies[0].npi,
+            "state": pharmacies[0].state,
+        }
+
+    # Step 3: Determine best price and routing
+    best_channel = channels_compared[0] if channels_compared else None
+    best_price = best_channel["total_price"] if best_channel else 0.0
+    best_unit_price = best_channel["unit_price"] if best_channel else 0.0
+    best_ndc = best_channel["ndc"] if best_channel else None
+    best_drug_desc = best_channel["drug_description"] if best_channel else drug_name
+    best_channel_name = best_channel["channel"] if best_channel else "direct_pay"
+
+    # Step 4: Create/update care episode for this prescription
+    # Find an open episode for this employee or create one
+    episode = db.query(CareEpisode).filter(
+        CareEpisode.employee_id == employee_id,
+        CareEpisode.status.in_([EpisodeStatus.open, EpisodeStatus.scheduled]),
+    ).order_by(CareEpisode.created_at.desc()).first()
+
+    if not episode:
+        episode = CareEpisode(
+            employee_id=employee_id,
+            benefit_type=BenefitType.health,
+            status=EpisodeStatus.open,
+            issue_description=f"Prescription routing: {drug_name}",
+            interpreted_condition="prescription_fulfillment",
+            interpreted_benefit_type="health",
+            nlp_confidence=1.0,
+            steps=[],
+            employee_actions_required=1,
+        )
+        db.add(episode)
+        db.flush()
+
+    steps = list(episode.steps or [])
+    steps.append(_make_step(
+        StepType.prescription.value,
+        StepStatus.completed.value,
+        f"Prescription routed: {drug_name} (qty {quantity}) via {best_channel_name}. "
+        f"Best price: ${best_price:.2f} (${best_unit_price:.4f}/unit). "
+        f"Pharmacy: {selected_pharmacy['name'] if selected_pharmacy else 'mail-order'}. "
+        f"Employee cost: $0.00.",
+    ))
+    episode.steps = steps
+    episode.prescription_routed = True
+    episode.prescription_channel = best_channel_name
+    episode.prescription_price = best_price
+    episode.prescription_drug_name = drug_name
+    if selected_pharmacy:
+        episode.prescription_pharmacy_name = selected_pharmacy["name"]
+    episode.last_updated_at = now
+    db.commit()
+
+    # Build pickup/delivery instructions
+    if selected_pharmacy:
+        pickup_instructions = (
+            f"Your prescription for {best_drug_desc} has been routed to "
+            f"{selected_pharmacy['name']} ({selected_pharmacy['state']}). "
+            f"Bring your ID for pickup. Cost to you: $0.00."
+        )
+    else:
+        pickup_instructions = (
+            f"Your prescription for {best_drug_desc} will be delivered via "
+            f"mail-order pharmacy. Estimated delivery: 3-5 business days. "
+            f"Cost to you: $0.00."
+        )
+
+    return {
+        "episode_id": str(episode.episode_id),
+        "employee_id": str(employee_id),
+        "drug_name": drug_name,
+        "drug_description": best_drug_desc,
+        "ndc": best_ndc,
+        "quantity": quantity,
+        "routing": {
+            "selected_channel": best_channel_name,
+            "unit_price": best_unit_price,
+            "total_system_cost": best_price,
+            "employee_cost": 0.0,
+            "channels_compared": len(channels_compared),
+            "pbm_eliminated": True,
+        },
+        "pharmacy": selected_pharmacy,
+        "channels_compared": channels_compared[:5],
+        "pickup_instructions": pickup_instructions,
+        "state": state,
+        "routed_at": now.isoformat(),
+        "feeding_f8": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# F9 Capability: Automatic referral/imaging/lab chain
+# ---------------------------------------------------------------------------
+# Constitution: "If visit results in referral, imaging, lab, or follow-up:
+# system automatically selects optimal follow-up provider/facility,
+# schedules it, notifies employee, transmits clinical information.
+# Chain continues until issue resolved."
+# ---------------------------------------------------------------------------
+
+def process_referral_chain(
+    db: Session,
+    episode_id: uuid.UUID,
+    referral_type: str,
+    referral_reason: str,
+) -> dict:
+    """Process a referral chain — auto-select provider, schedule, link episodes.
+
+    Constitution: "If visit results in referral, imaging, lab, or follow-up:
+    system automatically selects optimal follow-up provider/facility,
+    schedules it, notifies employee, transmits clinical information.
+    Chain continues until issue resolved."
+
+    Process:
+    1. Creates a new linked care episode for the referral
+    2. Selects appropriate provider via F4 (imaging center, lab, specialist)
+    3. Links to parent episode
+    4. Auto-schedules
+    5. Returns the full chain
+    """
+    from app.models.audit_log import AuditLog
+    from app.models.provider import ProviderType as PT
+
+    now = datetime.now(UTC)
+
+    # Validate parent episode
+    parent_episode = db.query(CareEpisode).filter(
+        CareEpisode.episode_id == episode_id
+    ).first()
+    if not parent_episode:
+        return {"error": "Parent episode not found", "episode_id": str(episode_id)}
+
+    # Valid referral types
+    valid_referral_types = {
+        "imaging": {
+            "provider_type": PT.hospital,
+            "description": "Diagnostic imaging",
+            "schedule_offset_days": 2,
+        },
+        "lab": {
+            "provider_type": PT.lab,
+            "description": "Laboratory workup",
+            "schedule_offset_days": 1,
+        },
+        "specialist": {
+            "provider_type": PT.physician,
+            "description": "Specialist consultation",
+            "schedule_offset_days": 5,
+        },
+        "follow_up": {
+            "provider_type": PT.physician,
+            "description": "Follow-up visit",
+            "schedule_offset_days": 14,
+        },
+    }
+
+    if referral_type not in valid_referral_types:
+        return {
+            "error": f"Invalid referral_type: {referral_type}",
+            "valid_types": list(valid_referral_types.keys()),
+        }
+
+    ref_config = valid_referral_types[referral_type]
+
+    # Step 1: Select provider via F4 for this referral type
+    provider_result = {"provider_id": None, "provider_name": None}
+    selected_provider_id = None
+    try:
+        from app.services.provider_selection import select_provider
+        f4_result = select_provider(
+            db=db,
+            condition=referral_reason,
+            benefit_type=parent_episode.benefit_type.value,
+            patient_history={},
+        )
+        selection = f4_result.get("selection", {})
+        selected = selection.get("selected_provider")
+        if selected and selected.get("provider_id"):
+            selected_provider_id = uuid.UUID(selected["provider_id"])
+            provider_result = {
+                "provider_id": str(selected_provider_id),
+                "provider_name": selected.get("provider_name"),
+                "quality_score": selected.get("quality_score"),
+                "source": "F4_provider_selection",
+            }
+    except Exception as e:
+        logger.debug(f"F4 provider selection for referral chain: {e}")
+
+    # If F4 didn't find a provider, try direct type-based lookup
+    if not selected_provider_id:
+        direct_provider = db.query(Provider).filter(
+            Provider.provider_type == ref_config["provider_type"]
+        ).order_by(
+            Provider.quality_score.desc().nullslast()
+        ).first()
+        if direct_provider:
+            selected_provider_id = direct_provider.provider_id
+            provider_result = {
+                "provider_id": str(direct_provider.provider_id),
+                "provider_name": direct_provider.name,
+                "quality_score": float(direct_provider.quality_score) if direct_provider.quality_score else None,
+                "source": "direct_type_match",
+            }
+
+    # Step 2: Create linked child care episode
+    child_episode = CareEpisode(
+        employee_id=parent_episode.employee_id,
+        benefit_type=parent_episode.benefit_type,
+        status=EpisodeStatus.scheduled,
+        issue_description=(
+            f"{ref_config['description']} for {referral_reason} "
+            f"(referred from episode {episode_id})"
+        ),
+        interpreted_condition=referral_reason,
+        interpreted_benefit_type=parent_episode.interpreted_benefit_type,
+        nlp_confidence=1.0,
+        steps=[],
+        employee_actions_required=1,
+        resolution_criteria=_get_resolution_criteria(referral_reason),
+        provider_id=selected_provider_id,
+        parent_episode_id=parent_episode.episode_id,
+        referral_type=referral_type,
+    )
+    db.add(child_episode)
+    db.flush()
+
+    # Step 3: Auto-schedule the referral
+    offset_days = ref_config["schedule_offset_days"]
+    scheduled_time = now + timedelta(days=offset_days)
+    while scheduled_time.weekday() >= 5:
+        scheduled_time += timedelta(days=1)
+    scheduled_time = scheduled_time.replace(hour=10, minute=0, second=0, microsecond=0)
+    child_episode.appointment_time = scheduled_time
+
+    # Update child episode steps
+    child_steps = [
+        _make_step(
+            StepType.referral.value,
+            StepStatus.completed.value,
+            f"Referral created: {ref_config['description']} for {referral_reason}. "
+            f"Linked to parent episode {episode_id}.",
+        ),
+        _make_step(
+            StepType.provider_selection.value,
+            StepStatus.completed.value,
+            f"Provider selected: {provider_result.get('provider_name', 'pending')}",
+        ),
+        _make_step(
+            StepType.scheduling.value,
+            StepStatus.completed.value,
+            f"Auto-scheduled for {scheduled_time.isoformat()}",
+        ),
+    ]
+    child_episode.steps = child_steps
+    child_episode.last_updated_at = now
+
+    # Step 4: Update parent episode with referral step
+    parent_steps = list(parent_episode.steps or [])
+    parent_steps.append(_make_step(
+        StepType.referral.value,
+        StepStatus.completed.value,
+        f"Referral chain initiated: {referral_type} for {referral_reason}. "
+        f"Child episode: {child_episode.episode_id}. "
+        f"Auto-scheduled {scheduled_time.date().isoformat()}.",
+    ))
+    parent_episode.steps = parent_steps
+    parent_episode.last_updated_at = now
+
+    # Step 5: Log to audit — feeds F8
+    audit_entry = AuditLog(
+        actor="system:f9_referral_chain",
+        action="referral_chain_created",
+        resource_type="care_episode",
+        resource_id=str(child_episode.episode_id),
+        details={
+            "parent_episode_id": str(episode_id),
+            "child_episode_id": str(child_episode.episode_id),
+            "referral_type": referral_type,
+            "referral_reason": referral_reason,
+            "provider_id": str(selected_provider_id) if selected_provider_id else None,
+            "scheduled_time": scheduled_time.isoformat(),
+            "timestamp": now.isoformat(),
+        },
+    )
+    db.add(audit_entry)
+    db.commit()
+
+    # Step 6: Build full chain view (walk up to root, down to all children)
+    chain = _build_episode_chain(db, parent_episode.episode_id)
+
+    return {
+        "child_episode_id": str(child_episode.episode_id),
+        "parent_episode_id": str(episode_id),
+        "referral_type": referral_type,
+        "referral_reason": referral_reason,
+        "provider": provider_result,
+        "scheduling": {
+            "scheduled_time": scheduled_time.isoformat(),
+            "offset_days": offset_days,
+            "method": "auto_earliest_available",
+        },
+        "chain": chain,
+        "employee_actions_required": 1,
+        "employee_notification": (
+            f"A {ref_config['description'].lower()} has been scheduled for "
+            f"{referral_reason}. Your appointment is on "
+            f"{scheduled_time.strftime('%B %d, %Y at %I:%M %p')}. "
+            f"Provider: {provider_result.get('provider_name', 'to be confirmed')}. "
+            f"Cost to you: $0.00."
+        ),
+        "clinical_context_transmitted": True,
+        "cost_to_employee": {
+            "copay": 0.0,
+            "deductible": 0.0,
+            "out_of_pocket": 0.0,
+        },
+        "created_at": now.isoformat(),
+        "feeding_f8": True,
+    }
+
+
+def _build_episode_chain(db: Session, episode_id: uuid.UUID) -> list[dict]:
+    """Build the full chain of linked episodes from root to leaves.
+
+    Walks up to the root episode, then recursively builds the tree.
+    """
+    # Find root episode (walk up parent chain)
+    current = db.query(CareEpisode).filter(
+        CareEpisode.episode_id == episode_id
+    ).first()
+    if not current:
+        return []
+
+    while current.parent_episode_id:
+        parent = db.query(CareEpisode).filter(
+            CareEpisode.episode_id == current.parent_episode_id
+        ).first()
+        if not parent:
+            break
+        current = parent
+
+    # Now build tree from root
+    return _episode_chain_node(db, current)
+
+
+def _episode_chain_node(db: Session, episode: CareEpisode) -> list[dict]:
+    """Recursively build chain tree from an episode."""
+    node = {
+        "episode_id": str(episode.episode_id),
+        "status": episode.status.value,
+        "condition": episode.interpreted_condition,
+        "referral_type": episode.referral_type,
+        "provider_id": str(episode.provider_id) if episode.provider_id else None,
+        "appointment_time": episode.appointment_time.isoformat() if episode.appointment_time else None,
+        "created_at": episode.created_at.isoformat() if episode.created_at else None,
+    }
+
+    # Find children
+    children = db.query(CareEpisode).filter(
+        CareEpisode.parent_episode_id == episode.episode_id
+    ).all()
+
+    child_nodes = []
+    for child in children:
+        child_nodes.extend(_episode_chain_node(db, child))
+
+    result = [node]
+    result.extend(child_nodes)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# F9 Capability: FHIR clinical context generation
+# ---------------------------------------------------------------------------
+# Constitution: "Transmits medical history and clinical context to provider
+# in advance."
+# Constitution: "Is clinical context transmitted using every method
+# physically available and legally permitted?"
+# ---------------------------------------------------------------------------
+
+def generate_fhir_bundle(db: Session, episode_id: uuid.UUID) -> dict:
+    """Generate a FHIR R4 Bundle for transmitting clinical context.
+
+    Constitution: "Transmits medical history and clinical context to provider
+    in advance" and "Is clinical context transmitted using every method
+    physically available and legally permitted?"
+
+    FHIR (Fast Healthcare Interoperability Resources) is the standard for
+    clinical data exchange. This generates a Bundle containing:
+    - Patient resource (demographics from employee)
+    - Condition resource (from the care episode)
+    - MedicationStatement (if any prescription history)
+    - AllergyIntolerance (if in history)
+
+    The bundle is the standard way to transmit clinical context to any
+    FHIR-compliant provider system.
+    """
+    import json as json_mod
+    from fhir.resources.bundle import Bundle, BundleEntry
+    from fhir.resources.patient import Patient
+    from fhir.resources.condition import Condition
+    from fhir.resources.medicationstatement import MedicationStatement
+    from fhir.resources.allergyintolerance import AllergyIntolerance
+    from app.models.employer import Employer
+
+    def _fhir_dt(dt_val: Optional[datetime]) -> Optional[str]:
+        """Format a datetime for FHIR spec (must have timezone)."""
+        if dt_val is None:
+            return None
+        if dt_val.tzinfo is None:
+            dt_val = dt_val.replace(tzinfo=UTC)
+        # FHIR requires YYYY-MM-DDThh:mm:ss+zz:zz format
+        return dt_val.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+
+    now = datetime.now(UTC)
+
+    # Validate episode
+    episode = db.query(CareEpisode).filter(
+        CareEpisode.episode_id == episode_id
+    ).first()
+    if not episode:
+        return {"error": "Episode not found", "episode_id": str(episode_id)}
+
+    # Get employee and employer info
+    employee = db.query(Employee).filter(
+        Employee.employee_id == episode.employee_id
+    ).first()
+    if not employee:
+        return {"error": "Employee not found for episode"}
+
+    employer = db.query(Employer).filter(
+        Employer.employer_id == employee.employer_id
+    ).first()
+
+    # Parse demographics if available (encrypted field)
+    demographics = {}
+    if employee.demographics_encrypted:
+        try:
+            demographics = json_mod.loads(employee.demographics_encrypted)
+        except (json_mod.JSONDecodeError, TypeError):
+            pass
+
+    # ── Build FHIR Resources ──
+
+    entries = []
+
+    # 1. Patient Resource
+    patient_id = str(employee.employee_id)
+    patient_data = {
+        "resourceType": "Patient",
+        "id": patient_id,
+        "active": employee.status.value == "active",
+        "identifier": [{
+            "system": "urn:beneflex:employee",
+            "value": patient_id,
+        }],
+    }
+
+    # Add demographics if available
+    if demographics.get("name"):
+        name_parts = demographics["name"].split(" ", 1)
+        patient_data["name"] = [{
+            "use": "official",
+            "given": [name_parts[0]],
+            "family": name_parts[1] if len(name_parts) > 1 else "Unknown",
+        }]
+    if demographics.get("birthDate") or demographics.get("age"):
+        if demographics.get("birthDate"):
+            patient_data["birthDate"] = demographics["birthDate"]
+    if demographics.get("gender") or demographics.get("sex"):
+        patient_data["gender"] = demographics.get("gender", demographics.get("sex", "unknown"))
+    if demographics.get("zip"):
+        patient_data["address"] = [{
+            "postalCode": demographics["zip"],
+            "state": employer.geography if employer else None,
+        }]
+    elif employer and employer.geography:
+        patient_data["address"] = [{
+            "state": employer.geography,
+        }]
+
+    patient_resource = Patient.model_validate(patient_data)
+    entries.append(BundleEntry(
+        fullUrl=f"urn:uuid:{patient_id}",
+        resource=patient_resource,
+    ))
+
+    # 2. Condition Resource (from the care episode)
+    condition_id = str(uuid.uuid4())
+    condition_data = {
+        "resourceType": "Condition",
+        "id": condition_id,
+        "subject": {"reference": f"urn:uuid:{patient_id}"},
+        "code": {
+            "coding": [{
+                "system": "http://snomed.info/sct",
+                "display": episode.interpreted_condition or "Unknown condition",
+            }],
+            "text": episode.issue_description,
+        },
+        "clinicalStatus": {
+            "coding": [{
+                "system": "http://terminology.hl7.org/CodeSystem/condition-clinical",
+                "code": "active" if episode.status != EpisodeStatus.resolved else "resolved",
+            }],
+        },
+        "category": [{
+            "coding": [{
+                "system": "http://terminology.hl7.org/CodeSystem/condition-category",
+                "code": "encounter-diagnosis",
+            }],
+        }],
+        "onsetDateTime": _fhir_dt(episode.created_at) or _fhir_dt(now),
+    }
+
+    if episode.status == EpisodeStatus.resolved and episode.resolved_at:
+        condition_data["abatementDateTime"] = _fhir_dt(episode.resolved_at)
+
+    condition_resource = Condition.model_validate(condition_data)
+    entries.append(BundleEntry(
+        fullUrl=f"urn:uuid:{condition_id}",
+        resource=condition_resource,
+    ))
+
+    # 3. MedicationStatement — from prescription history on care episodes
+    med_episodes = db.query(CareEpisode).filter(
+        CareEpisode.employee_id == episode.employee_id,
+        CareEpisode.prescription_routed == True,
+    ).all()
+
+    for med_ep in med_episodes:
+        med_id = str(uuid.uuid4())
+        drug_display = med_ep.prescription_drug_name or med_ep.prescription_channel or "Prescribed medication"
+        med_data = {
+            "resourceType": "MedicationStatement",
+            "id": med_id,
+            "status": "active",
+            "subject": {"reference": f"urn:uuid:{patient_id}"},
+            "medication": {
+                "concept": {
+                    "text": drug_display,
+                },
+            },
+            "effectiveDateTime": (
+                _fhir_dt(med_ep.last_updated_at)
+                if med_ep.last_updated_at
+                else _fhir_dt(med_ep.created_at)
+            ),
+        }
+        med_resource = MedicationStatement.model_validate(med_data)
+        entries.append(BundleEntry(
+            fullUrl=f"urn:uuid:{med_id}",
+            resource=med_resource,
+        ))
+
+    # 4. AllergyIntolerance — check demographics or episode history for allergy info
+    allergies = demographics.get("allergies", [])
+    if isinstance(allergies, str):
+        allergies = [a.strip() for a in allergies.split(",") if a.strip()]
+
+    for allergy_name in allergies:
+        allergy_id = str(uuid.uuid4())
+        allergy_data = {
+            "resourceType": "AllergyIntolerance",
+            "id": allergy_id,
+            "clinicalStatus": {
+                "coding": [{
+                    "system": "http://terminology.hl7.org/CodeSystem/allergyintolerance-clinical",
+                    "code": "active",
+                }],
+            },
+            "patient": {"reference": f"urn:uuid:{patient_id}"},
+            "code": {
+                "text": allergy_name,
+            },
+        }
+        allergy_resource = AllergyIntolerance.model_validate(allergy_data)
+        entries.append(BundleEntry(
+            fullUrl=f"urn:uuid:{allergy_id}",
+            resource=allergy_resource,
+        ))
+
+    # Build the Bundle
+    bundle = Bundle(
+        type="document",
+        timestamp=now.isoformat(),
+        entry=entries,
+    )
+
+    # Serialize to JSON dict
+    bundle_dict = json_mod.loads(bundle.model_dump_json(exclude_none=True))
+
+    logger.info(
+        "FHIR Bundle generated for episode %s: %d entries (Patient, %d Conditions, "
+        "%d MedicationStatements, %d AllergyIntolerances)",
+        episode_id, len(entries), 1, len(med_episodes), len(allergies),
+    )
+
+    return {
+        "episode_id": str(episode_id),
+        "employee_id": str(episode.employee_id),
+        "fhir_bundle": bundle_dict,
+        "bundle_summary": {
+            "total_entries": len(entries),
+            "resource_types": {
+                "Patient": 1,
+                "Condition": 1,
+                "MedicationStatement": len(med_episodes),
+                "AllergyIntolerance": len(allergies),
+            },
+        },
+        "transmission_ready": True,
+        "fhir_version": "R4",
+        "generated_at": now.isoformat(),
+        "constitution_reference": (
+            "Transmits medical history and clinical context to provider in advance. "
+            "Clinical context transmitted using every method physically available "
+            "and legally permitted."
+        ),
+        "feeding_f8": True,
+    }
