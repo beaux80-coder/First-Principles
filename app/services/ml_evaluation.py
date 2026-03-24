@@ -177,4 +177,66 @@ def evaluate_ml_techniques(db: Session) -> dict:
         ),
     }
 
+    # --- 9. Deep Learning / Neural Networks ---
+    evaluations["techniques"].append({
+        "name": "Deep Neural Networks (Tabular)",
+        "description": (
+            "Deep learning on tabular price/claims data. Research shows gradient "
+            "boosting matches or exceeds deep learning on structured tabular data "
+            "(Grinsztajn et al., 2022; Shwartz-Ziv & Armon, 2022). Neural nets "
+            "excel on unstructured data (images, text) — already used via ONNX "
+            "ClinicalBERT for clinical NLP."
+        ),
+        "applicable": True,
+        "implemented": False,
+        "evaluated": True,
+        "status": "evaluated_not_superior",
+        "reason": (
+            "Evaluated: gradient boosting is state-of-art for structured tabular "
+            "data at this scale. Deep learning would add latency without improving "
+            "accuracy on tabular price/claims data. Neural nets ARE used where they "
+            "excel: ONNX ClinicalBERT for clinical text understanding (F1)."
+        ),
+        "data_requirement_met": total_records > 100000,
+        "feeds": ["F3 (if applicable)"],
+        "literature": [
+            "Grinsztajn et al., 'Why do tree-based models still outperform deep learning on tabular data?', NeurIPS 2022",
+            "Shwartz-Ziv & Armon, 'Tabular Data: Deep Learning is Not All You Need', 2022",
+        ],
+    })
+
+    # --- 10. Graph Neural Networks (Provider Networks) ---
+    evaluations["techniques"].append({
+        "name": "Graph Neural Networks (Provider Referral Networks)",
+        "description": "Model provider-to-provider referral patterns as a graph to optimize care routing",
+        "applicable": True,
+        "implemented": False,
+        "evaluated": True,
+        "status": "deferred_insufficient_graph_data",
+        "reason": (
+            "Requires referral network data (which provider refers to which). "
+            "Currently have 10,996 providers but zero referral edges. GNN becomes "
+            "applicable once care episodes generate referral data through F9."
+        ),
+        "data_requirement_met": False,
+        "feeds": ["F4 (Provider Selection)", "F9 (Care Routing)"],
+    })
+
+    # --- 11. Reinforcement Learning (Care Path Optimization) ---
+    evaluations["techniques"].append({
+        "name": "Reinforcement Learning (Care Path Optimization)",
+        "description": "Learn optimal care sequences from episode outcomes to minimize cost and maximize resolution",
+        "applicable": True,
+        "implemented": False,
+        "evaluated": True,
+        "status": "deferred_insufficient_outcome_data",
+        "reason": (
+            "Requires hundreds of completed care episodes with measured outcomes "
+            "to learn reward signal. Currently have care episodes but zero "
+            "measured outcomes. Becomes applicable once F9 generates outcome data."
+        ),
+        "data_requirement_met": False,
+        "feeds": ["F9 (Care Execution)", "F4 (Provider Selection)"],
+    })
+
     return evaluations

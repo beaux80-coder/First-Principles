@@ -803,6 +803,103 @@ def generate_departure_recommendation(
     return recommendation
 
 
+def find_overdue_episodes(
+    db: Session,
+    days_threshold: int = 14,
+) -> dict:
+    """Find all open/scheduled episodes that are overdue and need follow-up.
+
+    Constitution F9: "Tracks resolution status of every open issue.
+    Proactively follows up on missed appointments and overdue results."
+
+    Identifies:
+    1. Episodes open longer than `days_threshold` days without resolution
+    2. Missed appointments that need rescheduling
+    3. Episodes with no recent follow-up activity (>7 days since last touch)
+    """
+    now = datetime.now(UTC)
+    cutoff = now - timedelta(days=days_threshold)
+    follow_up_stale_cutoff = now - timedelta(days=7)
+
+    # Query all non-resolved episodes
+    open_episodes = db.query(CareEpisode).filter(
+        CareEpisode.status.in_([
+            EpisodeStatus.open,
+            EpisodeStatus.scheduled,
+            EpisodeStatus.in_progress,
+        ])
+    ).all()
+
+    overdue_episodes = []
+    missed_appointments = []
+    stale_follow_ups = []
+
+    for ep in open_episodes:
+        episode_age_days = (now - ep.created_at.replace(tzinfo=UTC)).days if ep.created_at else 0
+        ep_data = {
+            "episode_id": str(ep.episode_id),
+            "employee_id": str(ep.employee_id),
+            "status": ep.status.value,
+            "issue_description": ep.issue_description,
+            "condition": ep.interpreted_condition,
+            "benefit_type": ep.benefit_type.value if ep.benefit_type else None,
+            "episode_age_days": episode_age_days,
+            "created_at": ep.created_at.isoformat() if ep.created_at else None,
+            "last_updated_at": ep.last_updated_at.isoformat() if ep.last_updated_at else None,
+            "follow_up_count": ep.follow_up_count or 0,
+            "last_follow_up_at": ep.last_follow_up_at.isoformat() if ep.last_follow_up_at else None,
+        }
+
+        # Flag 1: Episode older than threshold without resolution
+        if ep.created_at and ep.created_at.replace(tzinfo=UTC) < cutoff:
+            overdue_episodes.append({
+                **ep_data,
+                "overdue_reason": f"Open for {episode_age_days} days (threshold: {days_threshold})",
+                "recommended_action": "proactive_follow_up",
+            })
+
+        # Flag 2: Missed appointment
+        if ep.appointment_time and ep.appointment_time.replace(tzinfo=UTC) < now:
+            if ep.status in (EpisodeStatus.open, EpisodeStatus.scheduled):
+                missed_appointments.append({
+                    **ep_data,
+                    "appointment_time": ep.appointment_time.isoformat(),
+                    "appointment_missed": ep.appointment_missed,
+                    "overdue_reason": "Appointment time has passed without resolution",
+                    "recommended_action": "reschedule_appointment",
+                })
+
+        # Flag 3: No follow-up activity in >7 days
+        last_touch = ep.last_follow_up_at or ep.last_updated_at or ep.created_at
+        if last_touch and last_touch.replace(tzinfo=UTC) < follow_up_stale_cutoff:
+            stale_follow_ups.append({
+                **ep_data,
+                "days_since_last_activity": (now - last_touch.replace(tzinfo=UTC)).days,
+                "overdue_reason": "No follow-up activity in over 7 days",
+                "recommended_action": "contact_employee",
+            })
+
+    return {
+        "queried_at": now.isoformat(),
+        "days_threshold": days_threshold,
+        "summary": {
+            "total_open_episodes": len(open_episodes),
+            "overdue_episodes": len(overdue_episodes),
+            "missed_appointments": len(missed_appointments),
+            "stale_follow_ups": len(stale_follow_ups),
+            "needs_attention": len(overdue_episodes) + len(missed_appointments) + len(stale_follow_ups),
+        },
+        "overdue_episodes": overdue_episodes,
+        "missed_appointments": missed_appointments,
+        "stale_follow_ups": stale_follow_ups,
+        "constitution_reference": (
+            "F9: Tracks resolution status of every open issue. "
+            "Proactively follows up on missed appointments and overdue results."
+        ),
+        "feeding_f8": True,
+    }
+
+
 def get_care_metrics(db: Session) -> dict:
     """Care execution metrics for F8 transparency reporting.
 

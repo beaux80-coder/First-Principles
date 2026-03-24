@@ -640,6 +640,155 @@ def get_enrollment_summary(db: Session, employer_id: uuid.UUID) -> dict:
     }
 
 
+def export_employer_data(db: Session, employer_id: uuid.UUID) -> dict:
+    """Export all employer data — employers own their raw data.
+
+    Constitution F11: "Employers own their raw data and may export it."
+
+    Returns all data for the specified employer in structured JSON format.
+    Strict employer_id filtering ensures no PII from other employers is included.
+    """
+    from app.models.care_episode import CareEpisode
+    from app.models.clinical_determination import ClinicalDetermination
+
+    employer = _get_employer_or_raise(db, employer_id)
+
+    # ── Employees (no raw PII — encrypted demographics not exported raw) ──
+    employees = db.query(Employee).filter(
+        Employee.employer_id == employer_id
+    ).all()
+
+    employee_records = []
+    for emp in employees:
+        # Parse demographics for benefit elections only (no raw PII in export)
+        elections = {}
+        dependents_count = 0
+        if emp.demographics_encrypted:
+            try:
+                demographics = json.loads(emp.demographics_encrypted)
+                elections = demographics.get("benefit_elections", {})
+                dependents_count = len(demographics.get("dependents", []))
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        employee_records.append({
+            "employee_id": str(emp.employee_id),
+            "status": emp.status.value,
+            "enrolled_at": emp.enrolled_at.isoformat() if emp.enrolled_at else None,
+            "terminated_at": emp.terminated_at.isoformat() if emp.terminated_at else None,
+            "benefit_elections": elections,
+            "dependents_count": dependents_count,
+        })
+
+    # ── Claims ──
+    claims = db.query(Claim).filter(
+        Claim.employer_id == employer_id
+    ).all()
+
+    claim_records = []
+    determination_ids = set()
+    for c in claims:
+        claim_records.append({
+            "claim_id": str(c.claim_id),
+            "employee_id": str(c.employee_id),
+            "benefit_type": c.benefit_type.value if c.benefit_type else None,
+            "mode": c.mode.value if c.mode else None,
+            "status": c.status.value if c.status else None,
+            "amount_billed": float(c.amount_billed) if c.amount_billed else None,
+            "amount_paid": float(c.amount_paid) if c.amount_paid else None,
+            "amount_employee_oop": float(c.amount_employee_oop) if c.amount_employee_oop else None,
+            "submitted_at": c.submitted_at.isoformat() if c.submitted_at else None,
+            "adjudicated_at": c.adjudicated_at.isoformat() if c.adjudicated_at else None,
+            "paid_at": c.paid_at.isoformat() if c.paid_at else None,
+            "auto_adjudicated": c.auto_adjudicated,
+            "adjudication_reasoning": c.adjudication_reasoning,
+        })
+        if c.clinical_determination_id:
+            determination_ids.add(c.clinical_determination_id)
+
+    # ── Clinical Determinations (only those linked to this employer's claims) ──
+    determination_records = []
+    if determination_ids:
+        determinations = db.query(ClinicalDetermination).filter(
+            ClinicalDetermination.determination_id.in_(list(determination_ids))
+        ).all()
+        for d in determinations:
+            determination_records.append({
+                "determination_id": str(d.determination_id),
+                "claim_id": d.claim_id,
+                "benefit_type": d.benefit_type,
+                "decision": d.decision.value if d.decision else None,
+                "reasoning": d.reasoning,
+                "guidelines_referenced": d.guidelines_referenced,
+                "created_at": d.created_at.isoformat() if d.created_at else None,
+                "risk_score": d.risk_score,
+                "latency_ms": d.latency_ms,
+            })
+
+    # ── Care Episodes (only for this employer's employees) ──
+    employee_ids = [emp.employee_id for emp in employees]
+    care_episodes = []
+    if employee_ids:
+        episodes = db.query(CareEpisode).filter(
+            CareEpisode.employee_id.in_(employee_ids)
+        ).all()
+        for ep in episodes:
+            care_episodes.append({
+                "episode_id": str(ep.episode_id),
+                "employee_id": str(ep.employee_id),
+                "benefit_type": ep.benefit_type.value if ep.benefit_type else None,
+                "status": ep.status.value if ep.status else None,
+                "issue_description": ep.issue_description,
+                "interpreted_condition": ep.interpreted_condition,
+                "nlp_confidence": ep.nlp_confidence,
+                "provider_id": str(ep.provider_id) if ep.provider_id else None,
+                "appointment_time": ep.appointment_time.isoformat() if ep.appointment_time else None,
+                "appointment_missed": ep.appointment_missed,
+                "follow_up_count": ep.follow_up_count,
+                "prescription_routed": ep.prescription_routed,
+                "prescription_channel": ep.prescription_channel,
+                "prescription_price": ep.prescription_price,
+                "resolution_criteria": ep.resolution_criteria,
+                "resolution_notes": ep.resolution_notes,
+                "created_at": ep.created_at.isoformat() if ep.created_at else None,
+                "resolved_at": ep.resolved_at.isoformat() if ep.resolved_at else None,
+                "steps": ep.steps,
+            })
+
+    return {
+        "export_metadata": {
+            "employer_id": str(employer_id),
+            "employer_name": employer.name,
+            "exported_at": datetime.now(UTC).isoformat(),
+            "format_version": "1.0",
+            "contains_pii_of_other_employers": False,
+            "constitution_reference": (
+                "F11: Employers own their raw data and may export it."
+            ),
+        },
+        "employer": {
+            "employer_id": str(employer.employer_id),
+            "name": employer.name,
+            "industry": employer.industry,
+            "employee_count": employer.employee_count,
+            "geography": employer.geography,
+            "status": employer.status.value if employer.status else None,
+            "baseline_cost_pepm": float(employer.baseline_cost_pepm) if employer.baseline_cost_pepm else None,
+            "created_at": employer.created_at.isoformat() if employer.created_at else None,
+        },
+        "employees": employee_records,
+        "claims": claim_records,
+        "clinical_determinations": determination_records,
+        "care_episodes": care_episodes,
+        "summary": {
+            "total_employees": len(employee_records),
+            "total_claims": len(claim_records),
+            "total_determinations": len(determination_records),
+            "total_care_episodes": len(care_episodes),
+        },
+    }
+
+
 # ── Internal helpers ─────────────────────────────────────────────────────────
 
 

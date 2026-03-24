@@ -175,6 +175,26 @@ def configure_plan(request: PlanConfigRequest, db: Session = Depends(get_db)):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@router.get("/export/{employer_id}")
+def export_employer_data(employer_id: str, db: Session = Depends(get_db)):
+    """Export all employer data — employers own their raw data.
+
+    Constitution F11: "Employers own their raw data and may export it."
+
+    Returns all data for the specified employer in structured JSON:
+    - Claims and determinations
+    - Care episodes
+    - Enrollment data
+    - No PII from other employers included (strict employer_id filtering)
+    """
+    from app.services.benefits_admin import export_employer_data as _export
+
+    try:
+        return _export(db, employer_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
 @router.get("/enrollment/{employer_id}")
 def get_enrollment_summary(employer_id: str, db: Session = Depends(get_db)):
     """Enrollment summary and statistics.

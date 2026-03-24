@@ -261,6 +261,110 @@ def record_outcome(
     return result
 
 
+@router.get("/overdue")
+def get_overdue_episodes(
+    days_threshold: int = 14,
+    db: Session = Depends(get_db),
+):
+    """Proactive issue tracking — find all overdue care episodes.
+
+    Constitution F9: "Tracks resolution status of every open issue.
+    Proactively follows up on missed appointments and overdue results."
+
+    Returns all open/scheduled episodes that need follow-up:
+    - Episodes open longer than `days_threshold` without resolution
+    - Missed appointments not yet rescheduled
+    - Episodes with no follow-up activity in the last 7 days
+
+    This powers the proactive follow-up system that ensures no employee
+    care issue falls through the cracks.
+    """
+    from app.services.care_execution import find_overdue_episodes
+
+    result = find_overdue_episodes(db=db, days_threshold=days_threshold)
+    return result
+
+
+@router.post("/depart/{employee_id}")
+def departing_employee_recommendation(
+    employee_id: str,
+    db: Session = Depends(get_db),
+):
+    """Departing employee recommendation path.
+
+    Constitution F9: "When an employee leaves an employer on the platform,
+    the system provides a simple mechanism for the employee to recommend
+    the product to their new employer. The mechanism includes anonymized
+    statistics from the employee's own care experience and links to the
+    benchmark tool (Function 6A)."
+
+    Returns a shareable recommendation with:
+    - Anonymized stats (episodes managed, time saved, OOP=$0)
+    - Link to benchmark tool (/benchmark/)
+    - No PII
+    """
+    import uuid as uuid_mod
+    from app.services.care_execution import generate_departure_recommendation
+
+    try:
+        employee_uuid = uuid_mod.UUID(employee_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid employee_id format")
+
+    result = generate_departure_recommendation(db=db, employee_id=employee_uuid)
+
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+
+    # Build the shareable recommendation with anonymized stats and benchmark link.
+    # Strip any fields that could contain PII — return only aggregate stats.
+    experience = result.get("verified_experience_data", {})
+    shareable = {
+        "recommendation_id": result.get("recommendation_id"),
+        "generated_at": result.get("generated_at"),
+        "anonymized_care_stats": {
+            "episodes_managed": experience.get("total_care_episodes", 0),
+            "episodes_resolved": experience.get("resolved_episodes", 0),
+            "resolution_rate": experience.get("resolution_rate"),
+            "avg_resolution_days": experience.get("avg_resolution_days"),
+            "benefit_types_used_count": len(experience.get("benefit_types_used", [])),
+            "unique_conditions_treated": experience.get("unique_conditions_treated", 0),
+            "total_out_of_pocket": experience.get("total_employee_out_of_pocket", 0.0),
+            "time_saved_note": (
+                "Zero employee admin burden: scheduling, referrals, prescriptions, "
+                "and payments handled automatically by the system."
+            ),
+        },
+        "system_performance_summary": {
+            "zero_copays": True,
+            "zero_deductibles": True,
+            "zero_out_of_pocket": True,
+            "auto_scheduling": True,
+            "auto_referral_chaining": result.get("system_performance", {}).get(
+                "auto_referral_chaining_used", False
+            ),
+        },
+        "benchmark_link": {
+            "url": "/api/v1/benchmark/",
+            "description": (
+                "Use the benchmark tool (Function 6A) to compare your current "
+                "benefits costs against the First Principles platform. See "
+                "projected savings with zero employee cost-sharing."
+            ),
+            "action": "Share this link with your new employer's HR or benefits team.",
+        },
+        "shareable": True,
+        "contains_pii": False,
+        "message": (
+            "This recommendation is based on verified clinical outcomes, not "
+            "satisfaction surveys. All statistics are anonymized. Share the "
+            "benchmark link with your new employer to see projected savings."
+        ),
+    }
+
+    return shareable
+
+
 @router.get("/status/{employee_id}")
 def employee_care_status(
     employee_id: str,

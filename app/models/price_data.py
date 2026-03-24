@@ -31,6 +31,9 @@ class PriceSource(str, enum.Enum):
     dmepos_fee_schedule = "dmepos_fee_schedule"
     asp_drug_pricing = "asp_drug_pricing"
     va_fee_schedule = "va_fee_schedule"
+    goodrx_scrape = "goodrx_scrape"
+    state_apcd = "state_apcd"
+    insurer_mrf_index = "insurer_mrf_index"
     other = "other"
 
 
