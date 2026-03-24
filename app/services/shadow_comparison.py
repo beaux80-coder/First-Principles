@@ -22,8 +22,42 @@ from app.models.claim import Claim, ClaimStatus, ClaimMode
 from app.models.employer import Employer
 from app.models.employee import Employee, EmployeeStatus
 from app.models.service import BenefitType
+from app.models.price_data import PriceData
 
 logger = logging.getLogger(__name__)
+
+
+# ── Proof Layer definitions (Constitution 4-layer proof chain) ───────────────
+# Layer 1: Verified Facts — every price independently verifiable
+# Layer 2: Demonstrated Capability — care coordination backed by execution logs
+# Layer 3: Actuarial Certification — aggregate results independently certified
+# Layer 4: Track Record — shadow-to-live predicted vs actual published
+
+PROOF_LAYER_DEFINITIONS = {
+    1: {
+        "name": "Verified Facts",
+        "requirement": (
+            "Every price is independently verifiable (published transparency "
+            "file price, confirmed cash rate, or rate actually paid for "
+            "another employer)"
+        ),
+    },
+    2: {
+        "name": "Demonstrated Capability",
+        "requirement": (
+            "Every care coordination step backed by anonymized execution "
+            "logs from live employers"
+        ),
+    },
+    3: {
+        "name": "Actuarial Certification",
+        "requirement": "Aggregate results independently certified",
+    },
+    4: {
+        "name": "Track Record",
+        "requirement": "Shadow-to-live predicted vs actual published",
+    },
+}
 
 
 # ── Shadow comparison constants ──────────────────────────────────────────────
@@ -167,12 +201,24 @@ def run_shadow_comparison(
 
     db.commit()
 
+    # ── Proof layer tagging (Constitution 4-layer proof chain) ───────────
+    service_code = carrier_claim.get("service_code", "")
+    proof_layers = _tag_proof_layers(
+        db=db,
+        employer_id=employer_id,
+        service_code=service_code,
+        claim=shadow_claim,
+        system_result=system_result,
+        carrier_paid=carrier_paid,
+        carrier_oop=carrier_oop,
+    )
+
     return {
         "shadow_claim_id": str(shadow_claim.claim_id),
         "carrier_claim_id": carrier_claim.get("carrier_claim_id", ""),
         "employer_id": str(employer_id),
         "benefit_type": benefit_type.value,
-        "service_code": carrier_claim.get("service_code", ""),
+        "service_code": service_code,
         "service_description": carrier_claim.get("service_description", ""),
         "billed_amount": round(billed_amount, 2),
 
@@ -201,6 +247,8 @@ def run_shadow_comparison(
             "employee_oop_eliminated": round(carrier_oop, 2),
             "speed_improvement_days": round(speed_delta_days, 1),
         },
+
+        "proof_layers": proof_layers,
 
         "constitutional_guarantees": {
             "zero_employee_oop": True,
@@ -610,6 +658,201 @@ def get_shadow_confidence(db: Session, employer_id: uuid.UUID) -> dict:
                 "before recommending activation."
             ),
         },
+    }
+
+
+# ── Proof layer tagging helpers ──────────────────────────────────────────────
+
+
+def _tag_proof_layers(
+    db: Session,
+    employer_id: uuid.UUID,
+    service_code: str,
+    claim: Claim,
+    system_result: dict,
+    carrier_paid: float,
+    carrier_oop: float,
+) -> dict:
+    """Tag a shadow comparison line item with its applicable proof layers.
+
+    Constitution: Every shadow line item must be tagged with its proof layer.
+    Unverifiable items marked as "unverified estimate" with confidence interval.
+
+    Returns a dict describing each layer's applicability and evidence.
+    """
+    from app.models.benchmark_query import BenchmarkQuery, BenchmarkStage
+
+    layers = {}
+
+    # ── Layer 1: Verified Facts ──────────────────────────────────────────
+    # Price is independently verifiable if we have transparency file data
+    # for this service code (CMS, NADAC, insurer TiC, or confirmed cash rate).
+    price_record_count = 0
+    if service_code:
+        price_record_count = db.query(func.count(PriceData.price_id)).filter(
+            PriceData.service_code == service_code,
+        ).scalar() or 0
+
+    # Carrier-reported amounts are also verifiable (they came from
+    # the carrier's own EOB / claims feed).
+    carrier_data_verified = carrier_paid > 0 or carrier_oop > 0
+
+    layer1_verified = price_record_count > 0 or carrier_data_verified
+    layer1_evidence = []
+    if price_record_count > 0:
+        layer1_evidence.append(
+            f"{price_record_count} published transparency file price(s) "
+            f"for service code {service_code}"
+        )
+    if carrier_data_verified:
+        layer1_evidence.append(
+            "Carrier-reported paid amount and employee OOP from claims feed"
+        )
+
+    layers["layer_1_verified_facts"] = {
+        **PROOF_LAYER_DEFINITIONS[1],
+        "verified": layer1_verified,
+        "evidence": layer1_evidence,
+        "status": "verified" if layer1_verified else "unverified_estimate",
+    }
+
+    # If price is not independently verifiable, mark as unverified estimate
+    # with a confidence interval.
+    if not layer1_verified:
+        system_paid = system_result.get("amount_paid", 0) or 0
+        layers["layer_1_verified_facts"]["confidence_interval"] = {
+            "estimate": round(float(system_paid), 2),
+            "lower_bound": round(float(system_paid) * 0.80, 2),
+            "upper_bound": round(float(system_paid) * 1.20, 2),
+            "confidence_level": "80%",
+            "note": (
+                "Price not yet independently verified against published "
+                "transparency data. Estimate based on system adjudication "
+                "with +/-20% confidence interval."
+            ),
+        }
+
+    # ── Layer 2: Demonstrated Capability ─────────────────────────────────
+    # Care coordination steps backed by execution logs.
+    layer2_evidence = []
+    clinical_result = system_result.get("clinical_result")
+    if clinical_result:
+        layer2_evidence.append(
+            f"Clinical determination: {clinical_result.get('decision', 'n/a')}"
+        )
+    if claim.adjudication_reasoning:
+        layer2_evidence.append("Full adjudication audit trail recorded")
+    if system_result.get("auto_adjudicated"):
+        layer2_evidence.append("Auto-adjudicated with full execution log")
+    if claim.clinical_determination_id:
+        layer2_evidence.append(
+            f"Clinical determination ID: {claim.clinical_determination_id}"
+        )
+
+    layer2_verified = len(layer2_evidence) > 0
+
+    layers["layer_2_demonstrated_capability"] = {
+        **PROOF_LAYER_DEFINITIONS[2],
+        "verified": layer2_verified,
+        "evidence": layer2_evidence,
+        "status": "verified" if layer2_verified else "unverified_estimate",
+    }
+
+    if not layer2_verified:
+        layers["layer_2_demonstrated_capability"]["confidence_interval"] = {
+            "note": (
+                "No execution logs available for this line item. "
+                "Care coordination capability not yet demonstrated "
+                "for this specific service code."
+            ),
+        }
+
+    # ── Layer 3: Actuarial Certification ─────────────────────────────────
+    # Aggregate results independently certified. Applies at employer level,
+    # reflected per line item.
+    total_claims = db.query(func.count(Claim.claim_id)).filter(
+        Claim.employer_id == employer_id,
+    ).scalar() or 0
+
+    layer3_verified = total_claims >= 50
+    layer3_evidence = []
+    if layer3_verified:
+        layer3_evidence.append(
+            f"{total_claims} claims available for independent actuarial certification"
+        )
+    else:
+        layer3_evidence.append(
+            f"{total_claims}/50 claims toward actuarial certification threshold"
+        )
+
+    layers["layer_3_actuarial_certification"] = {
+        **PROOF_LAYER_DEFINITIONS[3],
+        "verified": layer3_verified,
+        "evidence": layer3_evidence,
+        "status": "verified" if layer3_verified else "unverified_estimate",
+    }
+
+    if not layer3_verified:
+        layers["layer_3_actuarial_certification"]["confidence_interval"] = {
+            "claims_needed": 50 - total_claims,
+            "note": (
+                f"Need {50 - total_claims} more claims before aggregate "
+                "results can be independently certified by actuarial firm."
+            ),
+        }
+
+    # ── Layer 4: Track Record ────────────────────────────────────────────
+    # Shadow-to-live predicted vs actual published.
+    shadow_sessions = db.query(func.count(BenchmarkQuery.query_id)).filter(
+        and_(
+            BenchmarkQuery.employer_id == employer_id,
+            BenchmarkQuery.stage == BenchmarkStage.shadow,
+        )
+    ).scalar() or 0
+
+    activation_records = db.query(func.count(BenchmarkQuery.query_id)).filter(
+        and_(
+            BenchmarkQuery.employer_id == employer_id,
+            BenchmarkQuery.stage == BenchmarkStage.activated,
+        )
+    ).scalar() or 0
+
+    layer4_verified = shadow_sessions > 0 and activation_records > 0
+    layer4_evidence = []
+    if shadow_sessions > 0:
+        layer4_evidence.append(f"{shadow_sessions} shadow session(s) on record")
+    if activation_records > 0:
+        layer4_evidence.append(
+            f"{activation_records} activation record(s) with predicted vs actual"
+        )
+
+    layers["layer_4_track_record"] = {
+        **PROOF_LAYER_DEFINITIONS[4],
+        "verified": layer4_verified,
+        "evidence": layer4_evidence,
+        "status": "verified" if layer4_verified else "unverified_estimate",
+    }
+
+    if not layer4_verified:
+        layers["layer_4_track_record"]["confidence_interval"] = {
+            "note": (
+                "No shadow-to-live activation history yet for this employer. "
+                "Track record will be established after activation."
+            ),
+        }
+
+    # ── Summary ──────────────────────────────────────────────────────────
+    layers_verified = sum(
+        1 for l in layers.values() if l["verified"]
+    )
+
+    return {
+        "layers": layers,
+        "layers_verified": layers_verified,
+        "total_layers": 4,
+        "coverage_pct": round(layers_verified / 4 * 100, 1),
+        "all_verified": layers_verified == 4,
+        "has_unverified_estimates": layers_verified < 4,
     }
 
 

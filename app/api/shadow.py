@@ -113,3 +113,24 @@ def shadow_confidence(employer_id: str, db: Session = Depends(get_db)):
         return get_shadow_confidence(db, employer_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/activate/{employer_id}")
+def activate_from_shadow_mode(employer_id: str, db: Session = Depends(get_db)):
+    """One-click activation: transition from shadow to live.
+
+    Constitution: "One-click transition from shadow to live. Zero data
+    re-entry." All configuration, employee mappings, and carrier
+    connections carry over automatically.
+
+    This is the one-click activation endpoint accessible from the shadow
+    dashboard. It validates that the employer is in shadow mode, gathers
+    shadow performance data, and transitions to live.
+    """
+    from app.services.shadow_mode import activate_from_shadow
+
+    result = activate_from_shadow(db, employer_id)
+    if "error" in result:
+        status_code = 404 if result["error"] == "employer_not_found" else 400
+        raise HTTPException(status_code=status_code, detail=result)
+    return result

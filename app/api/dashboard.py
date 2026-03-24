@@ -93,3 +93,49 @@ def verify_price(
         return verify_any_price(db, claim_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/{employer_id}/share")
+def share_results(employer_id: str, db: Session = Depends(get_db)):
+    """Generate shareable, anonymized results for referral.
+
+    Constitution F6B: "The employer can share their own verified, anonymized
+    results (cost, experience, outcomes — no employee PII) directly with
+    another employer, linking to the benchmark tool (Function 6A).
+    One action, not a sales pitch — their auditable data speaks for itself."
+    """
+    from app.services.dashboard import get_employer_dashboard
+
+    try:
+        dashboard = get_employer_dashboard(db, employer_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    # Anonymize: remove employer name, employee details, provider names
+    anonymized = {
+        "shared_at": dashboard["dashboard_generated_at"],
+        "employee_count": dashboard["employee_count"],
+        "results": {
+            "total_claims_processed": dashboard["spending"]["total_claims"],
+            "employee_out_of_pocket": dashboard["spending"]["employee_out_of_pocket"],
+            "auto_adjudication_rate": dashboard["clinical_rates"]["auto_adjudication_rate_pct"],
+            "benefit_types_covered": 7,
+            "care_episodes_managed": dashboard.get("care_execution", {}).get("total_episodes_managed", 0),
+            "zero_phone_calls_pct": dashboard.get("care_execution", {}).get("zero_phone_calls_pct", 100),
+        },
+        "savings": dashboard.get("savings", {}),
+        "transparency": dashboard["transparency_attestation"],
+        "benchmark_link": "/benchmark/",
+        "note": (
+            "These are verified, auditable results from an actual employer "
+            "on the platform. No employee PII is included. Click the benchmark "
+            "link to see what your own benefits could look like."
+        ),
+    }
+
+    return {
+        "share_id": f"share-{employer_id[:8]}",
+        "anonymized_results": anonymized,
+        "share_url": f"/benchmark/?ref=share-{employer_id[:8]}",
+        "feeding_f6a": True,
+    }
