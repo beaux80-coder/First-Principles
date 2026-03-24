@@ -28,10 +28,13 @@ PRICING_CHANNELS = [
     "reference_medicaid",
     "hospital_transparency_rate",
     "insurer_transparency_rate",
+    "insurer_mrf_negotiated",      # Insurer MRF negotiated rates
     "nadac_pharmacy",              # National Average Drug Acquisition Cost
     "asp_drug",                    # Average Sales Price (Part B drugs)
     "manufacturer_patient_program", # Manufacturer assistance
-    "discount_card",               # GoodRx-style
+    "discount_card",               # GoodRx scraped prices
+    "goodrx_scrape",               # GoodRx.com scraped discount prices
+    "state_apcd",                  # State All-Payer Claims Database
     "dpc_membership",              # Direct Primary Care
     "dmepos_rate",                 # Durable medical equipment
     "va_rate",                     # VA Community Care
@@ -187,7 +190,42 @@ def compare_all_channels(
             "source": "State Medicaid Fee Schedule",
         })
 
-    # 12. Dental fee schedules
+    # 12. State APCD data (all-payer claims)
+    apcd_prices = _query_prices(db, service_code, PriceSource.state_apcd, state=state)
+    for p in apcd_prices:
+        channels_compared.append({
+            "channel": "state_apcd",
+            "price": float(p.price),
+            "provider": p.provider_name,
+            "verified": True,
+            "source": f"State APCD ({p.state or 'unknown'})",
+        })
+
+    # 13. GoodRx scraped discount prices (pharmacy)
+    goodrx_prices = _query_prices(db, service_code, PriceSource.goodrx_scrape, state=state)
+    for p in goodrx_prices:
+        channels_compared.append({
+            "channel": "discount_card",
+            "price": float(p.price),
+            "provider": p.provider_name,
+            "verified": True,
+            "source": f"GoodRx scraped ({p.provider_name})",
+        })
+
+    # 14. Insurer MRF negotiated rates
+    insurer_mrf_prices = _query_prices(db, service_code, PriceSource.insurer_transparency,
+                                        provider_npi=provider_npi, state=state)
+    for p in insurer_mrf_prices:
+        channels_compared.append({
+            "channel": "insurer_mrf_negotiated",
+            "price": float(p.price),
+            "provider": p.provider_name,
+            "verified": True,
+            "source": f"Insurer MRF ({p.provider_name})",
+            "source_url": p.source_url,
+        })
+
+    # 15. Dental fee schedules
     if benefit_type == "dental":
         dental_prices = _query_prices(db, service_code, PriceSource.dental_fee_schedule, state=state)
         for p in dental_prices:
@@ -337,14 +375,66 @@ def compare_pharmacy_channels(
             "note": "Many manufacturers offer $0 or reduced copay programs — checked at point of service",
         })
 
-    # 5. Discount card pricing (GoodRx-style)
-    channels.append({
-        "channel": "discount_card",
-        "price": None,  # Requires real-time API
-        "source": "Discount card programs (compared at point of service)",
-        "verified": False,
-        "note": "Discount card prices compared in real time at pharmacy",
-    })
+    # 5. GoodRx scraped prices (discount card channel)
+    goodrx_prices = db.query(PriceData).filter(
+        PriceData.source == PriceSource.goodrx_scrape,
+        PriceData.service_code == ndc_code,
+    ).order_by(PriceData.price.asc()).limit(5).all()
+    if goodrx_prices:
+        for gp in goodrx_prices:
+            channels.append({
+                "channel": "discount_card",
+                "price": float(gp.price),
+                "source": f"GoodRx scraped price ({gp.provider_name})",
+                "verified": True,
+                "note": "GoodRx discount price scraped from public website",
+            })
+    else:
+        # Also try matching by drug name
+        if drug_name:
+            goodrx_by_name = db.query(PriceData).filter(
+                PriceData.source == PriceSource.goodrx_scrape,
+                PriceData.service_code == drug_name.lower(),
+            ).order_by(PriceData.price.asc()).limit(5).all()
+            if goodrx_by_name:
+                for gp in goodrx_by_name:
+                    channels.append({
+                        "channel": "discount_card",
+                        "price": float(gp.price),
+                        "source": f"GoodRx scraped price ({gp.provider_name})",
+                        "verified": True,
+                        "note": "GoodRx discount price scraped from public website (matched by drug name)",
+                    })
+            else:
+                channels.append({
+                    "channel": "discount_card",
+                    "price": None,
+                    "source": "GoodRx — no scraped data yet; run /data-pipeline/ingest/goodrx to populate",
+                    "verified": False,
+                    "note": "GoodRx prices will be compared once scraper has run",
+                })
+        else:
+            channels.append({
+                "channel": "discount_card",
+                "price": None,
+                "source": "GoodRx — no scraped data yet; run /data-pipeline/ingest/goodrx to populate",
+                "verified": False,
+                "note": "GoodRx prices will be compared once scraper has run",
+            })
+
+    # 6. State APCD data (all-payer claims)
+    apcd_prices = db.query(PriceData).filter(
+        PriceData.source == PriceSource.state_apcd,
+        PriceData.service_code == ndc_code,
+    ).order_by(PriceData.price.asc()).limit(5).all()
+    for ap in apcd_prices:
+        channels.append({
+            "channel": "state_apcd",
+            "price": float(ap.price),
+            "source": f"State APCD ({ap.state or 'unknown'})",
+            "verified": True,
+            "note": "All-Payer Claims Database average allowed amount",
+        })
 
     # Filter and sort
     priced_channels = [c for c in channels if c["price"] and c["price"] > 0]

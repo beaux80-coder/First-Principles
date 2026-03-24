@@ -233,6 +233,201 @@ def pipeline_metrics(db: Session = Depends(get_db)):
     return get_pipeline_dashboard(db)
 
 
+@router.post("/ingest/goodrx")
+def trigger_goodrx_scrape(
+    background_tasks: BackgroundTasks,
+    max_drugs: int = 20,
+    user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Scrape GoodRx.com pharmacy prices for top prescribed drugs.
+
+    Constitution F2: "Any pricing channel that physically exists and is
+    legally accessible." GoodRx prices are publicly visible on their website.
+    Web scraping public prices is legal (hiQ Labs v. LinkedIn, 2022).
+
+    Compares against NADAC and records every comparison feeding F8.
+    If scraping is blocked (403/CAPTCHA), documents the barrier.
+    """
+    def _run():
+        from app.database import SessionLocal
+        from app.services.goodrx_scraper import scrape_goodrx_batch
+        session = SessionLocal()
+        try:
+            results = scrape_goodrx_batch(session, max_drugs=max_drugs)
+            logger.info(
+                f"GoodRx scrape complete: {results['drugs_with_prices']}/{results['drugs_attempted']} "
+                f"with prices, {results['drugs_blocked']} blocked"
+            )
+        except Exception as e:
+            logger.error(f"GoodRx scrape failed: {e}")
+        finally:
+            session.close()
+
+    background_tasks.add_task(_run)
+    return {
+        "status": "scrape_started",
+        "max_drugs": max_drugs,
+        "message": f"Scraping GoodRx prices for up to {max_drugs} drugs in background",
+        "legal_basis": "hiQ Labs v. LinkedIn (2022) — scraping publicly visible prices is legal",
+    }
+
+
+@router.get("/goodrx/status")
+def goodrx_status(db: Session = Depends(get_db)):
+    """Get GoodRx scraping status and results.
+
+    Shows scraped prices, comparison results vs NADAC, and any barriers.
+    """
+    from app.services.goodrx_scraper import scrape_goodrx_batch, TOP_PRESCRIBED_DRUGS
+    from app.models.price_data import PriceData, PriceSource
+    from app.models.data_pipeline_metric import DataPipelineMetric
+    from sqlalchemy import func
+
+    # Count stored GoodRx prices
+    goodrx_count = db.query(func.count(PriceData.price_id)).filter(
+        PriceData.source == PriceSource.goodrx_scrape
+    ).scalar() or 0
+
+    # Get latest metric
+    latest_metric = db.query(DataPipelineMetric).filter(
+        DataPipelineMetric.metric_type == "goodrx_price_scrape"
+    ).order_by(DataPipelineMetric.measured_at.desc()).first()
+
+    return {
+        "goodrx_prices_stored": goodrx_count,
+        "top_drugs_tracked": len(TOP_PRESCRIBED_DRUGS),
+        "latest_scrape": latest_metric.details if latest_metric else None,
+        "latest_scrape_at": latest_metric.measured_at.isoformat() if latest_metric else None,
+        "channel": "discount_card (GoodRx)",
+        "legal_basis": "hiQ Labs v. LinkedIn (2022)",
+    }
+
+
+@router.post("/ingest/apcd")
+def trigger_apcd_ingestion(
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Ingest State All-Payer Claims Database (APCD) data.
+
+    Constitution F8: "Is there any publicly available data source the system
+    does not ingest?"
+
+    Attempts to download freely available APCD data from:
+    - Colorado (CIVHC)
+    - New Hampshire (NHCHIS)
+    - Maine (MHDO)
+    - Rhode Island DOH
+
+    Documents registration requirements where applicable.
+    """
+    def _run():
+        from app.database import SessionLocal
+        from app.services.apcd_ingester import ingest_all_apcd_states
+        session = SessionLocal()
+        try:
+            results = ingest_all_apcd_states(session)
+            logger.info(
+                f"APCD ingestion complete: {results['states_with_data']}/{results['states_attempted']} "
+                f"states with data, {results['total_records_ingested']} records"
+            )
+        except Exception as e:
+            logger.error(f"APCD ingestion failed: {e}")
+        finally:
+            session.close()
+
+    background_tasks.add_task(_run)
+    return {
+        "status": "ingestion_started",
+        "states": ["CO", "NH", "ME", "RI"],
+        "message": "Discovering and ingesting state APCD data in background",
+    }
+
+
+@router.get("/apcd/status")
+def apcd_status(db: Session = Depends(get_db)):
+    """Get State APCD ingestion status and results."""
+    from app.models.price_data import PriceData, PriceSource
+    from app.models.data_pipeline_metric import DataPipelineMetric
+    from sqlalchemy import func
+
+    apcd_count = db.query(func.count(PriceData.price_id)).filter(
+        PriceData.source == PriceSource.state_apcd
+    ).scalar() or 0
+
+    latest_metric = db.query(DataPipelineMetric).filter(
+        DataPipelineMetric.metric_type == "state_apcd_ingestion"
+    ).order_by(DataPipelineMetric.measured_at.desc()).first()
+
+    return {
+        "apcd_records_stored": apcd_count,
+        "states_configured": ["CO", "NH", "ME", "RI"],
+        "latest_ingestion": latest_metric.details if latest_metric else None,
+        "latest_ingestion_at": latest_metric.measured_at.isoformat() if latest_metric else None,
+    }
+
+
+@router.post("/ingest/mrf-index")
+def trigger_mrf_index_ingestion(
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Ingest the CMS Insurer MRF (Machine-Readable File) index.
+
+    Constitution F8: Full MRF files are 10-100GB each. This endpoint:
+    1. Ingests the CMS MRF index (list of all insurer MRF file locations)
+    2. Records the number of insurers with published MRFs
+    3. For one small insurer, attempts to download and parse a sample
+    4. Documents disk space barriers for large files
+    """
+    def _run():
+        from app.database import SessionLocal
+        from app.services.mrf_index_ingester import ingest_mrf_index
+        session = SessionLocal()
+        try:
+            results = ingest_mrf_index(session)
+            logger.info(
+                f"MRF index ingestion complete: {results['insurers_accessible']}/{results['insurers_probed']} "
+                f"accessible, {results['total_mrf_files_discovered']} MRF files discovered"
+            )
+        except Exception as e:
+            logger.error(f"MRF index ingestion failed: {e}")
+        finally:
+            session.close()
+
+    background_tasks.add_task(_run)
+    return {
+        "status": "ingestion_started",
+        "message": "Probing insurer MRF indexes and sampling data in background",
+        "insurers_to_probe": 15,  # Number of insurers in KNOWN_INSURER_MRF_INDEXES
+    }
+
+
+@router.get("/mrf-index/status")
+def mrf_index_status(db: Session = Depends(get_db)):
+    """Get CMS MRF index ingestion status and results."""
+    from app.models.price_data import PriceData, PriceSource
+    from app.models.data_pipeline_metric import DataPipelineMetric
+    from sqlalchemy import func
+
+    mrf_index_count = db.query(func.count(PriceData.price_id)).filter(
+        PriceData.source == PriceSource.insurer_mrf_index
+    ).scalar() or 0
+
+    latest_metric = db.query(DataPipelineMetric).filter(
+        DataPipelineMetric.metric_type == "insurer_mrf_index_ingestion"
+    ).order_by(DataPipelineMetric.measured_at.desc()).first()
+
+    return {
+        "mrf_index_entries_stored": mrf_index_count,
+        "latest_ingestion": latest_metric.details if latest_metric else None,
+        "latest_ingestion_at": latest_metric.measured_at.isoformat() if latest_metric else None,
+    }
+
+
 @router.get("/cross-type-signals")
 def cross_type_signals(db: Session = Depends(get_db)):
     """Actionable cross-type intelligence signals for downstream functions.
