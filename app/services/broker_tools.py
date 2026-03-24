@@ -271,25 +271,122 @@ def compare_vs_incumbent(db: Session, employer_id: uuid.UUID) -> dict:
     savings_pepm = baseline_pepm - actual_pepm
     savings_annual = savings_pepm * employee_count * 12
 
+    # Auto-adjudication rate
+    auto_rate = round(auto_adjudicated / max(total_claims, 1) * 100, 1)
+
+    # ── Full product comparison (not just cost) ─────────────────────
+    product_comparison = {
+        "cost": {
+            "dimension": "Total Cost of Benefits",
+            "incumbent": f"${round(baseline_pepm, 2):,.2f} PEPM",
+            "beneflex": f"${actual_pepm:,.2f} PEPM",
+            "advantage": f"${round(savings_pepm, 2):,.2f}/employee/month savings",
+            "winner": "beneflex" if savings_pepm > 0 else "incumbent",
+        },
+        "employee_cost_sharing": {
+            "dimension": "Employee Out-of-Pocket",
+            "incumbent": "28% average cost-sharing (copays, deductibles, coinsurance)",
+            "beneflex": "$0 — zero employee cost-sharing across all benefit types",
+            "advantage": "Employees pay nothing out-of-pocket",
+            "winner": "beneflex",
+        },
+        "benefit_coverage": {
+            "dimension": "Benefit Types Covered",
+            "incumbent": "Typically 3-4 types (health, dental, vision; others separate)",
+            "beneflex": "All 7 types from day one (health, dental, vision, mental health, Rx, disability, life)",
+            "advantage": "Complete coverage without separate carriers or enrollments",
+            "winner": "beneflex",
+        },
+        "claims_speed": {
+            "dimension": "Claims Processing Speed",
+            "incumbent": "14 days average (industry standard)",
+            "beneflex": f"{round(float(avg_latency), 1) if avg_latency else '<10'} ms average",
+            "advantage": "Real-time vs weeks of waiting",
+            "winner": "beneflex",
+        },
+        "automation": {
+            "dimension": "Claims Automation",
+            "incumbent": "Manual review for most claims, batch processing",
+            "beneflex": f"{auto_rate}% auto-adjudicated, real-time processing",
+            "advantage": "Fewer errors, faster resolution, lower admin burden",
+            "winner": "beneflex",
+        },
+        "transparency": {
+            "dimension": "Price and Decision Transparency",
+            "incumbent": "Opaque — negotiated rates hidden, decision logic proprietary",
+            "beneflex": "Full — every line item auditable, every price independently verifiable",
+            "advantage": "Employer can verify every dollar spent",
+            "winner": "beneflex",
+        },
+        "clinical_independence": {
+            "dimension": "Clinical Decision Making",
+            "incumbent": "Financial incentives influence coverage decisions (denial-driven revenue)",
+            "beneflex": "F1 Clinical Quality Engine — evidence-based, no financial inputs",
+            "advantage": "Decisions driven by clinical evidence, not profit motive",
+            "winner": "beneflex",
+        },
+        "carrier_overhead": {
+            "dimension": "Administrative Overhead",
+            "incumbent": f"{round(INDUSTRY_COST_BREAKDOWN['carrier_overhead_pct'] * 100, 1)}% of premium goes to carrier overhead",
+            "beneflex": "0% carrier overhead — pass-through cost model only",
+            "advantage": "Every dollar goes to care, not carrier profit",
+            "winner": "beneflex",
+        },
+        "pricing_model": {
+            "dimension": "Revenue / Pricing Model",
+            "incumbent": "Premium-based — carrier profits from higher premiums",
+            "beneflex": "Value-share only — earns only when employer saves vs verifiable baseline",
+            "advantage": "Incentives permanently aligned with employer outcomes",
+            "winner": "beneflex",
+        },
+        "broker_compensation": {
+            "dimension": "Broker Compensation",
+            "incumbent": "Commission from premium (3-6%), creates misaligned incentives",
+            "beneflex": "Advisory fee from value-share revenue, fully disclosed, no exclusivity",
+            "advantage": "Broker earns more when employer saves more",
+            "winner": "beneflex",
+        },
+        "onboarding": {
+            "dimension": "Implementation / Onboarding",
+            "incumbent": "60-90 day implementation, data re-entry, manual enrollment",
+            "beneflex": "Shadow mode (zero-risk proof) then one-click activation, zero data re-entry",
+            "advantage": "Prove savings before commitment, then instant go-live",
+            "winner": "beneflex",
+        },
+    }
+
     return {
         "employer_id": str(employer_id),
         "employer_name": employer.name,
         "employee_count": employee_count,
         "comparison_date": datetime.now(UTC).isoformat(),
 
-        "incumbent": incumbent_metrics,
-        "beneflex": beneflex_metrics,
-
-        "advantage": {
+        "cost_comparison": {
+            "incumbent": incumbent_metrics,
+            "beneflex": beneflex_metrics,
             "savings_pepm": round(savings_pepm, 2),
             "savings_annual": round(savings_annual, 2),
             "savings_pct": round(
                 savings_pepm / max(baseline_pepm, 1) * 100, 1
             ),
-            "oop_eliminated_pct": 28.0,
-            "speed_improvement": "Milliseconds vs 14 days",
-            "transparency_improvement": "Full vs opaque",
-            "benefit_types_improvement": "7 vs 3-4",
+        },
+
+        "product_comparison": product_comparison,
+
+        "product_summary": {
+            "total_dimensions": len(product_comparison),
+            "beneflex_wins": sum(
+                1 for d in product_comparison.values() if d["winner"] == "beneflex"
+            ),
+            "incumbent_wins": sum(
+                1 for d in product_comparison.values() if d["winner"] == "incumbent"
+            ),
+            "note": (
+                "This comparison covers the full product experience, not just cost. "
+                "Beneflex delivers a fundamentally different benefits model: zero "
+                "employee cost-sharing, all 7 benefit types, full transparency, "
+                "and aligned incentives."
+            ),
         },
 
         "constitutional_guarantees": {
@@ -298,6 +395,9 @@ def compare_vs_incumbent(db: Session, employer_id: uuid.UUID) -> dict:
             "every_price_verifiable": True,
             "clinical_decisions_independent": True,
             "sole_revenue_from_savings": True,
+            "all_7_benefit_types": True,
+            "no_carrier_overhead": True,
+            "broker_fee_from_value_share_only": True,
         },
     }
 
