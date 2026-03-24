@@ -1310,11 +1310,19 @@ def navigate_care(
     selected_provider_id = None
     try:
         from app.services.provider_selection import select_provider
+        # Get employer's state for provider search
+        from app.models.employer import Employer
+        employer = db.query(Employer).filter(
+            Employer.employer_id == employee.employer_id
+        ).first()
+        emp_state = employer.geography if employer else None
+
         provider_result = select_provider(
             db=db,
             condition=condition,
             benefit_type=benefit_type,
             patient_history={},
+            state=emp_state,
         )
         selection = provider_result.get("selection", {})
         clinical_filtering = provider_result.get("clinical_filtering", {})

@@ -156,13 +156,22 @@ def select_provider(
 
     # Persist audit record to immutable F8 data pipeline
     try:
+        import json
+        from decimal import Decimal
+        # Convert Decimals to floats for JSON serialization
+        def _default(o):
+            if isinstance(o, Decimal):
+                return float(o)
+            raise TypeError
+        clean_record = json.loads(json.dumps(audit_record, default=_default))
+
         from app.models.audit_log import AuditLog
         log = AuditLog(
             actor="system:provider_selection",
             action="provider_selection",
             resource_type="provider_selection",
             resource_id=audit_record["selection_id"],
-            details=audit_record,
+            details=clean_record,
         )
         db.add(log)
         db.commit()
@@ -218,7 +227,7 @@ def _clinical_filtering(
     for provider in all_providers:
         evaluated += 1
         # Check if provider meets clinical sufficiency threshold
-        quality = provider.quality_score or 0.0
+        quality = float(provider.quality_score) if provider.quality_score is not None else 0.0
         data_points = provider.outcome_data_points or 0
 
         # Calculate confidence-adjusted score using Wilson score interval

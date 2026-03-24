@@ -91,6 +91,19 @@ def run_shadow_comparison(
         f"{employer_id}:{employee_external_id}",
     )
 
+    # Ensure employee record exists (shadow mode creates placeholder employees)
+    existing_employee = db.query(Employee).filter(
+        Employee.employee_id == employee_id,
+    ).first()
+    if not existing_employee:
+        shadow_employee = Employee(
+            employee_id=employee_id,
+            employer_id=employer_id,
+            status=EmployeeStatus.active,
+        )
+        db.add(shadow_employee)
+        db.flush()
+
     billed_amount = carrier_claim.get("billed_amount", 0.0)
     carrier_paid = carrier_claim.get("carrier_paid_amount", billed_amount)
     carrier_oop = carrier_claim.get("employee_oop", 0.0)
@@ -106,6 +119,14 @@ def run_shadow_comparison(
         status=ClaimStatus.submitted,
         amount_billed=billed_amount,
         amount_employee_oop=0.00,
+        shadow_carrier_data={
+            "carrier_claim_id": carrier_claim.get("carrier_claim_id", ""),
+            "carrier_paid": carrier_paid,
+            "carrier_oop": carrier_oop,
+            "carrier_total_cost": carrier_paid + carrier_oop,
+            "carrier_decision": carrier_decision,
+            "carrier_processing_days": carrier_processing_days,
+        },
     )
     db.add(shadow_claim)
     db.flush()

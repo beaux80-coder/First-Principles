@@ -27,6 +27,7 @@ from app.models.claim import Claim, ClaimStatus, ClaimMode
 from app.models.employer import Employer, EmployerStatus
 from app.models.benchmark_query import BenchmarkQuery, BenchmarkStage
 from app.models.service import BenefitType
+from app.models.employee import Employee, EmployeeStatus
 from app.services.carrier_integration import (
     connect_carrier,
     fetch_carrier_claims,
@@ -161,6 +162,19 @@ def process_shadow_claim(
         uuid.NAMESPACE_DNS,
         f"{employer_id}:{carrier_claim.employee_external_id}",
     )
+
+    # Ensure employee record exists (shadow mode creates placeholder employees)
+    existing_employee = db.query(Employee).filter(
+        Employee.employee_id == employee_id,
+    ).first()
+    if not existing_employee:
+        shadow_employee = Employee(
+            employee_id=employee_id,
+            employer_id=employer_id,
+            status=EmployeeStatus.active,
+        )
+        db.add(shadow_employee)
+        db.flush()
 
     # Create shadow claim
     shadow_claim = Claim(

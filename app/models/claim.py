@@ -80,5 +80,10 @@ class Claim(Base):
     # Denial reason code (when denied)
     denial_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
+    # --- Shadow mode carrier comparison data ---
+    # Stores the carrier's actual amounts for shadow mode claims so the
+    # report and confidence endpoints can use real carrier data for comparison
+    shadow_carrier_data: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+
     employer = relationship("Employer", back_populates="claims")
     employee = relationship("Employee", back_populates="claims")

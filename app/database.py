@@ -1,7 +1,23 @@
+import json
+from decimal import Decimal
+
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 from app.config import settings
+
+
+def _json_serializer(obj):
+    """Custom JSON serializer that handles Decimal types."""
+    def default(o):
+        if isinstance(o, Decimal):
+            return float(o)
+        raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+    return json.dumps(obj, default=default)
+
+
+def _json_deserializer(s):
+    return json.loads(s)
 
 connect_args = {}
 if settings.database_url.startswith("sqlite"):
@@ -11,6 +27,8 @@ engine = create_engine(
     settings.database_url,
     pool_pre_ping=not settings.database_url.startswith("sqlite"),
     connect_args=connect_args,
+    json_serializer=_json_serializer,
+    json_deserializer=_json_deserializer,
 )
 
 # Enable foreign keys for SQLite

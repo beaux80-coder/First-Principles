@@ -44,3 +44,5 @@ models/*/.cache/
 
 # Logs
 *.log
+beneflex.db-shm
+beneflex.db-wal
