@@ -113,14 +113,16 @@ def evaluate_ml_techniques(db: Session) -> dict:
 
     # --- 6. NLP / Semantic Search (Clinical Guidelines) ---
     evaluations["techniques"].append({
-        "name": "Semantic Search with Embeddings (pgvector)",
+        "name": "Semantic Search with Embeddings (ONNX ClinicalBERT)",
         "description": "Embed clinical guidelines and service descriptions for semantic matching in F1 determinations",
         "applicable": True,
-        "implemented": False,
+        "implemented": True,
         "evaluated": True,
-        "status": "deferred_to_F1",
-        "reason": "Requires F1 (Clinical Quality Engine) and pgvector. Building in Step 2.",
-        "data_requirement_met": True,  # Service descriptions exist
+        "status": "implemented",
+        "reason": "Implemented in F1: Hybrid TF-IDF + ONNX Bio_ClinicalBERT. "
+                  "768-dimensional embeddings cached for all guidelines. "
+                  "Final score = 0.3*tfidf + 0.7*bert. Runs locally in TEE.",
+        "data_requirement_met": True,
         "feeds": ["F1 (Clinical Quality Engine)"],
     })
 

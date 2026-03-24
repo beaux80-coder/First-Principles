@@ -3,7 +3,7 @@ from datetime import datetime
 
 import enum
 
-from sqlalchemy import String, Numeric, ForeignKey, DateTime
+from sqlalchemy import String, Numeric, ForeignKey, DateTime, Text, Boolean, Float, JSON
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -61,6 +61,24 @@ class Claim(Base):
     submitted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     adjudicated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # --- F5 Adjudication fields ---
+    # Reasoning trace for the adjudication decision
+    adjudication_reasoning: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Duplicate detection result
+    duplicate_check: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Coding validation result (CPT/ICD accuracy, bundling, modifier checks)
+    coding_validation: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Error flags raised during adjudication
+    error_flags: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # End-to-end processing latency: submission to payment (ms)
+    processing_latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Whether the claim was fully auto-adjudicated or required human review
+    auto_adjudicated: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # Eligibility verification result
+    eligibility_check: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Denial reason code (when denied)
+    denial_reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
     employer = relationship("Employer", back_populates="claims")
     employee = relationship("Employee", back_populates="claims")

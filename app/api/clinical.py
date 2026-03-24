@@ -196,3 +196,32 @@ def ingest_guidelines(db: Session = Depends(get_db)):
     """
     from app.services.clinical_guidelines_ingester import ingest_all_dynamic_sources
     return ingest_all_dynamic_sources(db)
+
+
+@router.post("/nlp/fine-tune")
+def fine_tune_nlp(db: Session = Depends(get_db)):
+    """Fine-tune NLP model on the current guideline corpus.
+
+    Constitution: "Is there any physically possible, legally permitted method
+    to increase accuracy that has not been implemented?"
+
+    This analyzes the corpus to identify high-information clinical terms
+    and optimizes TF-IDF feature weights for better matching accuracy.
+    """
+    from app.services.clinical_nlp import fine_tune_on_corpus
+    return fine_tune_on_corpus(db)
+
+
+@router.post("/nlp/retrain")
+def retrain_from_outcomes(db: Session = Depends(get_db)):
+    """Active learning: retrain model from outcome feedback.
+
+    Constitution: "Is there any physically possible, legally permitted method
+    to increase accuracy that has not been implemented?"
+
+    When clinicians record outcomes (correct/incorrect via POST /clinical/outcome),
+    this retrains the model to boost weights for guideline-symptom pairs that
+    led to correct determinations and penalize incorrect ones.
+    """
+    from app.services.clinical_nlp import retrain_from_outcomes
+    return retrain_from_outcomes(db)

@@ -19,6 +19,17 @@ from app.services.data_downloaders import (
     download_nadac,
     download_medicare_pfs,
     download_hospital_transparency,
+    download_hospital_compare,
+    download_opps_rates,
+    download_quality_benchmarks,
+    download_insurer_tic,
+    download_medicaid_dental,
+    download_samhsa_data,
+    download_state_medicaid,
+    download_all_payer_claims,
+    download_dmepos_fee_schedule,
+    download_asp_drug_pricing,
+    download_va_fee_schedule,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,6 +72,54 @@ def _run_hospital_transparency_ingestion():
         logger.info(f"Scheduled hospital transparency ingestion complete: {count} records")
     except Exception as e:
         logger.error(f"Scheduled hospital transparency ingestion failed: {e}")
+    finally:
+        db.close()
+
+
+def _run_additional_sources_ingestion():
+    """Scheduled task: download dental, SAMHSA, state Medicaid, APCD data."""
+    logger.info("Scheduled task: Additional sources ingestion starting...")
+    db = SessionLocal()
+    try:
+        results = {}
+        for name, func in [
+            ("hospital_compare", download_hospital_compare),
+            ("opps_rates", download_opps_rates),
+            ("quality_benchmarks", download_quality_benchmarks),
+            ("medicaid_dental", download_medicaid_dental),
+            ("samhsa", download_samhsa_data),
+            ("state_medicaid", download_state_medicaid),
+            ("all_payer_claims", download_all_payer_claims),
+            ("dmepos", download_dmepos_fee_schedule),
+            ("asp_drug", download_asp_drug_pricing),
+            ("va_fee", download_va_fee_schedule),
+        ]:
+            try:
+                results[name] = func(db)
+            except Exception as e:
+                logger.error(f"  {name} failed: {e}")
+                results[name] = 0
+        logger.info(f"Additional sources ingestion complete: {results}")
+    except Exception as e:
+        logger.error(f"Additional sources ingestion failed: {e}")
+    finally:
+        db.close()
+
+
+def _run_cross_type_analytics():
+    """Scheduled task: run cross-type pattern detection and generate signals.
+
+    Constitution F8: "Is the data pipeline actively detecting cross-benefit-type
+    patterns (not just collecting data by type)?"
+    """
+    logger.info("Scheduled task: Cross-type analytics starting...")
+    db = SessionLocal()
+    try:
+        from app.services.cross_type_analytics import generate_cross_type_signals
+        signals = generate_cross_type_signals(db)
+        logger.info(f"Cross-type analytics complete: {len(signals)} signals generated")
+    except Exception as e:
+        logger.error(f"Cross-type analytics failed: {e}")
     finally:
         db.close()
 
@@ -118,8 +177,24 @@ def start_scheduler():
         replace_existing=True,
     )
 
+    # Additional sources (dental, SAMHSA, state Medicaid, APCD): weekly Wednesday 3:00 AM
+    scheduler.add_job(
+        _run_additional_sources_ingestion,
+        CronTrigger(day_of_week="wed", hour=3, minute=0),
+        id="additional_sources_weekly",
+        replace_existing=True,
+    )
+
+    # Cross-type analytics: daily at 6:00 AM (after guideline update, before business hours)
+    scheduler.add_job(
+        _run_cross_type_analytics,
+        CronTrigger(hour=6, minute=0),
+        id="cross_type_analytics_daily",
+        replace_existing=True,
+    )
+
     scheduler.start()
-    logger.info("Data pipeline scheduler started with 4 jobs")
+    logger.info("Data pipeline scheduler started with 6 jobs")
 
 
 def stop_scheduler():

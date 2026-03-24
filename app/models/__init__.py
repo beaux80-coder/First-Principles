@@ -10,6 +10,7 @@ from app.models.benchmark_query import BenchmarkQuery
 from app.models.audit_log import AuditLog
 from app.models.price_data import PriceData
 from app.models.clinical_guideline import ClinicalGuideline
+from app.services.payment import Payment
 
 __all__ = [
     "Employer",
@@ -24,4 +25,5 @@ __all__ = [
     "AuditLog",
     "PriceData",
     "ClinicalGuideline",
+    "Payment",
 ]

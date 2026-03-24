@@ -139,3 +139,41 @@ def published_research(db: Session = Depends(get_db)):
     """
     from app.services.research_publications import generate_research_report
     return generate_research_report(db)
+
+
+@router.get("/metrics")
+def pipeline_metrics(db: Session = Depends(get_db)):
+    """Full F8 data pipeline metrics dashboard.
+
+    Constitution F8 metrics:
+    - Data points per period by type, source, benefit type
+    - Public data coverage: % of U.S. hospitals/insurers ingested
+    - Data completeness: % of interactions producing structured records
+    - Cross-type data coverage
+    """
+    from app.services.data_pipeline_metrics import get_pipeline_dashboard
+    return get_pipeline_dashboard(db)
+
+
+@router.get("/cross-type-signals")
+def cross_type_signals(db: Session = Depends(get_db)):
+    """Actionable cross-type intelligence signals for downstream functions.
+
+    Constitution F8: "Is cross-type intelligence feeding Functions 1, 3, 4, and 9
+    with actionable signals?"
+    """
+    from app.services.cross_type_analytics import generate_cross_type_signals
+    signals = generate_cross_type_signals(db)
+    by_function = {}
+    for s in signals:
+        f = s["target_function"]
+        if f not in by_function:
+            by_function[f] = []
+        by_function[f].append(s)
+
+    return {
+        "total_signals": len(signals),
+        "functions_receiving_signals": sorted(by_function.keys()),
+        "signals_by_function": {k: len(v) for k, v in by_function.items()},
+        "signals": signals,
+    }

@@ -306,51 +306,42 @@ def ingest_nadac_pharmacy(db: Session, csv_content: str) -> int:
 
 
 def get_ingestion_stats(db: Session) -> dict:
-    """Get current data pipeline statistics including data quality metrics."""
-    from sqlalchemy import func
+    """Get current data pipeline statistics including data quality metrics.
 
-    total = db.query(func.count(PriceData.price_id)).scalar() or 0
+    Optimized for large datasets (11M+ rows) using raw SQL with indexes.
+    """
+    from sqlalchemy import text
 
-    by_source = dict(
-        db.query(PriceData.source, func.count(PriceData.price_id))
-        .group_by(PriceData.source)
-        .all()
-    )
+    # Use raw SQL for maximum performance on large tables
+    by_source = {}
+    rows = db.execute(text(
+        "SELECT source, COUNT(*) as cnt FROM price_data GROUP BY source"
+    )).fetchall()
+    for source, cnt in rows:
+        by_source[source] = cnt
+    total = sum(by_source.values())
 
-    by_state = dict(
-        db.query(PriceData.state, func.count(PriceData.price_id))
-        .filter(PriceData.state.isnot(None))
-        .group_by(PriceData.state)
-        .all()
-    )
+    # State coverage — count distinct states, skip the expensive per-state breakdown
+    state_count = db.execute(text(
+        "SELECT COUNT(DISTINCT state) FROM price_data WHERE state IS NOT NULL"
+    )).scalar() or 0
 
-    unique_providers = db.query(func.count(func.distinct(PriceData.provider_name))).scalar() or 0
-    unique_services = db.query(func.count(func.distinct(PriceData.service_code))).scalar() or 0
-
-    # Data quality: staleness per source (most recent ingestion timestamp)
+    # Staleness: most recent ingestion per source
     staleness = {}
-    for source_enum in PriceSource:
-        latest = db.query(func.max(PriceData.ingested_at)).filter(
-            PriceData.source == source_enum
-        ).scalar()
-        if latest:
-            staleness[str(source_enum)] = {
-                "last_ingested": latest.isoformat(),
-                "age_hours": round((datetime.utcnow() - latest).total_seconds() / 3600, 1),
-            }
-
-    # Coverage: states with 100+ records (sufficient for benchmark confidence)
-    states_with_coverage = sum(1 for v in by_state.values() if v >= 100)
+    staleness_rows = db.execute(text(
+        "SELECT source, MAX(ingested_at) as latest FROM price_data GROUP BY source"
+    )).fetchall()
+    for source, latest_str in staleness_rows:
+        if latest_str:
+            staleness[source] = {"last_ingested": str(latest_str)}
 
     return {
         "total_records": total,
-        "by_source": {str(k): v for k, v in by_source.items()},
-        "by_state": dict(by_state),
-        "unique_providers": unique_providers,
-        "unique_services": unique_services,
+        "by_source": by_source,
+        "states_with_data": state_count,
         "data_quality": {
             "staleness_by_source": staleness,
-            "states_with_sufficient_coverage": states_with_coverage,
-            "total_states_with_data": len(by_state),
         },
+        "sources_active": list(by_source.keys()),
+        "sources_count": len(by_source),
     }

@@ -24,6 +24,13 @@ class PriceSource(str, enum.Enum):
     medicare_inpatient = "medicare_inpatient"
     nadac_pharmacy = "nadac_pharmacy"
     cash_price = "cash_price"
+    samhsa_mental_health = "samhsa_mental_health"
+    state_medicaid = "state_medicaid"
+    dental_fee_schedule = "dental_fee_schedule"
+    all_payer_claims = "all_payer_claims"
+    dmepos_fee_schedule = "dmepos_fee_schedule"
+    asp_drug_pricing = "asp_drug_pricing"
+    va_fee_schedule = "va_fee_schedule"
     other = "other"
 
 
