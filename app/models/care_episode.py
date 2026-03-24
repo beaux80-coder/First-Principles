@@ -14,6 +14,8 @@ from app.models.service import BenefitType
 
 class EpisodeStatus(str, enum.Enum):
     open = "open"
+    scheduled = "scheduled"
+    in_progress = "in_progress"
     resolved = "resolved"
     abandoned = "abandoned"
 

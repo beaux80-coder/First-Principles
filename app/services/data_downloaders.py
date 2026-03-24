@@ -508,7 +508,273 @@ def download_hospital_compare(db: Session) -> int:
             break
 
     logger.info(f"Hospital Compare ingestion complete: {count} hospitals")
+
+    # After ingesting quality data, match to providers table
+    matched = match_quality_to_providers(db)
+    logger.info(f"Hospital Compare: matched quality scores to {matched} providers")
+
     return count
+
+
+def _normalize_name(name: str) -> str:
+    """Normalize a facility/provider name for fuzzy matching.
+
+    Strips common suffixes, punctuation, and extra whitespace so that
+    names like 'ST. VINCENT'S EAST' and 'ST VINCENTS EAST' compare equal.
+    """
+    import re
+    n = name.upper().strip()
+    # Remove common suffixes that differ between CMS and provider records
+    for suffix in [
+        " INC", " LLC", " PC", " P.C.", " PLLC", " LTD", " CORP",
+        " CORPORATION", " MEDICAL CENTER", " MED CTR", " HOSPITAL",
+        " HOSP", " HEALTH SYSTEM", " HEALTH", " CLINIC", " CENTER",
+        " CTR", " REGIONAL", " COMMUNITY", " MEMORIAL", " GENERAL",
+    ]:
+        if n.endswith(suffix):
+            n = n[: -len(suffix)].strip()
+    # Remove punctuation
+    n = re.sub(r"[^A-Z0-9 ]", "", n)
+    # Collapse whitespace
+    n = re.sub(r"\s+", " ", n).strip()
+    return n
+
+
+def match_quality_to_providers(db: Session) -> int:
+    """Match CMS Hospital Compare quality ratings to providers.quality_score.
+
+    Strategy:
+    1. Load all quality ratings from price_data (channel='cms_quality_rating')
+    2. Load all providers (all types, not just 'hospital')
+    3. Match by:
+       a. Exact NPI match (CMS facility_id stored in provider_npi vs provider.npi)
+       b. Normalized name + state match
+    4. Update provider.quality_score for every match found
+
+    Returns the number of providers whose quality_score was updated.
+    """
+    from app.models.provider import Provider
+    from app.models.price_data import PriceData
+
+    # Load all quality ratings with actual scores (price > 0 means 1-5 rating)
+    quality_rows = (
+        db.query(
+            PriceData.provider_name,
+            PriceData.provider_npi,  # CMS facility ID
+            PriceData.price,         # star rating 1-5
+            PriceData.state,
+        )
+        .filter(
+            PriceData.channel == "cms_quality_rating",
+            PriceData.price > 0,
+        )
+        .all()
+    )
+
+    if not quality_rows:
+        logger.info("No quality ratings with scores found in price_data")
+        return 0
+
+    logger.info(f"Loaded {len(quality_rows)} quality ratings for matching")
+
+    # Build lookup structures from CMS data
+    # By NPI/facility_id
+    quality_by_npi: dict[str, float] = {}
+    # By normalized_name + state
+    quality_by_name_state: dict[tuple[str, str], float] = {}
+
+    for row in quality_rows:
+        facility_name = row.provider_name or ""
+        facility_id = row.provider_npi or ""
+        rating = float(row.price)
+        state = (row.state or "").upper()
+
+        if facility_id:
+            quality_by_npi[facility_id] = rating
+
+        if facility_name and state:
+            norm = _normalize_name(facility_name)
+            if norm:
+                quality_by_name_state[(norm, state)] = rating
+
+    # Load all providers
+    providers = db.query(Provider).all()
+    matched = 0
+
+    for provider in providers:
+        score = None
+
+        # Strategy 1: NPI match (unlikely for hospitals but possible)
+        if provider.npi and provider.npi in quality_by_npi:
+            score = quality_by_npi[provider.npi]
+
+        # Strategy 2: Normalized name + state
+        if score is None and provider.name and provider.state:
+            norm = _normalize_name(provider.name)
+            state = provider.state.upper()
+            if (norm, state) in quality_by_name_state:
+                score = quality_by_name_state[(norm, state)]
+
+        # Strategy 3: Partial name containment (for short provider names)
+        if score is None and provider.name and provider.state:
+            prov_norm = _normalize_name(provider.name)
+            state = provider.state.upper()
+            if len(prov_norm) >= 5:
+                for (cms_norm, cms_state), rating in quality_by_name_state.items():
+                    if cms_state == state and (
+                        prov_norm in cms_norm or cms_norm in prov_norm
+                    ):
+                        score = rating
+                        break
+
+        if score is not None:
+            provider.quality_score = score
+            matched += 1
+
+    if matched > 0:
+        db.commit()
+        logger.info(f"Updated quality_score for {matched} providers")
+
+    return matched
+
+
+# ---------------------------------------------------------------------------
+# CMS Physician Quality API (MIPS / Quality Payment Program)
+# ---------------------------------------------------------------------------
+
+PHYSICIAN_COMPARE_API = "https://data.cms.gov/provider-data/api/1/datastore/query/mj5m-pzi6/0"
+
+
+def download_physician_quality(db: Session) -> int:
+    """Download CMS Physician Compare / MIPS quality data.
+
+    The mj5m-pzi6 dataset contains clinician-level quality information
+    including group practice PAC IDs and individual NPIs. We match by NPI
+    to update physician providers' quality_score.
+
+    Returns number of providers updated.
+    """
+    logger.info("Downloading CMS Physician Quality data...")
+
+    from app.models.provider import Provider
+
+    # Build NPI lookup for our providers
+    provider_by_npi: dict[str, Provider] = {}
+    for p in db.query(Provider).filter(Provider.npi.isnot(None)).all():
+        provider_by_npi[p.npi] = p
+
+    if not provider_by_npi:
+        logger.info("No providers with NPI found — skipping physician quality")
+        return 0
+
+    logger.info(f"Matching against {len(provider_by_npi)} providers with NPIs")
+
+    updated = 0
+    offset = 0
+    page_size = 500
+
+    while True:
+        try:
+            resp = httpx.get(
+                PHYSICIAN_COMPARE_API,
+                params={
+                    "offset": offset,
+                    "count": "true",
+                    "results": "true",
+                    "format": "csv",
+                    "limit": page_size,
+                },
+                timeout=httpx.Timeout(30.0, read=120.0),
+            )
+            if resp.status_code == 400:
+                # Try JSON format as fallback
+                resp = httpx.get(
+                    PHYSICIAN_COMPARE_API,
+                    params={
+                        "offset": offset,
+                        "count": "true",
+                        "results": "true",
+                        "limit": page_size,
+                    },
+                    timeout=httpx.Timeout(30.0, read=120.0),
+                )
+            resp.raise_for_status()
+        except (httpx.HTTPError, httpx.TimeoutException) as e:
+            logger.warning(f"Physician quality download failed at offset {offset}: {e}")
+            break
+
+        content_type = resp.headers.get("content-type", "")
+        rows_in_page = 0
+
+        if "json" in content_type or resp.text.lstrip().startswith("{"):
+            # JSON response
+            try:
+                data = resp.json()
+                results_list = data.get("results", [])
+                for row in results_list:
+                    rows_in_page += 1
+                    npi = str(row.get("npi", "") or row.get("NPI", "")).strip()
+                    if npi in provider_by_npi:
+                        # Look for quality/performance score fields
+                        score = None
+                        for field in [
+                            "final_mips_score", "quality_category_score",
+                            "Final MIPS Score", "Quality Category Score",
+                        ]:
+                            val = row.get(field)
+                            if val is not None:
+                                try:
+                                    s = float(val)
+                                    # MIPS scores are 0-100; normalize to 1-5
+                                    score = max(1.0, min(5.0, round(s / 20.0, 2)))
+                                    break
+                                except (ValueError, TypeError):
+                                    continue
+                        if score is not None:
+                            provider_by_npi[npi].quality_score = score
+                            updated += 1
+            except (json.JSONDecodeError, KeyError):
+                pass
+        else:
+            # CSV response
+            reader = csv.DictReader(io.StringIO(resp.text))
+            for row in reader:
+                rows_in_page += 1
+                npi = (row.get("NPI") or row.get("npi") or "").strip()
+                if npi in provider_by_npi:
+                    score = None
+                    for field in [
+                        "Final MIPS Score", "final_mips_score",
+                        "Quality Category Score", "quality_category_score",
+                    ]:
+                        val = (row.get(field) or "").strip()
+                        if val:
+                            try:
+                                s = float(val)
+                                score = max(1.0, min(5.0, round(s / 20.0, 2)))
+                                break
+                            except ValueError:
+                                continue
+                    if score is not None:
+                        provider_by_npi[npi].quality_score = score
+                        updated += 1
+
+        offset += max(rows_in_page, 1)
+        logger.info(f"  Physician quality: offset {offset}, {updated} providers updated so far")
+
+        if rows_in_page < page_size:
+            break
+
+        # Safety: stop after 50k records to avoid infinite loops
+        if offset > 50_000:
+            logger.info("Physician quality: reached 50k limit, stopping pagination")
+            break
+
+    if updated > 0:
+        db.commit()
+        logger.info(f"Physician quality: updated {updated} providers")
+
+    return updated
 
 
 # ---------------------------------------------------------------------------
@@ -1597,6 +1863,12 @@ def run_full_ingestion(db: Session) -> dict:
     except Exception as e:
         logger.error(f"Hospital Compare ingestion failed: {e}")
         results["hospital_compare"] = 0
+
+    try:
+        results["physician_quality"] = download_physician_quality(db)
+    except Exception as e:
+        logger.error(f"Physician quality ingestion failed: {e}")
+        results["physician_quality"] = 0
 
     try:
         results["quality_benchmarks"] = download_quality_benchmarks(db)

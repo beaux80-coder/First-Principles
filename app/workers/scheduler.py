@@ -20,6 +20,7 @@ from app.services.data_downloaders import (
     download_medicare_pfs,
     download_hospital_transparency,
     download_hospital_compare,
+    download_physician_quality,
     download_opps_rates,
     download_quality_benchmarks,
     download_insurer_tic,

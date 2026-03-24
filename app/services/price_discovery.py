@@ -199,15 +199,19 @@ def compare_all_channels(
                 "source": "Medicaid Dental Fee Schedule",
             })
 
-    # 13. DPC (Direct Primary Care) — check for DPC-eligible services
-    if service_code.startswith("992"):  # E&M codes (office visits)
+    # 13. DPC (Direct Primary Care) — compare DPC membership vs per-visit costs
+    # Constitution: evaluate DPC memberships as a pricing channel for primary care
+    # DPC-eligible: primary care E&M codes 99201-99215
+    if _is_dpc_eligible(service_code):
+        dpc_result = _evaluate_dpc_channel(db, service_code, state, channels_compared)
         channels_compared.append({
             "channel": "dpc_membership",
-            "price": _estimate_dpc_visit_cost(service_code, state),
-            "provider": "DPC_PRACTICE_ESTIMATE",
-            "verified": False,
-            "source": "DPC market rate estimate (varies by metro)",
-            "note": "DPC practices charge monthly membership; per-visit cost derived from typical utilization",
+            "price": dpc_result["effective_per_visit_cost"],
+            "provider": dpc_result.get("dpc_provider", "DPC_PRACTICE"),
+            "verified": dpc_result["verified"],
+            "source": dpc_result["source"],
+            "note": dpc_result["note"],
+            "dpc_comparison": dpc_result["comparison"],
         })
 
     # Filter out zero/negative prices
@@ -414,23 +418,218 @@ def _query_prices(
     return q.order_by(PriceData.price.asc()).limit(limit).all()
 
 
-def _estimate_dpc_visit_cost(service_code: str, state: Optional[str] = None) -> float:
-    """Estimate per-visit cost for a DPC membership.
+def _is_dpc_eligible(service_code: str) -> bool:
+    """Check if a service code is eligible for DPC pricing comparison.
 
-    DPC practices charge $75-150/month for unlimited primary care visits.
-    Average utilization: 4-6 visits/year. Per-visit cost: $150-450.
-    This is a pricing CHANNEL, not a structural dependency.
+    DPC practices cover primary care E&M codes: 99201-99215
+    (new patient: 99201-99205, established patient: 99211-99215).
     """
-    # Conservative estimate: $125/month membership, 5 visits/year
-    monthly_fee = 125.0
-    annual_visits = 5.0
-    per_visit = (monthly_fee * 12) / annual_visits  # $300
+    try:
+        code_num = int(service_code)
+        return (99201 <= code_num <= 99205) or (99211 <= code_num <= 99215)
+    except (ValueError, TypeError):
+        return False
 
-    # Adjust by state cost index
-    state_adjustments = {
-        "CA": 1.3, "NY": 1.25, "MA": 1.2, "TX": 0.95, "FL": 0.95,
-        "WA": 1.15, "CO": 1.1, "IL": 1.05, "PA": 1.0, "OH": 0.9,
+
+# DPC market pricing data — publicly available national averages
+# Source: DPC Frontier mapper, DPC Alliance published surveys
+# Average $80/month nationally, varies by market tier
+DPC_MARKET_RATES = {
+    # (state, tier) -> monthly fee in dollars
+    # Tier 1: major metro areas
+    "CA": {"monthly_fee": 100.0, "tier": "high_cost"},
+    "NY": {"monthly_fee": 95.0, "tier": "high_cost"},
+    "MA": {"monthly_fee": 95.0, "tier": "high_cost"},
+    "WA": {"monthly_fee": 90.0, "tier": "high_cost"},
+    "CT": {"monthly_fee": 90.0, "tier": "high_cost"},
+    "NJ": {"monthly_fee": 90.0, "tier": "high_cost"},
+    # Tier 2: moderate cost
+    "CO": {"monthly_fee": 85.0, "tier": "moderate_cost"},
+    "IL": {"monthly_fee": 80.0, "tier": "moderate_cost"},
+    "PA": {"monthly_fee": 80.0, "tier": "moderate_cost"},
+    "VA": {"monthly_fee": 80.0, "tier": "moderate_cost"},
+    "MN": {"monthly_fee": 80.0, "tier": "moderate_cost"},
+    "OR": {"monthly_fee": 85.0, "tier": "moderate_cost"},
+    "AZ": {"monthly_fee": 75.0, "tier": "moderate_cost"},
+    "NC": {"monthly_fee": 75.0, "tier": "moderate_cost"},
+    "GA": {"monthly_fee": 75.0, "tier": "moderate_cost"},
+    # Tier 3: lower cost markets
+    "TX": {"monthly_fee": 70.0, "tier": "lower_cost"},
+    "FL": {"monthly_fee": 70.0, "tier": "lower_cost"},
+    "OH": {"monthly_fee": 65.0, "tier": "lower_cost"},
+    "IN": {"monthly_fee": 65.0, "tier": "lower_cost"},
+    "TN": {"monthly_fee": 65.0, "tier": "lower_cost"},
+    "MO": {"monthly_fee": 65.0, "tier": "lower_cost"},
+    "KS": {"monthly_fee": 60.0, "tier": "lower_cost"},
+    "OK": {"monthly_fee": 60.0, "tier": "lower_cost"},
+    "AR": {"monthly_fee": 55.0, "tier": "lower_cost"},
+    "MS": {"monthly_fee": 50.0, "tier": "lower_cost"},
+}
+
+# National average when state is unknown
+DPC_NATIONAL_AVERAGE_MONTHLY = 80.0
+
+# Utilization tiers for per-visit cost calculation
+# Source: DPC Alliance member practice data
+DPC_UTILIZATION_PROFILES = {
+    "low": {"annual_visits": 3, "label": "Low utilizer (young, healthy)"},
+    "average": {"annual_visits": 5, "label": "Average utilizer"},
+    "moderate": {"annual_visits": 8, "label": "Moderate utilizer (chronic condition)"},
+    "high": {"annual_visits": 12, "label": "High utilizer (multiple conditions)"},
+}
+
+
+def _get_dpc_monthly_rate(state: Optional[str]) -> tuple[float, str]:
+    """Get the DPC monthly membership rate for a state.
+
+    Returns (monthly_fee, source_description).
+    """
+    if state and state in DPC_MARKET_RATES:
+        market = DPC_MARKET_RATES[state]
+        return market["monthly_fee"], f"DPC market rate ({state}, {market['tier']})"
+    return DPC_NATIONAL_AVERAGE_MONTHLY, "DPC national average ($80/month)"
+
+
+def _evaluate_dpc_channel(
+    db: Session,
+    service_code: str,
+    state: Optional[str],
+    existing_channels: list[dict],
+) -> dict:
+    """Evaluate DPC membership as a pricing channel against per-visit costs.
+
+    Compares the effective per-visit cost under a DPC membership to the
+    per-visit primary care costs already discovered in other channels.
+    Uses average utilization (5 visits/year) for the base comparison,
+    and provides breakdowns for all utilization profiles.
+
+    Records the comparison as structured data feeding F8.
+    """
+    monthly_fee, rate_source = _get_dpc_monthly_rate(state)
+    annual_cost = monthly_fee * 12
+
+    # Calculate effective per-visit cost across utilization profiles
+    per_visit_by_profile = {}
+    for profile_key, profile in DPC_UTILIZATION_PROFILES.items():
+        visits = profile["annual_visits"]
+        per_visit_by_profile[profile_key] = {
+            "annual_visits": visits,
+            "effective_per_visit": round(annual_cost / visits, 2),
+            "label": profile["label"],
+        }
+
+    # Use "average" profile (5 visits/year) as the standard comparison point
+    avg_per_visit = per_visit_by_profile["average"]["effective_per_visit"]
+
+    # Find the best per-visit primary care price from other channels
+    # Only compare against channels that have data for this service code
+    per_visit_alternatives = [
+        c for c in existing_channels
+        if c["price"] and c["price"] > 0
+        and c["channel"] != "dpc_membership"
+    ]
+    cheapest_per_visit = min(
+        (c["price"] for c in per_visit_alternatives), default=None
+    )
+
+    # Build the comparison record
+    dpc_is_cheaper = False
+    savings_per_visit = None
+    if cheapest_per_visit is not None:
+        dpc_is_cheaper = avg_per_visit < cheapest_per_visit
+        savings_per_visit = round(cheapest_per_visit - avg_per_visit, 2)
+
+    # DPC includes additional services beyond the visit itself:
+    # - Unlimited visits (no per-visit charge)
+    # - Same-day/next-day appointments
+    # - Extended visit times (30-60 min vs 15 min)
+    # - Direct physician access (text/email/phone)
+    # - Basic labs and procedures often included
+    # - No facility fees
+    included_services_value = round(monthly_fee * 0.3, 2)  # ~30% of fee is non-visit value
+
+    # Adjusted per-visit cost accounting for included services
+    adjusted_per_visit = round(
+        max(0, (annual_cost - included_services_value * 12) / DPC_UTILIZATION_PROFILES["average"]["annual_visits"]),
+        2,
+    )
+
+    # Determine if DPC data comes from actual DB records or market estimates
+    dpc_db_prices = db.query(PriceData).filter(
+        PriceData.service_code == service_code,
+        PriceData.channel.ilike("%dpc%"),
+    )
+    if state:
+        dpc_db_prices = dpc_db_prices.filter(PriceData.state == state)
+    dpc_from_db = dpc_db_prices.first()
+
+    if dpc_from_db:
+        # Use actual DPC price data from the database if available
+        effective_price = float(dpc_from_db.price)
+        verified = True
+        source = f"DPC practice published rate ({dpc_from_db.provider_name})"
+        dpc_provider = dpc_from_db.provider_name
+    else:
+        effective_price = avg_per_visit
+        verified = False
+        source = rate_source
+        dpc_provider = "DPC_MARKET_ESTIMATE"
+
+    comparison = {
+        "dpc_monthly_fee": monthly_fee,
+        "dpc_annual_cost": annual_cost,
+        "effective_per_visit_at_avg_utilization": avg_per_visit,
+        "adjusted_per_visit_with_included_services": adjusted_per_visit,
+        "per_visit_by_utilization_profile": per_visit_by_profile,
+        "cheapest_per_visit_alternative": cheapest_per_visit,
+        "cheapest_alternative_channel": (
+            min(per_visit_alternatives, key=lambda c: c["price"])["channel"]
+            if per_visit_alternatives else None
+        ),
+        "dpc_is_cheaper_at_avg_utilization": dpc_is_cheaper,
+        "savings_per_visit_vs_cheapest": savings_per_visit,
+        "included_services": [
+            "Unlimited primary care visits",
+            "Same-day/next-day scheduling",
+            "Extended visit times (30-60 min)",
+            "Direct physician access (text/email/phone)",
+            "Basic labs and procedures",
+            "No facility fees",
+        ],
+        "breakeven_visits_per_year": (
+            round(annual_cost / cheapest_per_visit, 1) if cheapest_per_visit and cheapest_per_visit > 0 else None
+        ),
+        "rate_source": rate_source,
+        "market_state": state,
     }
-    adjustment = state_adjustments.get(state, 1.0) if state else 1.0
 
-    return round(per_visit * adjustment, 2)
+    note = (
+        f"DPC membership: ${monthly_fee:.0f}/month ({rate_source}). "
+        f"Per-visit at avg utilization (5/yr): ${avg_per_visit:.2f}. "
+    )
+    if cheapest_per_visit is not None:
+        note += (
+            f"Cheapest per-visit alternative: ${cheapest_per_visit:.2f}. "
+            f"DPC {'saves' if dpc_is_cheaper else 'costs more by'} "
+            f"${abs(savings_per_visit):.2f}/visit at average utilization."
+        )
+    else:
+        note += "No per-visit alternatives found for comparison."
+
+    logger.info(
+        "DPC channel evaluated for %s (state=%s): $%.2f/visit vs $%s/visit alt, "
+        "DPC cheaper=%s",
+        service_code, state, avg_per_visit,
+        f"{cheapest_per_visit:.2f}" if cheapest_per_visit else "N/A",
+        dpc_is_cheaper,
+    )
+
+    return {
+        "effective_per_visit_cost": effective_price,
+        "verified": verified,
+        "source": source,
+        "note": note,
+        "comparison": comparison,
+        "dpc_provider": dpc_provider,
+        "feeding_f8": True,
+    }

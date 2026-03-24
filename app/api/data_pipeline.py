@@ -19,6 +19,9 @@ from app.services.data_downloaders import (
     download_nadac,
     download_medicare_pfs,
     download_hospital_transparency,
+    download_hospital_compare,
+    download_physician_quality,
+    match_quality_to_providers,
     run_full_ingestion,
 )
 
@@ -105,6 +108,81 @@ async def ingest_nadac_file(
     content = (await file.read()).decode("utf-8", errors="replace")
     count = ingest_nadac_pharmacy(db, content)
     return {"records_ingested": count}
+
+
+@router.post("/ingest/hospital-compare")
+def trigger_hospital_compare(
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Download CMS Hospital Compare quality data and match to providers.
+
+    Fetches ~5,400 hospital quality ratings from CMS, matches them to
+    providers by name/state, and updates provider quality_score fields.
+    """
+    def _run():
+        from app.database import SessionLocal
+        session = SessionLocal()
+        try:
+            count = download_hospital_compare(session)
+            logger.info(f"Hospital Compare ingestion: {count} ratings ingested")
+        except Exception as e:
+            logger.error(f"Hospital Compare ingestion failed: {e}")
+        finally:
+            session.close()
+
+    background_tasks.add_task(_run)
+    return {
+        "status": "ingestion_started",
+        "message": "Downloading CMS Hospital Compare quality data in background",
+    }
+
+
+@router.post("/ingest/physician-quality")
+def trigger_physician_quality(
+    background_tasks: BackgroundTasks,
+    user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Download CMS Physician Quality (MIPS) data and match to providers.
+
+    Fetches physician quality/MIPS scores and matches by NPI to update
+    provider quality_score fields for physician-type providers.
+    """
+    def _run():
+        from app.database import SessionLocal
+        session = SessionLocal()
+        try:
+            count = download_physician_quality(session)
+            logger.info(f"Physician quality ingestion: {count} providers updated")
+        except Exception as e:
+            logger.error(f"Physician quality ingestion failed: {e}")
+        finally:
+            session.close()
+
+    background_tasks.add_task(_run)
+    return {
+        "status": "ingestion_started",
+        "message": "Downloading CMS Physician Quality data in background",
+    }
+
+
+@router.post("/match-quality-to-providers")
+def trigger_quality_matching(
+    user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Re-run quality score matching from existing price_data to providers.
+
+    Uses already-ingested CMS Hospital Compare data (in price_data table)
+    to match and update provider quality_score fields.
+    """
+    matched = match_quality_to_providers(db)
+    return {
+        "matched_providers": matched,
+        "message": f"Updated quality_score for {matched} providers",
+    }
 
 
 @router.get("/cross-type-analytics")
