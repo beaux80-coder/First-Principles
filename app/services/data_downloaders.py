@@ -639,141 +639,177 @@ def match_quality_to_providers(db: Session) -> int:
 
 
 # ---------------------------------------------------------------------------
-# CMS Physician Quality API (MIPS / Quality Payment Program)
+# CMS Physician Quality — MIPS Performance Scores
 # ---------------------------------------------------------------------------
 
+# Dataset a174-a962: "PY 2023 Clinician Public Reporting: Overall MIPS Performance"
+# Contains final_MIPS_score for ~541K clinicians, matched by NPI.
+# The mj5m-pzi6 dataset is the Physician Compare *directory* (no scores);
+# a174-a962 is the actual MIPS performance file with final scores.
+MIPS_SCORE_CSV_URL = (
+    "https://data.cms.gov/provider-data/sites/default/files/resources/"
+    "6b9e57db797c95853b034b329b1212b2_1763510763/ec_score_file.csv"
+)
+MIPS_SCORE_API = "https://data.cms.gov/provider-data/api/1/datastore/query/a174-a962/0"
+
+# Legacy reference (directory dataset, no scores — kept for documentation)
 PHYSICIAN_COMPARE_API = "https://data.cms.gov/provider-data/api/1/datastore/query/mj5m-pzi6/0"
 
 
 def download_physician_quality(db: Session) -> int:
-    """Download CMS Physician Compare / MIPS quality data.
+    """Download CMS MIPS clinician performance scores and update providers.
 
-    The mj5m-pzi6 dataset contains clinician-level quality information
-    including group practice PAC IDs and individual NPIs. We match by NPI
-    to update physician providers' quality_score.
+    Uses bulk CSV download from dataset a174-a962 (PY 2023 Clinician Public
+    Reporting: Overall MIPS Performance) which contains ~541K clinician records
+    with final_MIPS_score.  Falls back to paginated API if CSV is unavailable.
+
+    MIPS scores (0-100) are normalized to a 1-5 quality scale.
 
     Returns number of providers updated.
     """
-    logger.info("Downloading CMS Physician Quality data...")
+    logger.info("Downloading CMS MIPS clinician performance scores...")
 
-    from app.models.provider import Provider
+    from sqlalchemy import text as sa_text
 
-    # Build NPI lookup for our providers
-    provider_by_npi: dict[str, Provider] = {}
-    for p in db.query(Provider).filter(Provider.npi.isnot(None)).all():
-        provider_by_npi[p.npi] = p
+    # --- Strategy 1: Bulk CSV download (fast, ~41 MB, ~1-3 seconds) ---
+    updated = _download_mips_via_csv(db)
+    if updated > 0:
+        return updated
 
-    if not provider_by_npi:
-        logger.info("No providers with NPI found — skipping physician quality")
+    # --- Strategy 2: Paginated API fallback (CMS API max page size = 1000) ---
+    logger.info("CSV download failed; falling back to paginated API...")
+    return _download_mips_via_api(db)
+
+
+def _download_mips_via_csv(db: Session) -> int:
+    """Bulk-download the MIPS score CSV and update providers by NPI."""
+    from sqlalchemy import text as sa_text
+
+    try:
+        resp = httpx.get(
+            MIPS_SCORE_CSV_URL,
+            timeout=httpx.Timeout(30.0, read=300.0),
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+    except (httpx.HTTPError, httpx.TimeoutException) as e:
+        logger.warning(f"MIPS CSV download failed: {e}")
         return 0
 
-    logger.info(f"Matching against {len(provider_by_npi)} providers with NPIs")
+    logger.info(f"Downloaded MIPS CSV ({len(resp.content):,} bytes)")
+
+    reader = csv.DictReader(io.StringIO(resp.text))
+    # CMS CSV has leading spaces in column names after the first column
+    reader.fieldnames = [f.strip() for f in reader.fieldnames]
+
+    updated = 0
+    batch: list[tuple[float, str]] = []
+
+    for row in reader:
+        npi = (row.get("NPI") or "").strip()
+        score_str = (row.get("final_MIPS_score") or "").strip()
+        if not npi or not score_str:
+            continue
+        try:
+            mips_score = float(score_str)
+            if mips_score <= 0:
+                continue
+            # MIPS 0-100 → 1-5 scale
+            normalized = max(1.0, min(5.0, round(mips_score / 20.0, 2)))
+            batch.append((normalized, npi))
+        except (ValueError, TypeError):
+            continue
+
+    logger.info(f"Parsed {len(batch):,} MIPS records with scores > 0")
+
+    # Batch-update using raw SQL for performance (avoids loading all ORM objects)
+    for i in range(0, len(batch), 1000):
+        chunk = batch[i : i + 1000]
+        with db.get_bind().connect() as conn:
+            for score, npi in chunk:
+                result = conn.execute(
+                    sa_text(
+                        "UPDATE providers SET quality_score = :score WHERE npi = :npi"
+                    ),
+                    {"score": score, "npi": npi},
+                )
+                if result.rowcount > 0:
+                    updated += 1
+            conn.commit()
+
+    logger.info(f"MIPS quality: updated {updated:,} providers from CSV")
+    return updated
+
+
+def _download_mips_via_api(db: Session) -> int:
+    """Paginated API fallback for MIPS scores (API max page size = 1000)."""
+    from sqlalchemy import text as sa_text
 
     updated = 0
     offset = 0
-    page_size = 500
+    page_size = 1000  # CMS API maximum
 
     while True:
         try:
             resp = httpx.get(
-                PHYSICIAN_COMPARE_API,
-                params={
-                    "offset": offset,
-                    "count": "true",
-                    "results": "true",
-                    "format": "csv",
-                    "limit": page_size,
-                },
+                MIPS_SCORE_API,
+                params={"limit": page_size, "offset": offset},
                 timeout=httpx.Timeout(30.0, read=120.0),
             )
-            if resp.status_code == 400:
-                # Try JSON format as fallback
-                resp = httpx.get(
-                    PHYSICIAN_COMPARE_API,
-                    params={
-                        "offset": offset,
-                        "count": "true",
-                        "results": "true",
-                        "limit": page_size,
-                    },
-                    timeout=httpx.Timeout(30.0, read=120.0),
+            if resp.status_code != 200:
+                logger.warning(
+                    f"MIPS API returned {resp.status_code} at offset {offset}"
                 )
+                break
             resp.raise_for_status()
         except (httpx.HTTPError, httpx.TimeoutException) as e:
-            logger.warning(f"Physician quality download failed at offset {offset}: {e}")
+            logger.warning(f"MIPS API failed at offset {offset}: {e}")
             break
 
-        content_type = resp.headers.get("content-type", "")
-        rows_in_page = 0
+        try:
+            data = resp.json()
+        except (json.JSONDecodeError, ValueError):
+            break
 
-        if "json" in content_type or resp.text.lstrip().startswith("{"):
-            # JSON response
-            try:
-                data = resp.json()
-                results_list = data.get("results", [])
-                for row in results_list:
-                    rows_in_page += 1
-                    npi = str(row.get("npi", "") or row.get("NPI", "")).strip()
-                    if npi in provider_by_npi:
-                        # Look for quality/performance score fields
-                        score = None
-                        for field in [
-                            "final_mips_score", "quality_category_score",
-                            "Final MIPS Score", "Quality Category Score",
-                        ]:
-                            val = row.get(field)
-                            if val is not None:
-                                try:
-                                    s = float(val)
-                                    # MIPS scores are 0-100; normalize to 1-5
-                                    score = max(1.0, min(5.0, round(s / 20.0, 2)))
-                                    break
-                                except (ValueError, TypeError):
-                                    continue
-                        if score is not None:
-                            provider_by_npi[npi].quality_score = score
-                            updated += 1
-            except (json.JSONDecodeError, KeyError):
-                pass
-        else:
-            # CSV response
-            reader = csv.DictReader(io.StringIO(resp.text))
-            for row in reader:
-                rows_in_page += 1
-                npi = (row.get("NPI") or row.get("npi") or "").strip()
-                if npi in provider_by_npi:
-                    score = None
-                    for field in [
-                        "Final MIPS Score", "final_mips_score",
-                        "Quality Category Score", "quality_category_score",
-                    ]:
-                        val = (row.get(field) or "").strip()
-                        if val:
-                            try:
-                                s = float(val)
-                                score = max(1.0, min(5.0, round(s / 20.0, 2)))
-                                break
-                            except ValueError:
-                                continue
-                    if score is not None:
-                        provider_by_npi[npi].quality_score = score
+        results_list = data.get("results", [])
+        if not results_list:
+            break
+
+        page_matched = 0
+        with db.get_bind().connect() as conn:
+            for row in results_list:
+                npi = str(row.get("npi", "")).strip()
+                score_str = row.get("final_mips_score", "")
+                if not npi or not score_str:
+                    continue
+                try:
+                    mips_score = float(str(score_str).strip())
+                    if mips_score <= 0:
+                        continue
+                    normalized = max(1.0, min(5.0, round(mips_score / 20.0, 2)))
+                    result = conn.execute(
+                        sa_text(
+                            "UPDATE providers SET quality_score = :score WHERE npi = :npi"
+                        ),
+                        {"score": normalized, "npi": npi},
+                    )
+                    if result.rowcount > 0:
                         updated += 1
+                        page_matched += 1
+                except (ValueError, TypeError):
+                    continue
+            conn.commit()
 
-        offset += max(rows_in_page, 1)
-        logger.info(f"  Physician quality: offset {offset}, {updated} providers updated so far")
+        offset += page_size
+        if offset % 50_000 == 0:
+            logger.info(
+                f"  MIPS API: offset {offset:,}, {updated:,} providers updated"
+            )
 
-        if rows_in_page < page_size:
+        if len(results_list) < page_size:
             break
 
-        # Safety: stop after 50k records to avoid infinite loops
-        if offset > 50_000:
-            logger.info("Physician quality: reached 50k limit, stopping pagination")
-            break
-
-    if updated > 0:
-        db.commit()
-        logger.info(f"Physician quality: updated {updated} providers")
-
+    logger.info(f"MIPS quality (API): updated {updated:,} providers")
     return updated
 
 

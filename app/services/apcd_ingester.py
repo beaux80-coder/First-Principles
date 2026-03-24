@@ -48,6 +48,12 @@ STATE_APCD_SOURCES = {
             "https://civhc.org/get-data/public-data/focus-areas/cost-of-care/",
             "https://civhc.org/get-data/public-data/focus-areas/",
         ],
+        # Socrata datasets on data.colorado.gov (require $$app_token for access)
+        "socrata_datasets": [
+            {"host": "data.colorado.gov", "id": "a9bw-4sc8", "name": "CO APCD Insights"},
+            {"host": "data.colorado.gov", "id": "r74d-d2pc", "name": "Telehealth Utilization"},
+            {"host": "data.colorado.gov", "id": "9zu6-ut2w", "name": "Shop for Care"},
+        ],
     },
     "NH": {
         "name": "New Hampshire CHIS",

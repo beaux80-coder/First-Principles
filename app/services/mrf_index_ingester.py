@@ -117,6 +117,19 @@ KNOWN_INSURER_MRF_INDEXES = [
     },
 ]
 
+# Highmark MRF Hub provides direct JSON index access for BCBS affiliates
+# The mrfdata.hmhs.com portal publishes CMS-format table-of-contents JSON
+# files with signed S3 URLs to actual in-network rate files.
+# URL pattern: /files/{region_code}/{state}/inbound/local/{YYYY-MM-DD}_{insurer}_index.json
+HIGHMARK_MRF_HUB_INSURERS = [
+    {"region_code": "460", "state": "wy", "name": "Blue Cross Blue Shield of Wyoming",
+     "template": "{date}_Blue_Cross_Blue_Shield_of_Wyoming_index.json"},
+    {"region_code": "320", "state": "nd", "name": "Blue Cross Blue Shield of North Dakota",
+     "template": "{date}_BlueCrossBlueShieldND_index.json"},
+    {"region_code": "070", "state": "del", "name": "Highmark Blue Cross Blue Shield Delaware",
+     "template": "{date}_Highmark_Blue_Cross_Blue_Shield_of_Delaware_index.json"},
+]
+
 
 def probe_mrf_index(url: str) -> dict:
     """Probe an insurer's MRF index URL to check availability and discover files.
