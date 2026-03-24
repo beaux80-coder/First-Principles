@@ -154,6 +154,21 @@ def select_provider(
         "resolution_definition": _get_resolution_definition(condition),
     }
 
+    # Persist audit record to immutable F8 data pipeline
+    try:
+        from app.models.audit_log import AuditLog
+        log = AuditLog(
+            actor="system:provider_selection",
+            action="provider_selection",
+            resource_type="provider_selection",
+            resource_id=audit_record["selection_id"],
+            details=audit_record,
+        )
+        db.add(log)
+        db.commit()
+    except Exception as e:
+        logger.warning(f"Failed to persist selection audit: {e}")
+
     return {
         "selection": step2_result,
         "clinical_filtering": step1_result,
