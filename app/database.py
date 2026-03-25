@@ -56,6 +56,20 @@ def get_db():
         db.close()
 
 
+
+def employer_scope_filter(model_class, employer_id):
+    """Row-level security helper: returns SQLAlchemy filter ensuring employer data isolation.
+
+    Use in queries to guarantee multi-tenant data separation:
+        query.filter(employer_scope_filter(Employee, employer_id))
+
+    Raises ValueError if the model does not have an employer_id column.
+    """
+    if hasattr(model_class, 'employer_id'):
+        return model_class.employer_id == employer_id
+    raise ValueError(f"{model_class.__name__} does not have employer_id column")
+
+
 # ---- Immutability enforcement for clinical_determinations ----
 # Constitution F1: "Every determination recorded in an immutable, append-only,
 # cryptographically secured log."

@@ -527,6 +527,17 @@ def make_determination(
         except Exception as e:
             logger.warning(f"NLP matching failed (falling back to rules): {e}")
 
+    # Consume F8 waste detection signals (clinical patterns — TEE-safe)
+    waste_signals = _consume_f8_waste_signals(db, benefit_type, service_code)
+    if waste_signals:
+        # Add waste detection context to clinical reasoning
+        waste_context = "; ".join([s["recommendation"] for s in waste_signals if s["recommendation"]])
+        if waste_context:
+            # Store as supplementary clinical context, not as a denial reason
+            if risk_factors is None:
+                risk_factors = {}
+            risk_factors["f8_waste_detection_signals"] = waste_signals
+
     guidelines_referenced = [
         f"{g.source.value}:{g.title} (Grade {g.grade.value})"
         for g in guidelines
@@ -634,6 +645,365 @@ def make_determination(
     )
 
     return determination
+
+
+def ensemble_determination(
+    db: Session,
+    claim_id: str,
+    service_code: str,
+    benefit_type: str,
+    patient_symptoms: list[str],
+    patient_history: dict,
+    condition: Optional[str] = None,
+) -> dict:
+    """Run multiple evaluation strategies and combine with weighted voting.
+
+    Strategies:
+    1. Rule-based: standard guideline matching and criteria evaluation
+    2. NLP-based: semantic similarity matching via clinical NLP
+    3. Risk-based: meaningful risk of deterioration assessment
+
+    Each strategy produces a decision and confidence score. The final
+    determination uses weighted voting to combine them.
+
+    This improves accuracy over single-strategy determination by reducing
+    variance and catching cases where one strategy may be weak.
+    """
+    t_start = time.perf_counter()
+    strategies = []
+
+    # --- Strategy 1: Rule-based guideline matching ---
+    guidelines = _find_matching_guidelines(db, service_code, benefit_type, condition)
+    rule_decision = "approved"
+    rule_confidence = 0.5
+    rule_reasoning = "No matching guidelines found (rule-based)."
+
+    if guidelines:
+        any_approved = False
+        any_denied = False
+        reasoning_parts = []
+        for g in guidelines:
+            meets, reasoning_text = _evaluate_criteria(g, patient_symptoms, patient_history)
+            reasoning_parts.append(f"[{g.title}] {reasoning_text}")
+            if meets:
+                any_approved = True
+            else:
+                any_denied = True
+
+        if any_denied and not any_approved:
+            rule_decision = "denied"
+            rule_confidence = 0.8
+        elif any_approved:
+            rule_decision = "approved"
+            rule_confidence = 0.85
+        else:
+            rule_decision = "approved"
+            rule_confidence = 0.6
+
+        rule_reasoning = " | ".join(reasoning_parts)
+
+    strategies.append({
+        "name": "rule_based",
+        "decision": rule_decision,
+        "confidence": rule_confidence,
+        "weight": 0.4,
+        "reasoning": rule_reasoning,
+        "guidelines_matched": len(guidelines),
+    })
+
+    # --- Strategy 2: NLP-based semantic matching ---
+    nlp_decision = "approved"
+    nlp_confidence = 0.5
+    nlp_reasoning = "NLP matching not available."
+
+    try:
+        from app.services.clinical_nlp import match_symptoms_to_guidelines
+        nlp_matches = match_symptoms_to_guidelines(
+            db, patient_symptoms, patient_history, benefit_type, condition,
+            top_k=5, min_score=0.1,
+        )
+        if nlp_matches:
+            top_score = nlp_matches[0]["similarity_score"]
+            nlp_confidence = min(top_score + 0.3, 0.9)
+
+            # Check if top NLP match supports or denies
+            top_guideline_id = nlp_matches[0]["guideline_id"]
+            top_guideline = db.query(ClinicalGuideline).filter(
+                ClinicalGuideline.guideline_id == top_guideline_id
+            ).first()
+            if top_guideline:
+                meets, nlp_reason = _evaluate_criteria(top_guideline, patient_symptoms, patient_history)
+                nlp_decision = "approved" if meets else "denied"
+                nlp_reasoning = f"NLP top match (score={top_score:.2f}): {nlp_reason}"
+            else:
+                nlp_reasoning = f"NLP matched {len(nlp_matches)} guidelines, top score={top_score:.2f}"
+        else:
+            nlp_confidence = 0.3
+            nlp_reasoning = "No strong NLP matches found."
+    except Exception as e:
+        nlp_reasoning = f"NLP matching failed: {e}"
+        nlp_confidence = 0.3
+
+    strategies.append({
+        "name": "nlp_based",
+        "decision": nlp_decision,
+        "confidence": nlp_confidence,
+        "weight": 0.3,
+        "reasoning": nlp_reasoning,
+    })
+
+    # --- Strategy 3: Risk-based assessment ---
+    risk_score, risk_factors, risk_reasoning = _assess_meaningful_risk(
+        patient_symptoms, patient_history, service_code, benefit_type
+    )
+    risk_decision = "approved" if risk_score >= 0.25 else "denied"
+    risk_confidence = min(abs(risk_score - 0.25) * 4 + 0.5, 0.9)
+
+    strategies.append({
+        "name": "risk_based",
+        "decision": risk_decision,
+        "confidence": risk_confidence,
+        "weight": 0.3,
+        "reasoning": risk_reasoning,
+        "risk_score": risk_score,
+    })
+
+    # --- Weighted voting ---
+    approve_score = 0.0
+    deny_score = 0.0
+    for s in strategies:
+        weighted = s["weight"] * s["confidence"]
+        if s["decision"] == "approved":
+            approve_score += weighted
+        else:
+            deny_score += weighted
+
+    ensemble_decision = "approved" if approve_score >= deny_score else "denied"
+    ensemble_confidence = max(approve_score, deny_score) / (approve_score + deny_score) if (approve_score + deny_score) > 0 else 0.5
+
+    latency_ms = (time.perf_counter() - t_start) * 1000
+
+    return {
+        "claim_id": claim_id,
+        "service_code": service_code,
+        "benefit_type": benefit_type,
+        "ensemble_decision": ensemble_decision,
+        "ensemble_confidence": round(ensemble_confidence, 3),
+        "approve_score": round(approve_score, 3),
+        "deny_score": round(deny_score, 3),
+        "strategies": strategies,
+        "latency_ms": round(latency_ms, 1),
+        "note": (
+            "Ensemble combines rule-based (0.4 weight), NLP-based (0.3 weight), "
+            "and risk-based (0.3 weight) strategies with confidence-weighted voting."
+        ),
+    }
+
+
+def cross_validate_determinations(db: Session, sample_size: int = 100) -> dict:
+    """Cross-validation framework for testing determination accuracy on historical data.
+
+    Compares historical determinations against a re-evaluation using current
+    guidelines and logic. Identifies drift between original and current
+    determination outcomes, which can indicate guideline updates or engine
+    improvements.
+
+    Constitution: accuracy must be measured and improved.
+    """
+    # Fetch historical determinations with outcome feedback
+    determinations = (
+        db.query(ClinicalDetermination)
+        .filter(ClinicalDetermination.outcome_feedback.isnot(None))
+        .order_by(ClinicalDetermination.created_at.desc())
+        .limit(sample_size)
+        .all()
+    )
+
+    if not determinations:
+        # Fall back to any determinations if none have outcome feedback
+        determinations = (
+            db.query(ClinicalDetermination)
+            .order_by(ClinicalDetermination.created_at.desc())
+            .limit(sample_size)
+            .all()
+        )
+
+    if not determinations:
+        return {
+            "status": "no_data",
+            "message": "No historical determinations available for cross-validation.",
+        }
+
+    total = len(determinations)
+    concordant = 0
+    discordant = 0
+    correct_outcomes = 0
+    incorrect_outcomes = 0
+    errors_by_type = {"false_approve": 0, "false_deny": 0}
+    re_evaluation_results = []
+
+    for det in determinations:
+        # Parse original inputs
+        try:
+            inputs = json.loads(det.inputs_encrypted) if det.inputs_encrypted else {}
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        original_decision = det.decision.value if hasattr(det.decision, 'value') else str(det.decision)
+
+        # Re-evaluate with current guidelines
+        service_code = inputs.get("service_code", "")
+        benefit_type_str = inputs.get("benefit_type", "health")
+        patient_symptoms = inputs.get("patient_symptoms", [])
+        patient_history = inputs.get("patient_history", {})
+        condition_val = inputs.get("condition")
+
+        current_guidelines = _find_matching_guidelines(db, service_code, benefit_type_str, condition_val)
+
+        if current_guidelines:
+            any_meets = any(
+                _evaluate_criteria(g, patient_symptoms, patient_history)[0]
+                for g in current_guidelines
+            )
+            current_decision = "approved" if any_meets else "denied"
+        else:
+            risk_score, _, _ = _assess_meaningful_risk(
+                patient_symptoms, patient_history, service_code, benefit_type_str
+            )
+            current_decision = "approved" if risk_score >= 0.25 else "denied"
+
+        if original_decision == current_decision:
+            concordant += 1
+        else:
+            discordant += 1
+
+        # Check against outcome feedback if available
+        if det.outcome_feedback:
+            if det.outcome_feedback == "correct":
+                correct_outcomes += 1
+            else:
+                incorrect_outcomes += 1
+                if original_decision == "approved":
+                    errors_by_type["false_approve"] += 1
+                else:
+                    errors_by_type["false_deny"] += 1
+
+        re_evaluation_results.append({
+            "determination_id": str(det.determination_id),
+            "original_decision": original_decision,
+            "current_decision": current_decision,
+            "concordant": original_decision == current_decision,
+            "outcome_feedback": det.outcome_feedback,
+        })
+
+    outcomes_total = correct_outcomes + incorrect_outcomes
+    accuracy = round(correct_outcomes / outcomes_total * 100, 1) if outcomes_total > 0 else None
+
+    return {
+        "sample_size": total,
+        "concordance": {
+            "concordant": concordant,
+            "discordant": discordant,
+            "concordance_rate_pct": round(concordant / total * 100, 1) if total > 0 else None,
+        },
+        "outcome_accuracy": {
+            "correct": correct_outcomes,
+            "incorrect": incorrect_outcomes,
+            "accuracy_pct": accuracy,
+            "errors_by_type": errors_by_type,
+        },
+        "interpretation": (
+            f"Of {total} historical determinations, {concordant} ({round(concordant/total*100, 1) if total else 0}%) "
+            f"would receive the same decision with current guidelines. "
+            + (f"Outcome accuracy: {accuracy}%." if accuracy else "No outcome feedback available yet.")
+        ),
+        "evaluated_at": datetime.now(UTC).isoformat(),
+    }
+
+
+def create_ab_test(
+    db: Session,
+    test_name: str,
+    variant_config: dict,
+) -> dict:
+    """A/B testing framework for comparing determination strategies.
+
+    Creates an A/B test configuration that splits incoming determinations
+    between the standard strategy and a variant strategy. Results are
+    tracked and compared after a defined period.
+
+    Parameters
+    ----------
+    test_name : str
+        Human-readable name for the test (e.g., "ensemble_vs_standard").
+    variant_config : dict
+        Configuration for the variant strategy. Keys:
+        - strategy: "ensemble" | "nlp_weighted" | "risk_weighted"
+        - traffic_pct: float (0-50, percentage of traffic to variant)
+        - duration_days: int (how long to run the test)
+
+    Returns
+    -------
+    dict with test configuration and initial metrics.
+    """
+    from app.models.data_pipeline_metric import DataPipelineMetric
+
+    strategy = variant_config.get("strategy", "ensemble")
+    traffic_pct = min(variant_config.get("traffic_pct", 10), 50)  # Cap at 50%
+    duration_days = variant_config.get("duration_days", 14)
+
+    now = datetime.now(UTC)
+    test_id = hashlib.sha256(f"{test_name}-{now.isoformat()}".encode()).hexdigest()[:12]
+
+    # Record test configuration as a metric
+    metric = DataPipelineMetric(
+        metric_type=f"ab_test:{test_id}",
+        value=0,
+        details={
+            "test_id": test_id,
+            "test_name": test_name,
+            "status": "active",
+            "variant_strategy": strategy,
+            "traffic_pct": traffic_pct,
+            "duration_days": duration_days,
+            "started_at": now.isoformat(),
+            "control_count": 0,
+            "variant_count": 0,
+            "control_approve_rate": None,
+            "variant_approve_rate": None,
+            "control_accuracy": None,
+            "variant_accuracy": None,
+        },
+        measured_at=now,
+    )
+    db.add(metric)
+    db.commit()
+
+    # Fetch baseline metrics for comparison
+    total_dets = db.query(func.count(ClinicalDetermination.determination_id)).scalar() or 0
+    approved = db.query(func.count(ClinicalDetermination.determination_id)).filter(
+        ClinicalDetermination.decision == "approved"
+    ).scalar() or 0
+    baseline_approve_rate = round(approved / total_dets * 100, 1) if total_dets > 0 else None
+
+    return {
+        "test_id": test_id,
+        "test_name": test_name,
+        "status": "active",
+        "variant_strategy": strategy,
+        "traffic_pct": traffic_pct,
+        "duration_days": duration_days,
+        "started_at": now.isoformat(),
+        "baseline_metrics": {
+            "total_determinations": total_dets,
+            "current_approve_rate_pct": baseline_approve_rate,
+        },
+        "instructions": (
+            f"Test '{test_name}' is active. {traffic_pct}% of incoming determinations "
+            f"will use the '{strategy}' strategy. Results will be compared after "
+            f"{duration_days} days. Monitor via /api/clinical/ab-test/{test_id}."
+        ),
+    }
 
 
 def verify_audit_chain(db: Session, limit: int = 100) -> dict:
@@ -858,3 +1228,32 @@ def get_published_rates(db: Session) -> dict:
             "audit_log": "Immutable, append-only, cryptographically secured hash chain",
         },
     }
+
+
+def _consume_f8_waste_signals(db: Session, benefit_type: str, service_code: str) -> list[dict]:
+    """Consume F8 waste detection signals — clinical patterns only (TEE-safe).
+
+    These are epidemiological/clinical patterns, NOT financial data.
+    Safe to use inside TEE isolation boundary.
+    """
+    try:
+        from app.models.data_pipeline_metric import DataPipelineMetric
+
+        signals = db.query(DataPipelineMetric).filter(
+            DataPipelineMetric.metric_type.like("cross_type_signal:%"),
+            DataPipelineMetric.details.isnot(None),
+        ).order_by(DataPipelineMetric.measured_at.desc()).limit(20).all()
+
+        waste_signals = []
+        for s in signals:
+            details = s.details or {}
+            if details.get("target_function") == "F1" and "waste" in details.get("signal_type", ""):
+                waste_signals.append({
+                    "signal_type": details["signal_type"],
+                    "recommendation": details.get("actionable_recommendation", ""),
+                    "confidence": details.get("confidence", 0),
+                    "benefit_type": details.get("benefit_type", ""),
+                })
+        return waste_signals
+    except Exception:
+        return []

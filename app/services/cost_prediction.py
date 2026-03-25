@@ -857,3 +857,244 @@ def get_prediction_methodology() -> dict[str, Any]:
             "CMS Hospital Compare (quality ratings)",
         ],
     }
+
+
+def attribute_prediction_errors(
+    db: Session,
+    employer_id: str,
+) -> dict[str, Any]:
+    """Compare predictions vs actuals and categorize error sources.
+
+    Constitution F3: accuracy must be measured, understood, and improved.
+    This function decomposes prediction errors into actionable categories:
+    - Data quality: missing or stale price data, incomplete claims history
+    - Model calibration: systematic over/under-prediction
+    - Outlier events: large unexpected claims (catastrophic, transplant, etc.)
+    - Demographic shift: changes in employee population characteristics
+
+    Parameters
+    ----------
+    db : Session
+        Database session.
+    employer_id : str
+        UUID of the employer to analyze.
+
+    Returns
+    -------
+    dict with error attribution breakdown and improvement recommendations.
+    """
+    employer = db.query(Employer).filter(Employer.employer_id == employer_id).first()
+    if not employer:
+        return {"error": "employer_not_found", "employer_id": employer_id}
+
+    # Get current predictions
+    cross_type_signals = generate_cross_type_signals(db)
+    price_reg = price_regression_by_state(db)
+    model, train_meta = _train_ensemble(db, cross_type_signals, price_reg)
+    model_available = model is not None
+
+    active_count = (
+        db.query(func.count(Employee.employee_id))
+        .filter(
+            Employee.employer_id == employer.employer_id,
+            Employee.status == EmployeeStatus.active,
+        )
+        .scalar()
+        or employer.employee_count
+        or 1
+    )
+
+    error_attributions: dict[str, list] = {
+        "data_quality": [],
+        "model_calibration": [],
+        "outlier_events": [],
+        "demographic_shift": [],
+    }
+    per_benefit_type: dict[str, dict] = {}
+
+    for bt in BenefitType:
+        # Actual paid amount
+        actual_total = (
+            db.query(func.coalesce(func.sum(Claim.amount_paid), 0))
+            .filter(
+                Claim.employer_id == employer.employer_id,
+                Claim.benefit_type == bt,
+                Claim.status.in_([ClaimStatus.paid, ClaimStatus.approved]),
+            )
+            .scalar()
+        )
+        actual_pepm = float(actual_total) / max(active_count, 1) if actual_total else 0.0
+        if actual_pepm <= 0:
+            continue
+
+        # Predicted amount
+        features = _extract_employer_features(
+            db, employer, bt, cross_type_signals, price_reg
+        )
+        if model_available:
+            X = np.array([_features_to_array(features)])
+            predicted_pepm = float(model.predict(X)[0])
+        else:
+            predicted_pepm = _actuarial_heuristic(features, bt)
+
+        error = predicted_pepm - actual_pepm
+        abs_error = abs(error)
+        pct_error = abs_error / actual_pepm * 100 if actual_pepm > 0 else 0
+
+        bt_result = {
+            "predicted_pepm": round(predicted_pepm, 2),
+            "actual_pepm": round(actual_pepm, 2),
+            "error": round(error, 2),
+            "abs_pct_error": round(pct_error, 2),
+            "direction": "over" if error > 0 else "under",
+            "error_sources": [],
+        }
+
+        # --- Data quality attribution ---
+        # Check for sparse price data in employer's state
+        state = (employer.geography or "")[:2].upper() if employer.geography else None
+        if state:
+            state_price_count = (
+                db.query(func.count(PriceData.price_id))
+                .filter(PriceData.state == state)
+                .scalar()
+                or 0
+            )
+            if state_price_count < 100:
+                contribution = min(pct_error * 0.3, 15.0)
+                bt_result["error_sources"].append({
+                    "category": "data_quality",
+                    "factor": "sparse_state_price_data",
+                    "contribution_pct": round(contribution, 1),
+                    "detail": f"Only {state_price_count} price records in {state}; prediction relies more on national averages",
+                })
+                error_attributions["data_quality"].append(f"{bt.value}: sparse price data in {state}")
+
+        # Check for limited claims history
+        claim_count = features.get("historical_claim_count", 0)
+        if claim_count < 20:
+            contribution = min(pct_error * 0.25, 20.0)
+            bt_result["error_sources"].append({
+                "category": "data_quality",
+                "factor": "limited_claims_history",
+                "contribution_pct": round(contribution, 1),
+                "detail": f"Only {int(claim_count)} historical claims for {bt.value}; low credibility weighting",
+            })
+            error_attributions["data_quality"].append(f"{bt.value}: {int(claim_count)} claims (need 20+)")
+
+        # --- Model calibration attribution ---
+        if not model_available:
+            contribution = min(pct_error * 0.2, 10.0)
+            bt_result["error_sources"].append({
+                "category": "model_calibration",
+                "factor": "heuristic_fallback",
+                "contribution_pct": round(contribution, 1),
+                "detail": "Using actuarial heuristic (insufficient training data for ML model)",
+            })
+            error_attributions["model_calibration"].append(f"{bt.value}: actuarial heuristic fallback")
+        elif error > 0 and pct_error > 15:
+            bt_result["error_sources"].append({
+                "category": "model_calibration",
+                "factor": "systematic_over_prediction",
+                "contribution_pct": round(min(pct_error * 0.15, 10.0), 1),
+                "detail": f"Model over-predicts {bt.value} by {round(pct_error, 1)}%; may need recalibration",
+            })
+            error_attributions["model_calibration"].append(f"{bt.value}: over-predicts by {round(pct_error, 1)}%")
+        elif error < 0 and pct_error > 15:
+            bt_result["error_sources"].append({
+                "category": "model_calibration",
+                "factor": "systematic_under_prediction",
+                "contribution_pct": round(min(pct_error * 0.15, 10.0), 1),
+                "detail": f"Model under-predicts {bt.value} by {round(pct_error, 1)}%; may need recalibration",
+            })
+            error_attributions["model_calibration"].append(f"{bt.value}: under-predicts by {round(pct_error, 1)}%")
+
+        # --- Outlier event attribution ---
+        # Check for large individual claims (>3x average)
+        avg_claim = features.get("historical_avg_paid", 0)
+        if avg_claim > 0:
+            large_claims = (
+                db.query(func.count(Claim.claim_id))
+                .filter(
+                    Claim.employer_id == employer.employer_id,
+                    Claim.benefit_type == bt,
+                    Claim.amount_paid > avg_claim * 3,
+                    Claim.status.in_([ClaimStatus.paid, ClaimStatus.approved]),
+                )
+                .scalar()
+                or 0
+            )
+            if large_claims > 0:
+                contribution = min(pct_error * 0.3, 25.0)
+                bt_result["error_sources"].append({
+                    "category": "outlier_events",
+                    "factor": "large_claim_outliers",
+                    "contribution_pct": round(contribution, 1),
+                    "detail": f"{large_claims} claims > 3x average (${round(avg_claim, 2)}) — catastrophic or high-cost events",
+                })
+                error_attributions["outlier_events"].append(f"{bt.value}: {large_claims} outlier claims")
+
+        # --- Demographic shift attribution ---
+        # Compare current employee count against employer record
+        recorded_count = employer.employee_count or 0
+        if recorded_count > 0 and abs(active_count - recorded_count) / recorded_count > 0.1:
+            contribution = min(pct_error * 0.15, 10.0)
+            shift_pct = round((active_count - recorded_count) / recorded_count * 100, 1)
+            bt_result["error_sources"].append({
+                "category": "demographic_shift",
+                "factor": "employee_count_change",
+                "contribution_pct": round(contribution, 1),
+                "detail": f"Employee count shifted {shift_pct}% (recorded: {recorded_count}, current: {active_count})",
+            })
+            error_attributions["demographic_shift"].append(
+                f"Employee count changed {shift_pct}% ({recorded_count} -> {active_count})"
+            )
+
+        per_benefit_type[bt.value] = bt_result
+
+    # Generate recommendations based on error attribution
+    recommendations = []
+    if error_attributions["data_quality"]:
+        recommendations.append({
+            "priority": "high",
+            "action": "Increase price data coverage for employer's state/region",
+            "expected_improvement": "5-15% MAPE reduction",
+            "issues": error_attributions["data_quality"],
+        })
+    if error_attributions["model_calibration"]:
+        recommendations.append({
+            "priority": "medium",
+            "action": "Retrain model with more employer-specific claims data",
+            "expected_improvement": "3-10% MAPE reduction",
+            "issues": error_attributions["model_calibration"],
+        })
+    if error_attributions["outlier_events"]:
+        recommendations.append({
+            "priority": "medium",
+            "action": "Implement outlier-robust prediction (e.g., trimmed mean, Huber loss)",
+            "expected_improvement": "Reduces impact of catastrophic claims on predictions",
+            "issues": error_attributions["outlier_events"],
+        })
+    if error_attributions["demographic_shift"]:
+        recommendations.append({
+            "priority": "low",
+            "action": "Update employer demographics and re-run census",
+            "expected_improvement": "Aligns prediction features with current population",
+            "issues": error_attributions["demographic_shift"],
+        })
+
+    return {
+        "employer_id": str(employer.employer_id),
+        "employer_name": employer.name,
+        "active_employees": active_count,
+        "prediction_method": "gradient_boosting_ensemble" if model_available else "actuarial_heuristic",
+        "per_benefit_type": per_benefit_type,
+        "error_attribution_summary": {
+            "data_quality_issues": len(error_attributions["data_quality"]),
+            "model_calibration_issues": len(error_attributions["model_calibration"]),
+            "outlier_events": len(error_attributions["outlier_events"]),
+            "demographic_shifts": len(error_attributions["demographic_shift"]),
+        },
+        "recommendations": recommendations,
+        "analyzed_at": datetime.now(UTC).isoformat(),
+    }

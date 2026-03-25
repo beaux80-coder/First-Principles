@@ -11,6 +11,9 @@ from app.models.audit_log import AuditLog
 from app.models.price_data import PriceData
 from app.models.clinical_guideline import ClinicalGuideline
 from app.services.payment import Payment
+from app.models.appeal import Appeal, AppealTimeline
+from app.models.provider_portal import ProviderAuthorization, ProviderDispute
+from app.models.security import BAARecord, BreachIncident, SecurityAssessment
 
 __all__ = [
     "Employer",
@@ -26,4 +29,11 @@ __all__ = [
     "PriceData",
     "ClinicalGuideline",
     "Payment",
+    "ProviderAuthorization",
+    "ProviderDispute",
+    "Appeal",
+    "AppealTimeline",
+    "BAARecord",
+    "BreachIncident",
+    "SecurityAssessment",
 ]

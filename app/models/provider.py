@@ -2,7 +2,7 @@ import uuid
 
 import enum
 
-from sqlalchemy import String, Integer, Numeric, Float
+from sqlalchemy import String, Integer, Numeric, Float, JSON
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -36,3 +36,7 @@ class Provider(Base):
     longitude: Mapped[float | None] = mapped_column(Float, nullable=True)
     quality_score: Mapped[float | None] = mapped_column(Numeric(5, 2), nullable=True)
     outcome_data_points: Mapped[int] = mapped_column(Integer, default=0)
+    # Provider availability windows — JSON list of
+    # {"day_of_week": 0-6, "start_hour": 8, "end_hour": 17, "slot_minutes": 30}
+    # Supports Q3: scheduling at earliest provider availability
+    availability_schedule: Mapped[dict | None] = mapped_column(JSON, nullable=True)

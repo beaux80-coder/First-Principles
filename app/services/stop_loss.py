@@ -94,6 +94,65 @@ STOP_LOSS_CARRIERS = {
         "benefit_types_covered": ["health", "dental", "vision", "mental_health", "life", "std", "ltd"],
         "terminal_liability_months": 12,
     },
+    "aetna": {
+        "name": "Aetna Stop Loss",
+        "financial_strength": "A",
+        "specific_deductible_range": (60_000, 400_000),
+        "aggregate_corridor_pct": (1.20, 1.32),
+        "base_rate_pepm": 40.00,
+        "rate_discount_per_100_lives": 0.005,
+        "max_group_discount": 0.22,
+        "claim_turnaround_days": 12,
+        "benefit_types_covered": ["health", "dental", "vision", "mental_health"],
+        "terminal_liability_months": 15,
+        "api_submission": True,
+        "api_endpoint": "https://api.aetna.com/stoploss/v1/quotes",
+        "api_notes": "Aetna supports electronic submission via their Stop Loss API for groups 50+ lives",
+    },
+    "cigna": {
+        "name": "Cigna Stop Loss",
+        "financial_strength": "A",
+        "specific_deductible_range": (75_000, 500_000),
+        "aggregate_corridor_pct": (1.22, 1.35),
+        "base_rate_pepm": 43.00,
+        "rate_discount_per_100_lives": 0.005,
+        "max_group_discount": 0.24,
+        "claim_turnaround_days": 10,
+        "benefit_types_covered": ["health", "dental", "vision", "mental_health", "life"],
+        "terminal_liability_months": 12,
+        "api_submission": True,
+        "api_endpoint": "https://api.cigna.com/stoploss/submissions",
+        "api_notes": "Cigna offers API-based submission for groups with 100+ enrolled employees",
+    },
+    "humana": {
+        "name": "Humana Stop Loss",
+        "financial_strength": "A-",
+        "specific_deductible_range": (50_000, 350_000),
+        "aggregate_corridor_pct": (1.25, 1.40),
+        "base_rate_pepm": 37.50,
+        "rate_discount_per_100_lives": 0.006,
+        "max_group_discount": 0.23,
+        "claim_turnaround_days": 14,
+        "benefit_types_covered": ["health", "dental", "vision", "mental_health"],
+        "terminal_liability_months": 12,
+        "api_submission": False,
+        "api_notes": "Humana requires manual submission via broker portal; no public API for stop-loss quotes",
+    },
+    "metlife": {
+        "name": "MetLife Stop Loss",
+        "financial_strength": "A+",
+        "specific_deductible_range": (100_000, 600_000),
+        "aggregate_corridor_pct": (1.18, 1.28),
+        "base_rate_pepm": 46.00,
+        "rate_discount_per_100_lives": 0.004,
+        "max_group_discount": 0.20,
+        "claim_turnaround_days": 11,
+        "benefit_types_covered": ["health", "dental", "vision", "mental_health", "life", "std", "ltd"],
+        "terminal_liability_months": 15,
+        "api_submission": True,
+        "api_endpoint": "https://api.metlife.com/stoploss/v2/submit",
+        "api_notes": "MetLife supports API submission via their Group Benefits platform for 75+ life groups",
+    },
 }
 
 # ── Risk Factor Weights by Benefit Type ─────────────────────────────────────
@@ -637,6 +696,392 @@ def _default_risk_profile(employer: Employer) -> dict:
         "total_claims_analyzed": 0,
         "assessment_date": datetime.now(UTC).isoformat(),
     }
+
+
+def negotiate_group_rate(db: Session, employer_ids: list) -> dict:
+    """Multi-employer group negotiation framework.
+
+    Aggregates multiple employers into a single purchasing group for
+    stop-loss negotiation, computing the combined risk profile and
+    the group discount achievable by pooling lives.
+
+    Args:
+        db: Database session.
+        employer_ids: List of employer UUIDs to include in the group.
+    """
+    now = datetime.now(UTC)
+
+    if not employer_ids:
+        return {"error": "No employer IDs provided"}
+
+    # Assess each employer's risk and aggregate
+    group_risk_scores = []
+    group_employees = 0
+    employer_details = []
+
+    for eid in employer_ids:
+        try:
+            employer_uuid = eid if isinstance(eid, uuid.UUID) else uuid.UUID(str(eid))
+            risk = assess_employer_risk(db, employer_uuid)
+            employer = db.query(Employer).filter(
+                Employer.employer_id == employer_uuid,
+            ).first()
+
+            emp_count = risk.get("employee_count", 0)
+            risk_score = risk.get("aggregate_risk_score", 50.0)
+
+            group_risk_scores.append((risk_score, emp_count))
+            group_employees += emp_count
+
+            employer_details.append({
+                "employer_id": str(eid),
+                "name": employer.name if employer else "Unknown",
+                "employee_count": emp_count,
+                "risk_score": risk_score,
+                "risk_tier": risk.get("risk_tier", "moderate"),
+            })
+        except Exception as e:
+            logger.warning(f"Risk assessment failed for employer {eid}: {e}")
+            employer_details.append({
+                "employer_id": str(eid),
+                "error": str(e),
+            })
+
+    if group_employees == 0:
+        return {"error": "No employees found across provided employers"}
+
+    # Weighted average risk score (weighted by employee count)
+    weighted_risk = sum(
+        score * count for score, count in group_risk_scores
+    ) / group_employees if group_employees > 0 else 50.0
+
+    # Compute group discount for each carrier
+    carrier_group_rates = {}
+    for carrier_key, carrier in STOP_LOSS_CARRIERS.items():
+        # Group discount based on total group lives
+        group_discount = min(
+            carrier["max_group_discount"],
+            (group_employees / 100) * carrier["rate_discount_per_100_lives"],
+        )
+
+        # Risk-adjusted rate
+        risk_multiplier = 0.7 + (weighted_risk / 100) * 0.6
+        group_rate = carrier["base_rate_pepm"] * risk_multiplier * (1 - group_discount)
+
+        # Individual rate (what each employer would pay alone)
+        # Average employer size
+        avg_employer_size = group_employees / max(1, len(employer_ids))
+        individual_discount = min(
+            carrier["max_group_discount"],
+            (avg_employer_size / 100) * carrier["rate_discount_per_100_lives"],
+        )
+        individual_rate = carrier["base_rate_pepm"] * risk_multiplier * (1 - individual_discount)
+
+        savings_vs_individual = individual_rate - group_rate
+
+        carrier_group_rates[carrier_key] = {
+            "carrier_name": carrier["name"],
+            "group_rate_pepm": round(group_rate, 2),
+            "individual_rate_pepm": round(individual_rate, 2),
+            "savings_per_life_pepm": round(savings_vs_individual, 2),
+            "group_discount_pct": round(group_discount * 100, 1),
+            "individual_discount_pct": round(individual_discount * 100, 1),
+            "annual_group_premium": round(group_rate * group_employees * 12, 2),
+            "annual_savings_vs_individual": round(
+                savings_vs_individual * group_employees * 12, 2
+            ),
+        }
+
+    # Sort by group rate
+    best_carrier = min(carrier_group_rates.items(), key=lambda x: x[1]["group_rate_pepm"])
+
+    return {
+        "negotiated_at": now.isoformat(),
+        "group_composition": {
+            "employer_count": len(employer_ids),
+            "total_employees": group_employees,
+            "weighted_risk_score": round(weighted_risk, 1),
+            "risk_tier": _risk_tier(weighted_risk),
+        },
+        "employer_details": employer_details,
+        "carrier_group_rates": carrier_group_rates,
+        "recommended_carrier": {
+            "carrier_key": best_carrier[0],
+            **best_carrier[1],
+        },
+        "group_advantage": (
+            f"Pooling {len(employer_ids)} employers ({group_employees} lives) achieves "
+            f"purchasing power equivalent to a single {group_employees}-employee "
+            f"organization. Best group rate: ${best_carrier[1]['group_rate_pepm']}/PEPM "
+            f"(saving ${best_carrier[1]['savings_per_life_pepm']}/life/month vs individual rates)."
+        ),
+    }
+
+
+def run_advanced_monte_carlo(
+    db: Session,
+    employer_id,
+    num_simulations: int = 10_000,
+) -> dict:
+    """Advanced actuarial Monte Carlo simulation for catastrophic claim prediction.
+
+    Enhanced version of run_monte_carlo_simulation with:
+    - Per-benefit-type claim distributions
+    - Correlation modeling between benefit types
+    - Trend factor application (medical inflation)
+    - Specific and aggregate attachment point optimization
+    - Value-at-Risk (VaR) and Conditional VaR computation
+
+    Args:
+        db: Database session.
+        employer_id: Employer UUID.
+        num_simulations: Number of simulation iterations (default 10,000).
+    """
+    employer_uuid = employer_id if isinstance(employer_id, uuid.UUID) else uuid.UUID(str(employer_id))
+    risk_profile = assess_employer_risk(db, employer_uuid)
+    employee_count = risk_profile["employee_count"]
+
+    if employee_count == 0:
+        return {"error": "No employees found for employer"}
+
+    rng = random.Random(42)
+
+    # Per-benefit-type claim distributions (lognormal parameters)
+    benefit_distributions = {
+        BenefitType.health: {"mu": 7.8, "sigma": 1.8, "frequency": 6.0},
+        BenefitType.mental_health: {"mu": 6.5, "sigma": 1.2, "frequency": 2.0},
+        BenefitType.dental: {"mu": 5.5, "sigma": 0.8, "frequency": 3.0},
+        BenefitType.vision: {"mu": 5.0, "sigma": 0.5, "frequency": 1.5},
+        BenefitType.life: {"mu": 11.0, "sigma": 1.0, "frequency": 0.005},
+        BenefitType.std: {"mu": 8.5, "sigma": 1.0, "frequency": 0.1},
+        BenefitType.ltd: {"mu": 9.5, "sigma": 1.2, "frequency": 0.05},
+    }
+
+    # Medical trend factor (annual medical cost inflation)
+    trend_factor = 1.07  # 7% annual medical inflation
+
+    # Correlation factor: mental health claims increase medical claims
+    mh_medical_correlation = 0.3
+
+    # Simulation
+    annual_costs = []
+    max_individual_claims = []
+    catastrophic_counts = []
+    benefit_type_totals = {bt.value: [] for bt in BenefitType}
+
+    for sim in range(num_simulations):
+        year_total = 0.0
+        year_max_claim = 0.0
+        year_catastrophic = 0
+        year_bt_totals = {bt.value: 0.0 for bt in BenefitType}
+
+        for _ in range(employee_count):
+            employee_mh_flag = False
+
+            for bt, dist in benefit_distributions.items():
+                # Claim frequency (Poisson-like)
+                n_claims = max(0, int(rng.gauss(dist["frequency"], dist["frequency"] * 0.3)))
+
+                # Correlation: if employee had mental health claims, increase health frequency
+                if bt == BenefitType.health and employee_mh_flag:
+                    n_claims = int(n_claims * (1 + mh_medical_correlation))
+
+                for _ in range(n_claims):
+                    claim_amount = rng.lognormvariate(dist["mu"], dist["sigma"])
+                    claim_amount *= trend_factor  # Apply medical inflation
+                    year_total += claim_amount
+                    year_bt_totals[bt.value] += claim_amount
+                    year_max_claim = max(year_max_claim, claim_amount)
+
+                    threshold = CATASTROPHIC_THRESHOLDS.get(bt, 100_000)
+                    if claim_amount >= threshold:
+                        year_catastrophic += 1
+
+                    if bt == BenefitType.mental_health and claim_amount > 5_000:
+                        employee_mh_flag = True
+
+        annual_costs.append(year_total)
+        max_individual_claims.append(year_max_claim)
+        catastrophic_counts.append(year_catastrophic)
+        for bt_val, total in year_bt_totals.items():
+            benefit_type_totals[bt_val].append(total)
+
+    # Sort for percentile computation
+    annual_costs.sort()
+    max_individual_claims.sort()
+
+    # Core statistics
+    mean_cost = sum(annual_costs) / num_simulations
+    p50 = annual_costs[int(num_simulations * 0.50)]
+    p75 = annual_costs[int(num_simulations * 0.75)]
+    p90 = annual_costs[int(num_simulations * 0.90)]
+    p95 = annual_costs[int(num_simulations * 0.95)]
+    p99 = annual_costs[int(num_simulations * 0.99)]
+
+    # Value-at-Risk (VaR) and Conditional VaR (CVaR / Expected Shortfall)
+    var_95 = p95
+    cvar_95_costs = [c for c in annual_costs if c >= var_95]
+    cvar_95 = sum(cvar_95_costs) / len(cvar_95_costs) if cvar_95_costs else var_95
+
+    var_99 = p99
+    cvar_99_costs = [c for c in annual_costs if c >= var_99]
+    cvar_99 = sum(cvar_99_costs) / len(cvar_99_costs) if cvar_99_costs else var_99
+
+    # Per-benefit-type statistics
+    bt_statistics = {}
+    for bt_val, costs in benefit_type_totals.items():
+        costs.sort()
+        if costs:
+            bt_statistics[bt_val] = {
+                "mean": round(sum(costs) / len(costs), 2),
+                "p95": round(costs[int(len(costs) * 0.95)], 2),
+                "p99": round(costs[int(len(costs) * 0.99)], 2),
+                "pct_of_total": round(
+                    sum(costs) / sum(annual_costs) * 100, 1
+                ) if sum(annual_costs) > 0 else 0,
+            }
+
+    # Optimal attachment points
+    p95_max = max_individual_claims[int(num_simulations * 0.95)]
+    optimal_specific = _round_to_nearest(p95_max * 0.8, 25_000)
+    optimal_specific = max(50_000, min(500_000, optimal_specific))
+    optimal_aggregate_pct = p90 / max(1, p50)
+
+    # Catastrophic claim statistics
+    avg_catastrophic = sum(catastrophic_counts) / num_simulations
+    prob_any_catastrophic = sum(1 for c in catastrophic_counts if c > 0) / num_simulations
+
+    return {
+        "employer_id": str(employer_id),
+        "employee_count": employee_count,
+        "simulations_run": num_simulations,
+        "methodology": {
+            "claim_distributions": "Per-benefit-type lognormal with Poisson frequency",
+            "trend_factor": trend_factor,
+            "correlation_modeling": "Mental health → medical claim frequency correlation",
+            "benefit_types_modeled": len(benefit_distributions),
+        },
+        "annual_cost_distribution": {
+            "mean": round(mean_cost, 2),
+            "p50": round(p50, 2),
+            "p75": round(p75, 2),
+            "p90": round(p90, 2),
+            "p95": round(p95, 2),
+            "p99": round(p99, 2),
+        },
+        "risk_metrics": {
+            "var_95": round(var_95, 2),
+            "cvar_95": round(cvar_95, 2),
+            "var_99": round(var_99, 2),
+            "cvar_99": round(cvar_99, 2),
+            "var_note": (
+                "VaR = maximum expected loss at confidence level. "
+                "CVaR = expected loss given that loss exceeds VaR (tail risk)."
+            ),
+        },
+        "catastrophic_analysis": {
+            "avg_catastrophic_per_year": round(avg_catastrophic, 2),
+            "probability_any_catastrophic": round(prob_any_catastrophic, 4),
+            "p95_largest_single_claim": round(p95_max, 2),
+        },
+        "benefit_type_breakdown": bt_statistics,
+        "optimal_attachment_points": {
+            "specific_deductible": optimal_specific,
+            "aggregate_corridor_pct": round(optimal_aggregate_pct * 100, 1),
+        },
+        "risk_profile": {
+            "aggregate_risk_score": risk_profile["aggregate_risk_score"],
+            "risk_tier": risk_profile["risk_tier"],
+        },
+    }
+
+
+def submit_to_carrier_api(carrier_name: str, submission_data: dict) -> dict:
+    """Carrier API submission framework.
+
+    Documents which carriers support API submission and provides the
+    submission structure. In production, this would make actual API calls
+    to carrier endpoints.
+
+    Args:
+        carrier_name: Carrier key (e.g., "aetna", "cigna", "metlife").
+        submission_data: Quote request data including employer profile,
+                        employee count, risk assessment, and desired
+                        attachment points.
+    """
+    carrier = STOP_LOSS_CARRIERS.get(carrier_name.lower())
+    if not carrier:
+        return {
+            "error": f"Unknown carrier: {carrier_name}",
+            "available_carriers": list(STOP_LOSS_CARRIERS.keys()),
+        }
+
+    has_api = carrier.get("api_submission", False)
+    api_endpoint = carrier.get("api_endpoint")
+    api_notes = carrier.get("api_notes", "No API information available")
+
+    # Build the submission payload structure
+    submission_payload = {
+        "carrier": carrier["name"],
+        "request_type": "stop_loss_quote",
+        "group_data": {
+            "employer_name": submission_data.get("employer_name", ""),
+            "employee_count": submission_data.get("employee_count", 0),
+            "industry": submission_data.get("industry", ""),
+            "state": submission_data.get("state", ""),
+            "effective_date": submission_data.get("effective_date", ""),
+        },
+        "coverage_requested": {
+            "specific_deductible": submission_data.get("specific_deductible", 150_000),
+            "aggregate_corridor_pct": submission_data.get("aggregate_corridor_pct", 125),
+            "benefit_types": submission_data.get(
+                "benefit_types", carrier["benefit_types_covered"]
+            ),
+            "terminal_liability_months": carrier["terminal_liability_months"],
+        },
+        "risk_data": {
+            "aggregate_risk_score": submission_data.get("risk_score", 50.0),
+            "claims_history_months": submission_data.get("claims_history_months", 0),
+            "prior_year_total_claims": submission_data.get("prior_year_claims", 0),
+            "large_claims_over_50k": submission_data.get("large_claims", 0),
+        },
+        "group_purchasing": {
+            "total_platform_lives": submission_data.get("total_platform_lives", 0),
+            "group_discount_requested": True,
+        },
+    }
+
+    if has_api:
+        return {
+            "carrier": carrier["name"],
+            "api_supported": True,
+            "api_endpoint": api_endpoint,
+            "api_notes": api_notes,
+            "submission_status": "ready_to_submit",
+            "submission_payload": submission_payload,
+            "expected_response_time": f"{carrier['claim_turnaround_days']} business days",
+            "integration_notes": (
+                f"API submission to {carrier['name']} is supported. "
+                f"In production, this payload would be sent to {api_endpoint} "
+                f"with appropriate authentication credentials."
+            ),
+        }
+    else:
+        return {
+            "carrier": carrier["name"],
+            "api_supported": False,
+            "api_notes": api_notes,
+            "submission_status": "manual_required",
+            "submission_payload": submission_payload,
+            "manual_process": {
+                "step_1": f"Log into {carrier['name']} broker portal",
+                "step_2": "Navigate to Stop Loss Quote Request",
+                "step_3": "Enter group data from submission payload",
+                "step_4": "Upload census file and claims history",
+                "step_5": "Submit and await quote response",
+            },
+            "expected_response_time": f"{carrier['claim_turnaround_days']} business days",
+        }
 
 
 def _build_predictions(

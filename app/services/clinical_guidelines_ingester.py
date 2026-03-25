@@ -758,6 +758,497 @@ def ingest_pubmed_clinical_guidelines(db: Session, max_results: int = 50) -> int
     return count
 
 
+def ingest_va_guidelines(db: Session) -> dict:
+    """Ingest VA/DoD Clinical Practice Guidelines.
+
+    Constitution: "Is there any clinical data source that exists and is legally
+    accessible that the engine does not reference?"
+
+    VA/DoD CPGs are evidence-based guidelines developed jointly by the
+    Department of Veterans Affairs and Department of Defense. They cover
+    common conditions with rigorous evidence review and are publicly available.
+
+    Source: https://www.healthquality.va.gov/
+    """
+    logger.info("Ingesting VA/DoD Clinical Practice Guidelines...")
+
+    va_guidelines = [
+        {
+            "title": "VA/DoD Management of Major Depressive Disorder",
+            "condition": "major_depressive_disorder",
+            "benefit_type": BenefitTypeGuideline.mental_health,
+            "recommendation": (
+                "Pharmacotherapy and/or psychotherapy recommended for moderate-severe MDD. "
+                "SSRIs or SNRIs as first-line pharmacotherapy. CBT, behavioral activation, "
+                "or interpersonal therapy as first-line psychotherapy. Combination therapy "
+                "for severe or treatment-resistant cases."
+            ),
+            "criteria": (
+                "Diagnosis of MDD via PHQ-9 >= 10 or clinical interview. Severity assessment "
+                "determines treatment intensity: mild (PHQ-9 10-14) watchful waiting or "
+                "monotherapy; moderate (15-19) monotherapy or combination; severe (20+) "
+                "combination therapy recommended."
+            ),
+            "contraindications": "MAOIs with SSRIs/SNRIs. Bupropion in seizure disorder.",
+            "service_codes": "90834,90837,96127,99213,99214",
+            "grade": GuidelineGrade.a,
+            "population": "Adults with major depressive disorder",
+            "frequency": "Follow-up every 2-4 weeks during acute treatment; monthly during continuation",
+            "source_url": "https://www.healthquality.va.gov/guidelines/MH/mdd/",
+            "publication_date": datetime(2022, 3, 1),
+        },
+        {
+            "title": "VA/DoD Management of PTSD and Acute Stress Disorder",
+            "condition": "ptsd",
+            "benefit_type": BenefitTypeGuideline.mental_health,
+            "recommendation": (
+                "Trauma-focused psychotherapy strongly recommended as first-line treatment. "
+                "Prolonged exposure (PE) or cognitive processing therapy (CPT) preferred. "
+                "Sertraline, paroxetine, or venlafaxine as first-line pharmacotherapy when "
+                "psychotherapy is unavailable or patient preference."
+            ),
+            "criteria": (
+                "Meets DSM-5 criteria for PTSD. PCL-5 score >= 33 supports diagnosis. "
+                "Acute stress disorder: symptoms within 1 month of trauma exposure."
+            ),
+            "contraindications": "Benzodiazepines NOT recommended for PTSD (evidence of harm).",
+            "service_codes": "90834,90837,96127,90791,99213,99214",
+            "grade": GuidelineGrade.a,
+            "population": "Adults with PTSD or acute stress disorder",
+            "frequency": "Weekly sessions for 8-16 weeks for trauma-focused therapy",
+            "source_url": "https://www.healthquality.va.gov/guidelines/MH/ptsd/",
+            "publication_date": datetime(2023, 6, 1),
+        },
+        {
+            "title": "VA/DoD Management of Chronic Pain",
+            "condition": "chronic_pain",
+            "benefit_type": BenefitTypeGuideline.health,
+            "recommendation": (
+                "Multimodal non-pharmacologic approaches first-line: exercise therapy, CBT for pain, "
+                "physical therapy, yoga, massage. NSAIDs or acetaminophen for mild-moderate pain. "
+                "Opioids only when benefits clearly outweigh risks with documented treatment agreement."
+            ),
+            "criteria": (
+                "Pain lasting >= 3 months. Functional assessment documenting impact on daily activities. "
+                "Trial of non-pharmacologic approaches before escalation to pharmacotherapy."
+            ),
+            "contraindications": (
+                "Opioids: active substance use disorder without concurrent MAT treatment. "
+                "NSAIDs: renal insufficiency, GI bleeding history, cardiovascular disease."
+            ),
+            "service_codes": "97110,97140,97530,99213,99214,99215,90834",
+            "grade": GuidelineGrade.a,
+            "population": "Adults with chronic non-cancer pain",
+            "frequency": "Reassess every 1-3 months; opioid risk reassessment every 90 days",
+            "source_url": "https://www.healthquality.va.gov/guidelines/Pain/cot/",
+            "publication_date": datetime(2022, 11, 1),
+        },
+        {
+            "title": "VA/DoD Management of Type 2 Diabetes Mellitus",
+            "condition": "type2_diabetes",
+            "benefit_type": BenefitTypeGuideline.health,
+            "recommendation": (
+                "Lifestyle modification (diet, exercise, weight management) as foundation. "
+                "Metformin as first-line pharmacotherapy. GLP-1 receptor agonists or SGLT2 "
+                "inhibitors preferred second-line for patients with cardiovascular disease "
+                "or chronic kidney disease."
+            ),
+            "criteria": (
+                "HbA1c >= 6.5% or fasting glucose >= 126 mg/dL on two separate occasions. "
+                "Individualized HbA1c target: < 7% for most; < 8% for elderly/comorbid."
+            ),
+            "contraindications": "Metformin: eGFR < 30. SGLT2i: recurrent UTI or DKA history.",
+            "service_codes": "83036,82947,99213,99214,99215,97802,97803",
+            "grade": GuidelineGrade.a,
+            "population": "Adults with type 2 diabetes mellitus",
+            "frequency": "HbA1c every 3-6 months; annual comprehensive diabetes exam",
+            "source_url": "https://www.healthquality.va.gov/guidelines/CD/diabetes/",
+            "publication_date": datetime(2023, 5, 1),
+        },
+        {
+            "title": "VA/DoD Management of Hypertension",
+            "condition": "hypertension",
+            "benefit_type": BenefitTypeGuideline.health,
+            "recommendation": (
+                "Lifestyle modification for all: DASH diet, sodium reduction, regular exercise, "
+                "weight management, alcohol moderation. Pharmacotherapy when BP >= 140/90 "
+                "(or >= 130/80 with high cardiovascular risk). ACE inhibitors, ARBs, "
+                "calcium channel blockers, or thiazide diuretics as first-line."
+            ),
+            "criteria": (
+                "Office BP >= 140/90 on 2+ occasions, confirmed by ambulatory or home monitoring. "
+                "Lower threshold of 130/80 for patients with diabetes, CKD, or established CVD."
+            ),
+            "contraindications": "ACEi/ARB: pregnancy, bilateral renal artery stenosis, hyperkalemia.",
+            "service_codes": "99213,99214,99215,93784,93786,93788,93790",
+            "grade": GuidelineGrade.a,
+            "population": "Adults with hypertension",
+            "frequency": "Follow-up every 4-6 weeks until controlled; every 3-6 months thereafter",
+            "source_url": "https://www.healthquality.va.gov/guidelines/CD/htn/",
+            "publication_date": datetime(2023, 4, 1),
+        },
+    ]
+
+    now = datetime.now(UTC)
+    count = 0
+    for g in va_guidelines:
+        existing = db.query(ClinicalGuideline).filter(
+            ClinicalGuideline.title == g["title"],
+            ClinicalGuideline.source == GuidelineSource.other,
+        ).first()
+        if existing:
+            continue
+
+        db.add(ClinicalGuideline(
+            source=GuidelineSource.other,
+            benefit_type=g["benefit_type"],
+            title=g["title"],
+            condition=g["condition"],
+            service_codes=g.get("service_codes"),
+            recommendation=g["recommendation"],
+            criteria=g.get("criteria"),
+            contraindications=g.get("contraindications"),
+            grade=g.get("grade", GuidelineGrade.ungraded),
+            population=g.get("population"),
+            frequency=g.get("frequency"),
+            source_url=g.get("source_url"),
+            publication_date=g.get("publication_date"),
+            ingested_at=now,
+            is_active=True,
+        ))
+        count += 1
+
+    db.commit()
+    logger.info(f"Ingested {count} VA/DoD clinical practice guidelines")
+    return {
+        "source": "VA/DoD Clinical Practice Guidelines",
+        "guidelines_ingested": count,
+        "ingested_at": now.isoformat(),
+    }
+
+
+def ingest_acr_guidelines(db: Session) -> dict:
+    """Ingest ACR Appropriateness Criteria (imaging guidelines).
+
+    Constitution: "Is there any clinical data source that exists and is legally
+    accessible that the engine does not reference?"
+
+    ACR Appropriateness Criteria are evidence-based guidelines for imaging
+    and interventional radiology. They specify which imaging study is most
+    appropriate for a given clinical condition, reducing unnecessary imaging
+    and ensuring patients receive the right diagnostic test.
+
+    Source: https://acsearch.acr.org/
+    """
+    logger.info("Ingesting ACR Appropriateness Criteria...")
+
+    acr_guidelines = [
+        {
+            "title": "ACR Appropriateness Criteria: Low Back Pain",
+            "condition": "low_back_pain",
+            "benefit_type": BenefitTypeGuideline.health,
+            "recommendation": (
+                "Imaging NOT indicated for acute low back pain without red flags in first 6 weeks. "
+                "MRI lumbar spine indicated for: radiculopathy not improving after 6 weeks conservative "
+                "treatment, cauda equina syndrome, suspected cancer/infection, progressive neurological deficit."
+            ),
+            "criteria": (
+                "Red flags requiring immediate imaging: cauda equina syndrome (bowel/bladder dysfunction), "
+                "fever with back pain (suspected infection), history of cancer, trauma with neurological deficit, "
+                "progressive weakness. Without red flags: 6 weeks conservative treatment before imaging."
+            ),
+            "contraindications": "MRI: pacemaker, metallic implants. CT preferred if MRI contraindicated.",
+            "service_codes": "72148,72141,72156,72131,72132,72133,72010,72020,72100,72110",
+            "grade": GuidelineGrade.a,
+            "population": "Adults with low back pain",
+            "frequency": "Follow-up imaging only if clinical picture changes or new red flags develop",
+            "source_url": "https://acsearch.acr.org/docs/69483/Narrative/",
+            "publication_date": datetime(2021, 1, 1),
+        },
+        {
+            "title": "ACR Appropriateness Criteria: Headache",
+            "condition": "headache",
+            "benefit_type": BenefitTypeGuideline.health,
+            "recommendation": (
+                "Imaging NOT indicated for typical primary headache (migraine, tension) with normal "
+                "neurological exam. MRI brain indicated for: thunderclap headache, new headache with "
+                "papilledema, headache with focal neurological signs, positional headache, "
+                "headache in immunocompromised patient."
+            ),
+            "criteria": (
+                "Red flags (SNOOP criteria): systemic symptoms/disease, neurological signs, "
+                "onset sudden (thunderclap), onset after age 50, pattern change. "
+                "Imaging indicated for any red flag. CT without contrast for acute presentation; "
+                "MRI with and without contrast for subacute evaluation."
+            ),
+            "contraindications": "CT with contrast: iodine allergy (premedicate), renal insufficiency.",
+            "service_codes": "70553,70551,70552,70450,70460,70470",
+            "grade": GuidelineGrade.a,
+            "population": "Adults with headache",
+            "frequency": "Not indicated for stable chronic headache without change in pattern",
+            "source_url": "https://acsearch.acr.org/docs/69482/Narrative/",
+            "publication_date": datetime(2022, 1, 1),
+        },
+        {
+            "title": "ACR Appropriateness Criteria: Acute Chest Pain — Low Probability of CAD",
+            "condition": "chest_pain_low_risk",
+            "benefit_type": BenefitTypeGuideline.health,
+            "recommendation": (
+                "For low-risk chest pain (HEART score 0-3): coronary CT angiography or stress "
+                "testing appropriate. CT angiography preferred for rapid rule-out. "
+                "Resting echocardiography appropriate if valvular disease suspected."
+            ),
+            "criteria": (
+                "Low-risk acute chest pain: HEART score 0-3, negative initial troponin, "
+                "no ST changes on ECG. Age-appropriate risk stratification. "
+                "CCTA appropriate for patients with low-intermediate pre-test probability."
+            ),
+            "contraindications": (
+                "CCTA: irregular heart rhythm (relative), contrast allergy, renal insufficiency. "
+                "Stress testing: acute MI, unstable angina, decompensated heart failure."
+            ),
+            "service_codes": "75574,78452,78453,78454,93350,93351,93306,93307,93308",
+            "grade": GuidelineGrade.b,
+            "population": "Adults with acute chest pain, low probability of CAD",
+            "frequency": "Per acute presentation; not for routine screening",
+            "source_url": "https://acsearch.acr.org/docs/3155607/Narrative/",
+            "publication_date": datetime(2022, 1, 1),
+        },
+        {
+            "title": "ACR Appropriateness Criteria: Shoulder Pain — Nontraumatic",
+            "condition": "shoulder_pain_nontraumatic",
+            "benefit_type": BenefitTypeGuideline.health,
+            "recommendation": (
+                "Initial evaluation: radiographs (2 views minimum). MRI without contrast for suspected "
+                "rotator cuff tear or labral pathology. Ultrasound appropriate alternative to MRI for "
+                "rotator cuff evaluation in experienced hands. MR arthrography for suspected labral tear."
+            ),
+            "criteria": (
+                "Radiographs first for all shoulder pain. MRI indicated when: clinical exam suggests "
+                "rotator cuff tear (positive drop arm, weakness in external rotation), symptoms not "
+                "improving with 4-6 weeks conservative management, surgical planning needed."
+            ),
+            "contraindications": "MRI: pacemaker, metallic implants. Use ultrasound as alternative.",
+            "service_codes": "73221,73222,73223,73020,73030,76881,76882",
+            "grade": GuidelineGrade.b,
+            "population": "Adults with nontraumatic shoulder pain",
+            "frequency": "Follow-up imaging based on clinical response to treatment",
+            "source_url": "https://acsearch.acr.org/docs/69433/Narrative/",
+            "publication_date": datetime(2022, 1, 1),
+        },
+        {
+            "title": "ACR Appropriateness Criteria: Knee Pain — Nontraumatic",
+            "condition": "knee_pain_nontraumatic",
+            "benefit_type": BenefitTypeGuideline.health,
+            "recommendation": (
+                "Initial evaluation: weight-bearing radiographs. MRI without contrast for suspected "
+                "internal derangement (meniscal tear, ligament injury) not responding to conservative "
+                "management. Aspiration and fluid analysis if effusion with suspected infection or crystal disease."
+            ),
+            "criteria": (
+                "Radiographs first for chronic knee pain. MRI indicated for: mechanical symptoms "
+                "(locking, catching), clinical exam suggesting internal derangement, persistent pain "
+                "after 4-6 weeks conservative management, pre-surgical planning."
+            ),
+            "contraindications": "MRI: standard contraindications (pacemaker, metallic implants).",
+            "service_codes": "73721,73722,73723,73560,73562,73564,73565",
+            "grade": GuidelineGrade.b,
+            "population": "Adults with nontraumatic knee pain",
+            "frequency": "Follow-up imaging based on clinical response; not routine for osteoarthritis",
+            "source_url": "https://acsearch.acr.org/docs/69419/Narrative/",
+            "publication_date": datetime(2023, 1, 1),
+        },
+    ]
+
+    now = datetime.now(UTC)
+    count = 0
+    for g in acr_guidelines:
+        existing = db.query(ClinicalGuideline).filter(
+            ClinicalGuideline.title == g["title"],
+            ClinicalGuideline.source == GuidelineSource.other,
+        ).first()
+        if existing:
+            continue
+
+        db.add(ClinicalGuideline(
+            source=GuidelineSource.other,
+            benefit_type=g["benefit_type"],
+            title=g["title"],
+            condition=g["condition"],
+            service_codes=g.get("service_codes"),
+            recommendation=g["recommendation"],
+            criteria=g.get("criteria"),
+            contraindications=g.get("contraindications"),
+            grade=g.get("grade", GuidelineGrade.ungraded),
+            population=g.get("population"),
+            frequency=g.get("frequency"),
+            source_url=g.get("source_url"),
+            publication_date=g.get("publication_date"),
+            ingested_at=now,
+            is_active=True,
+        ))
+        count += 1
+
+    db.commit()
+    logger.info(f"Ingested {count} ACR Appropriateness Criteria guidelines")
+    return {
+        "source": "ACR Appropriateness Criteria",
+        "guidelines_ingested": count,
+        "ingested_at": now.isoformat(),
+    }
+
+
+def ingest_specialty_guidelines(db: Session) -> dict:
+    """Ingest additional specialty society clinical practice guidelines.
+
+    Covers cardiology (ACC/AHA), endocrinology (ADA), pulmonology (GOLD),
+    and gastroenterology (ACG) guidelines to expand clinical coverage.
+    """
+    logger.info("Ingesting specialty society guidelines...")
+
+    specialty_guidelines = [
+        # ACC/AHA Cardiology
+        {
+            "title": "ACC/AHA Heart Failure Management",
+            "condition": "heart_failure",
+            "benefit_type": BenefitTypeGuideline.health,
+            "recommendation": (
+                "Stage C HFrEF: GDMT includes ACEi/ARB/ARNI, beta-blocker, MRA, and SGLT2i. "
+                "Diuretics for volume overload. ICD for EF <= 35% despite 3 months GDMT. "
+                "CRT for EF <= 35% with LBBB and QRS >= 150ms."
+            ),
+            "criteria": (
+                "Stage C: structural heart disease with current or prior symptoms of HF. "
+                "EF <= 40% for HFrEF classification. NYHA class I-IV symptom assessment. "
+                "BNP > 100 pg/mL or NT-proBNP > 300 pg/mL supports diagnosis."
+            ),
+            "contraindications": (
+                "ACEi: angioedema history, bilateral renal artery stenosis, pregnancy. "
+                "Beta-blockers: decompensated HF, severe bradycardia, advanced heart block."
+            ),
+            "service_codes": "93306,93307,93308,93312,93350,93351,99213,99214,99215",
+            "grade": GuidelineGrade.a,
+            "population": "Adults with heart failure",
+            "frequency": "Follow-up every 1-2 weeks during titration; every 3-6 months when stable",
+            "source_url": "https://www.acc.org/guidelines/hf",
+            "publication_date": datetime(2022, 4, 1),
+        },
+        # ADA Diabetes Management
+        {
+            "title": "ADA Standards of Care in Diabetes — Pharmacologic Management",
+            "condition": "diabetes_pharmacologic",
+            "benefit_type": BenefitTypeGuideline.health,
+            "recommendation": (
+                "Metformin remains first-line. Second-line selection based on comorbidities: "
+                "GLP-1 RA or SGLT2i for established ASCVD/CKD/HF. Weight-based selection: "
+                "GLP-1 RA or dual GIP/GLP-1 RA for patients needing weight reduction. "
+                "Insulin initiation when HbA1c remains > 10% or symptomatic hyperglycemia."
+            ),
+            "criteria": (
+                "HbA1c target individualization: < 7% for most adults; < 6.5% if achievable "
+                "without significant hypoglycemia; < 8% for elderly, limited life expectancy, "
+                "extensive comorbidities. Reassess every 3 months."
+            ),
+            "contraindications": (
+                "Metformin: eGFR < 30 (contraindicated), < 45 (dose reduction). "
+                "Sulfonylureas: hypoglycemia risk, avoid in CKD. "
+                "SGLT2i: recurrent DKA, type 1 diabetes (off-label risk)."
+            ),
+            "service_codes": "83036,82947,99213,99214,99215,97802,97803,97804",
+            "grade": GuidelineGrade.a,
+            "population": "Adults with type 2 diabetes mellitus",
+            "frequency": "HbA1c every 3 months until stable, then every 6 months",
+            "source_url": "https://diabetesjournals.org/care",
+            "publication_date": datetime(2024, 1, 1),
+        },
+        # GOLD COPD
+        {
+            "title": "GOLD 2024 COPD Management Strategy",
+            "condition": "copd",
+            "benefit_type": BenefitTypeGuideline.health,
+            "recommendation": (
+                "Smoking cessation is the most effective intervention. Bronchodilator therapy: "
+                "LAMA monotherapy for Group A; LABA+LAMA for Group B; LABA+LAMA+ICS triple therapy "
+                "for Group E (exacerbation history). Pulmonary rehabilitation for all symptomatic patients."
+            ),
+            "criteria": (
+                "Post-bronchodilator FEV1/FVC < 0.70 confirms diagnosis. GOLD classification: "
+                "1 (mild) FEV1 >= 80%; 2 (moderate) 50-79%; 3 (severe) 30-49%; 4 (very severe) < 30%. "
+                "ABE group assignment based on exacerbation history and symptoms (mMRC/CAT)."
+            ),
+            "contraindications": "ICS monotherapy without bronchodilator in COPD. Theophylline as first-line.",
+            "service_codes": "94010,94060,94070,94726,94727,94729,99213,99214,97110",
+            "grade": GuidelineGrade.a,
+            "population": "Adults with COPD",
+            "frequency": "Spirometry annually; follow-up every 3-6 months; pulmonary rehab 6-12 weeks",
+            "source_url": "https://goldcopd.org/2024-gold-report/",
+            "publication_date": datetime(2024, 1, 1),
+        },
+        # ACG Gastroenterology
+        {
+            "title": "ACG Guideline: Management of Irritable Bowel Syndrome",
+            "condition": "irritable_bowel_syndrome",
+            "benefit_type": BenefitTypeGuideline.health,
+            "recommendation": (
+                "Diagnosis based on Rome IV criteria; limited testing needed for typical presentation. "
+                "First-line: dietary modification (low FODMAP), soluble fiber supplementation. "
+                "Pharmacotherapy based on subtype: antispasmodics, rifaximin (IBS-D), "
+                "linaclotide/plecanatide (IBS-C). CBT and gut-directed hypnotherapy effective."
+            ),
+            "criteria": (
+                "Rome IV criteria: recurrent abdominal pain >= 1 day/week in last 3 months, "
+                "associated with defecation, change in stool frequency, or change in stool form. "
+                "Onset >= 6 months prior. Alarm features absent (weight loss, rectal bleeding, "
+                "family history of CRC, onset after 50)."
+            ),
+            "contraindications": "Opioids for IBS (worsen motility, risk of narcotic bowel syndrome).",
+            "service_codes": "99213,99214,99215,45378,45380,91037,91038",
+            "grade": GuidelineGrade.b,
+            "population": "Adults with irritable bowel syndrome",
+            "frequency": "Follow-up at 4-8 weeks to assess treatment response; then every 3-6 months",
+            "source_url": "https://journals.lww.com/ajg/",
+            "publication_date": datetime(2021, 1, 1),
+        },
+    ]
+
+    now = datetime.now(UTC)
+    count = 0
+    for g in specialty_guidelines:
+        existing = db.query(ClinicalGuideline).filter(
+            ClinicalGuideline.title == g["title"],
+            ClinicalGuideline.source == GuidelineSource.other,
+        ).first()
+        if existing:
+            continue
+
+        db.add(ClinicalGuideline(
+            source=GuidelineSource.other,
+            benefit_type=g["benefit_type"],
+            title=g["title"],
+            condition=g["condition"],
+            service_codes=g.get("service_codes"),
+            recommendation=g["recommendation"],
+            criteria=g.get("criteria"),
+            contraindications=g.get("contraindications"),
+            grade=g.get("grade", GuidelineGrade.ungraded),
+            population=g.get("population"),
+            frequency=g.get("frequency"),
+            source_url=g.get("source_url"),
+            publication_date=g.get("publication_date"),
+            ingested_at=now,
+            is_active=True,
+        ))
+        count += 1
+
+    db.commit()
+    logger.info(f"Ingested {count} specialty society guidelines")
+    return {
+        "source": "Specialty Society Guidelines (ACC/AHA, ADA, GOLD, ACG)",
+        "guidelines_ingested": count,
+        "ingested_at": now.isoformat(),
+    }
+
+
 def ingest_all_dynamic_sources(db: Session) -> dict:
     """Run all dynamic guideline ingestion sources.
 
@@ -767,7 +1258,10 @@ def ingest_all_dynamic_sources(db: Session) -> dict:
     results["hardcoded_ncds"] = ingest_cms_ncd_guidelines(db)
     results["uspstf"] = ingest_uspstf_recommendations(db)
     results["pubmed"] = ingest_pubmed_clinical_guidelines(db)
-    results["total"] = sum(results.values())
+    results["va_guidelines"] = ingest_va_guidelines(db).get("guidelines_ingested", 0)
+    results["acr_guidelines"] = ingest_acr_guidelines(db).get("guidelines_ingested", 0)
+    results["specialty_guidelines"] = ingest_specialty_guidelines(db).get("guidelines_ingested", 0)
+    results["total"] = sum(v for v in results.values() if isinstance(v, int))
     results["ingested_at"] = datetime.now(UTC).isoformat()
     logger.info(f"Dynamic ingestion complete: {results}")
     return results

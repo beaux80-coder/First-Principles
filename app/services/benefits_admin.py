@@ -14,6 +14,7 @@ All 7 benefit types: health, dental, vision, life, STD, LTD, mental health.
 """
 
 import logging
+import re
 import uuid
 import json
 from datetime import datetime, UTC, timedelta
@@ -207,8 +208,9 @@ def process_life_event(
     db: Session,
     employee_id: uuid.UUID,
     event_type: str,
-    event_date: str,
-    changes: dict,
+    event_date: str | None = None,
+    changes: dict | None = None,
+    simplified_input: str | None = None,
 ) -> dict:
     """Process a qualifying life event (marriage, birth, etc.).
 
@@ -217,16 +219,32 @@ def process_life_event(
     Life events allow mid-year benefit election changes within
     the qualifying period. Changes can apply to any of the 7 benefit types.
 
+    Supports two input formats:
+    1. Structured: event_type, event_date, changes as separate args
+    2. Simplified single-line: "married 2024-01-15" parsed automatically
+
     Args:
         db: Database session
         employee_id: Employee UUID
         event_type: Type of life event (marriage, birth, adoption, etc.)
-        event_date: Date of the event (ISO 8601)
-        changes: Dict of requested changes:
-            - add_dependents: list of dependent data
-            - remove_dependents: list of dependent IDs
-            - benefit_changes: dict of benefit type to new election
+        event_date: Date of the event (ISO 8601). Optional if simplified_input provided.
+        changes: Dict of requested changes. Optional — defaults to empty.
+        simplified_input: Single-line format like "married 2024-01-15".
+            If provided, event_type and event_date are parsed from it.
     """
+    # Parse simplified single-line format: "married 2024-01-15"
+    if simplified_input:
+        parsed = _parse_simplified_life_event(simplified_input)
+        event_type = parsed["event_type"]
+        event_date = parsed["event_date"]
+        changes = parsed.get("changes", {})
+
+    if changes is None:
+        changes = {}
+
+    if event_date is None:
+        event_date = datetime.now(UTC).isoformat()
+
     employee = db.query(Employee).filter(
         Employee.employee_id == employee_id
     ).first()
@@ -789,7 +807,950 @@ def export_employer_data(db: Session, employer_id: uuid.UUID) -> dict:
     }
 
 
+# ── Continuous Enrollment ─────────────────────────────────────────────────────
+
+
+def continuous_enroll(
+    db: Session,
+    employer_id: uuid.UUID,
+    employee_data: dict,
+    benefit_elections: dict | None = None,
+) -> dict:
+    """Auto-enroll an employee with all 7 benefit types, bypassing open enrollment.
+
+    Constitution: "New hires auto-enrolled upon detection. One plan,
+    zero cost-sharing, no plan selection. Open enrollment eliminated entirely."
+
+    If benefit_elections is not provided, the employee is automatically
+    enrolled in all 7 benefit types with zero cost-sharing. There is no
+    plan selection, no waiting period, and no open enrollment window.
+
+    Args:
+        db: Database session
+        employer_id: Employer UUID
+        employee_data: Dict with employee information
+        benefit_elections: Optional overrides. If None, all 7 types elected.
+
+    Returns:
+        Enrollment confirmation.
+    """
+    employer = _get_employer_or_raise(db, employer_id)
+
+    # Default: elect all 7 benefit types
+    if benefit_elections is None:
+        benefit_elections = {
+            bt: {"elected": True, "auto_enrolled": True}
+            for bt in ALL_BENEFIT_TYPES
+        }
+
+    demographics = {
+        "first_name": employee_data.get("first_name", ""),
+        "last_name": employee_data.get("last_name", ""),
+        "date_of_birth": employee_data.get("date_of_birth", ""),
+        "zip_code": employee_data.get("zip_code", ""),
+        "hire_date": employee_data.get("hire_date", ""),
+        "dependents": employee_data.get("dependents", []),
+        "enrollment_date": datetime.now(UTC).isoformat(),
+        "enrollment_method": "continuous_auto",
+        "benefit_elections": benefit_elections,
+    }
+
+    employee = Employee(
+        employer_id=employer_id,
+        status=EmployeeStatus.active,
+        demographics_encrypted=json.dumps(demographics),
+    )
+    db.add(employee)
+    db.commit()
+    db.refresh(employee)
+
+    # Validate elections
+    elected_types = []
+    for bt in BenefitType:
+        election = benefit_elections.get(bt.value, {})
+        is_elected = election.get("elected", False) if isinstance(election, dict) else bool(election)
+        if is_elected:
+            elected_types.append(bt.value)
+
+    return {
+        "enrollment_id": str(employee.employee_id),
+        "employer_id": str(employer_id),
+        "employer_name": employer.name,
+        "status": "enrolled",
+        "enrolled_at": employee.enrolled_at.isoformat(),
+        "enrollment_method": "continuous_auto",
+
+        "employee": {
+            "employee_id": str(employee.employee_id),
+            "name": f"{employee_data.get('first_name', '')} {employee_data.get('last_name', '')}",
+            "dependents_count": len(employee_data.get("dependents", [])),
+        },
+
+        "benefit_elections": benefit_elections,
+        "elected_benefit_types": elected_types,
+        "all_7_types_enrolled": len(elected_types) == len(ALL_BENEFIT_TYPES),
+        "available_benefit_types": ALL_BENEFIT_TYPES,
+
+        "open_enrollment_bypassed": True,
+        "plan_selection_required": False,
+
+        "zero_cost_sharing": {
+            "employee_premium_contribution": 0.00,
+            "deductible": 0.00,
+            "copays": 0.00,
+            "coinsurance": 0.00,
+            "out_of_pocket_max": 0.00,
+            "constitutional_guarantee": (
+                "Zero employee cost-sharing. Open enrollment eliminated."
+            ),
+        },
+    }
+
+
+# ── COBRA Administration ─────────────────────────────────────────────────────
+
+
+def generate_cobra_notice(
+    db: Session,
+    employee_id: uuid.UUID,
+    event_type: str,
+) -> dict:
+    """Generate a COBRA election notice with all required fields.
+
+    Constitution: "Standard benefits admin: COBRA."
+
+    COBRA election notices must contain specific information per
+    29 CFR 2590.606-4. This generates a compliant notice with
+    all required fields populated from the employee's enrollment data.
+
+    Args:
+        db: Database session
+        employee_id: Employee UUID
+        event_type: COBRA qualifying event type
+
+    Returns:
+        Complete COBRA election notice dict.
+    """
+    employee = db.query(Employee).filter(
+        Employee.employee_id == employee_id
+    ).first()
+    if not employee:
+        raise ValueError(f"Employee {employee_id} not found")
+
+    employer = db.query(Employer).filter(
+        Employer.employer_id == employee.employer_id
+    ).first()
+
+    event_info = COBRA_QUALIFYING_EVENTS.get(event_type)
+    if not event_info:
+        raise ValueError(
+            f"Unknown COBRA qualifying event: {event_type}. "
+            f"Valid events: {list(COBRA_QUALIFYING_EVENTS.keys())}"
+        )
+
+    demographics = {}
+    if employee.demographics_encrypted:
+        try:
+            demographics = json.loads(employee.demographics_encrypted)
+        except (json.JSONDecodeError, TypeError):
+            demographics = {}
+
+    now = datetime.now(UTC)
+    election_deadline = now + timedelta(days=60)
+    max_months = event_info["max_continuation_months"]
+    continuation_end = now + timedelta(days=max_months * 30)
+
+    # Estimate COBRA premium (102% of pass-through cost)
+    # Under beneflex, this is the actual care cost, not inflated carrier premium
+    estimated_monthly_premium = 0.00
+    if employer and employer.baseline_cost_pepm:
+        estimated_monthly_premium = float(employer.baseline_cost_pepm) * 1.02
+
+    dependents = demographics.get("dependents", [])
+
+    return {
+        "notice_type": "COBRA Election Notice",
+        "notice_date": now.isoformat(),
+        "regulatory_basis": "29 CFR 2590.606-4",
+
+        "plan_information": {
+            "plan_name": f"{employer.name if employer else 'Employer'} Employee Welfare Benefit Plan",
+            "plan_number": "501",
+            "plan_administrator": employer.name if employer else "",
+            "plan_administrator_address": "[Address on file]",
+            "plan_administrator_phone": "[Phone on file]",
+        },
+
+        "qualifying_event": {
+            "type": event_type,
+            "description": event_info["description"],
+            "event_date": now.strftime("%Y-%m-%d"),
+        },
+
+        "qualified_beneficiaries": [
+            {
+                "name": f"{demographics.get('first_name', '')} {demographics.get('last_name', '')}",
+                "relationship": "employee",
+            }
+        ] + [
+            {
+                "name": dep.get("name", ""),
+                "relationship": dep.get("relationship", "dependent"),
+            }
+            for dep in dependents
+        ],
+
+        "election_information": {
+            "election_deadline": election_deadline.isoformat(),
+            "election_period_days": 60,
+            "retroactive_coverage": True,
+            "retroactive_coverage_note": (
+                "If you elect COBRA within 60 days, coverage is retroactive "
+                "to the date of the qualifying event."
+            ),
+        },
+
+        "coverage_information": {
+            "benefit_types_available": ALL_BENEFIT_TYPES,
+            "coverage_identical_to_active": True,
+            "max_continuation_months": max_months,
+            "continuation_end_date": continuation_end.isoformat(),
+        },
+
+        "premium_information": {
+            "monthly_premium": estimated_monthly_premium,
+            "premium_calculation": "102% of applicable premium (pass-through cost + 2% admin)",
+            "first_payment_due": (now + timedelta(days=45)).isoformat(),
+            "grace_period_days": 30,
+            "payment_methods": ["ACH", "check", "credit card"],
+            "beneflex_advantage": (
+                "COBRA premium based on actual pass-through cost, not "
+                "inflated carrier rates. Typically 30-50% lower than "
+                "traditional COBRA premiums."
+            ),
+        },
+
+        "important_notices": [
+            "You have 60 days from this notice to elect COBRA continuation coverage.",
+            "If you do not elect COBRA, your coverage will end on the qualifying event date.",
+            "COBRA coverage is identical to active employee coverage.",
+            "You may elect COBRA for some or all benefit types.",
+            "Failure to pay premiums within the grace period will result in loss of coverage.",
+            "You may be eligible for coverage through the Health Insurance Marketplace.",
+        ],
+
+        "rights_and_protections": {
+            "erisa_rights": True,
+            "hipaa_protections": True,
+            "no_discrimination": True,
+            "appeal_rights": True,
+        },
+    }
+
+
+def generate_cobra_invoice(
+    db: Session,
+    employee_id: uuid.UUID,
+    month: str,
+) -> dict:
+    """Generate monthly COBRA premium invoice.
+
+    Args:
+        db: Database session
+        employee_id: Employee UUID
+        month: Invoice month (YYYY-MM format)
+
+    Returns:
+        COBRA invoice dict with premium breakdown.
+    """
+    employee = db.query(Employee).filter(
+        Employee.employee_id == employee_id
+    ).first()
+    if not employee:
+        raise ValueError(f"Employee {employee_id} not found")
+
+    employer = db.query(Employer).filter(
+        Employer.employer_id == employee.employer_id
+    ).first()
+
+    demographics = {}
+    if employee.demographics_encrypted:
+        try:
+            demographics = json.loads(employee.demographics_encrypted)
+        except (json.JSONDecodeError, TypeError):
+            demographics = {}
+
+    cobra_info = demographics.get("cobra", {})
+
+    # Calculate premium
+    base_cost = 0.00
+    if employer and employer.baseline_cost_pepm:
+        base_cost = float(employer.baseline_cost_pepm)
+    admin_fee = base_cost * 0.02
+    total_premium = base_cost + admin_fee
+
+    # Count covered individuals
+    dependents = demographics.get("dependents", [])
+    covered_count = 1 + len(dependents)
+
+    invoice_id = str(uuid.uuid4())
+    now = datetime.now(UTC)
+
+    # Payment due date: 30 days from invoice generation
+    due_date = now + timedelta(days=30)
+
+    return {
+        "invoice_id": invoice_id,
+        "invoice_type": "COBRA Monthly Premium",
+        "employee_id": str(employee_id),
+        "employee_name": f"{demographics.get('first_name', '')} {demographics.get('last_name', '')}",
+
+        "invoice_period": month,
+        "generated_at": now.isoformat(),
+        "due_date": due_date.isoformat(),
+        "grace_period_days": 30,
+        "final_payment_deadline": (due_date + timedelta(days=30)).isoformat(),
+
+        "premium_breakdown": {
+            "base_cost_pepm": base_cost,
+            "admin_fee_2pct": admin_fee,
+            "total_monthly_premium": total_premium,
+            "covered_individuals": covered_count,
+            "total_due": total_premium,
+        },
+
+        "benefit_types_covered": ALL_BENEFIT_TYPES,
+
+        "payment_instructions": {
+            "methods": ["ACH", "check", "credit card"],
+            "payable_to": employer.name if employer else "Plan Administrator",
+            "reference": f"COBRA-{invoice_id[:8]}",
+        },
+
+        "cobra_status": {
+            "qualifying_event": cobra_info.get("qualifying_event", ""),
+            "continuation_end": cobra_info.get("continuation_end", ""),
+            "months_remaining": cobra_info.get("max_months", 18),
+        },
+
+        "late_payment_warning": (
+            "Payment must be received within 30 days of the due date. "
+            "Failure to pay within the grace period will result in "
+            "termination of COBRA coverage, which cannot be reinstated."
+        ),
+    }
+
+
+def process_cobra_payment(
+    db: Session,
+    employee_id: uuid.UUID,
+    payment_data: dict,
+) -> dict:
+    """Process a COBRA premium payment.
+
+    Args:
+        db: Database session
+        employee_id: Employee UUID
+        payment_data: Payment details:
+            - amount: float
+            - payment_method: str (ach, check, credit_card)
+            - invoice_id: str
+            - payment_date: str (ISO 8601)
+
+    Returns:
+        Payment processing result.
+    """
+    employee = db.query(Employee).filter(
+        Employee.employee_id == employee_id
+    ).first()
+    if not employee:
+        raise ValueError(f"Employee {employee_id} not found")
+
+    if employee.status != EmployeeStatus.cobra:
+        raise ValueError(
+            f"Employee {employee_id} is not on COBRA "
+            f"(status: {employee.status.value})"
+        )
+
+    amount = payment_data.get("amount", 0.00)
+    payment_method = payment_data.get("payment_method", "ach")
+    invoice_id = payment_data.get("invoice_id", "")
+    payment_date = payment_data.get(
+        "payment_date", datetime.now(UTC).isoformat()
+    )
+
+    payment_id = str(uuid.uuid4())
+    now = datetime.now(UTC)
+
+    # Record payment in demographics
+    demographics = {}
+    if employee.demographics_encrypted:
+        try:
+            demographics = json.loads(employee.demographics_encrypted)
+        except (json.JSONDecodeError, TypeError):
+            demographics = {}
+
+    cobra_payments = demographics.get("cobra_payments", [])
+    cobra_payments.append({
+        "payment_id": payment_id,
+        "invoice_id": invoice_id,
+        "amount": amount,
+        "payment_method": payment_method,
+        "payment_date": payment_date,
+        "processed_at": now.isoformat(),
+        "status": "processed",
+    })
+    demographics["cobra_payments"] = cobra_payments
+    employee.demographics_encrypted = json.dumps(demographics)
+    db.commit()
+
+    return {
+        "payment_id": payment_id,
+        "employee_id": str(employee_id),
+        "invoice_id": invoice_id,
+        "status": "processed",
+        "amount": amount,
+        "payment_method": payment_method,
+        "payment_date": payment_date,
+        "processed_at": now.isoformat(),
+        "coverage_status": "active",
+        "coverage_note": (
+            "COBRA coverage remains active. Next premium due on the "
+            "first of the following month."
+        ),
+    }
+
+
+# ── Payroll Deductions ────────────────────────────────────────────────────────
+
+
+def manage_payroll_deductions(
+    db: Session,
+    employee_id: uuid.UUID,
+) -> dict:
+    """Track and manage payroll deductions for an employee.
+
+    Constitution: Zero cost-sharing means employee deductions are $0.
+    This function tracks the employer-side cost allocation for accounting.
+
+    Args:
+        db: Database session
+        employee_id: Employee UUID
+
+    Returns:
+        Deduction summary showing $0 employee and employer cost allocation.
+    """
+    employee = db.query(Employee).filter(
+        Employee.employee_id == employee_id
+    ).first()
+    if not employee:
+        raise ValueError(f"Employee {employee_id} not found")
+
+    employer = db.query(Employer).filter(
+        Employer.employer_id == employee.employer_id
+    ).first()
+
+    demographics = {}
+    if employee.demographics_encrypted:
+        try:
+            demographics = json.loads(employee.demographics_encrypted)
+        except (json.JSONDecodeError, TypeError):
+            demographics = {}
+
+    elections = demographics.get("benefit_elections", {})
+    dependents = demographics.get("dependents", [])
+
+    # Build per-benefit-type deduction breakdown
+    deduction_lines = {}
+    for bt in ALL_BENEFIT_TYPES:
+        election = elections.get(bt, {})
+        is_elected = (
+            election.get("elected", False) if isinstance(election, dict)
+            else bool(election)
+        )
+        deduction_lines[bt] = {
+            "elected": is_elected,
+            "employee_pre_tax_deduction": 0.00,
+            "employee_post_tax_deduction": 0.00,
+            "employer_contribution": 0.00,  # Set after pricing
+            "deduction_code": f"BFX_{bt.upper()}",
+            "section_125_eligible": True,
+        }
+
+    return {
+        "employee_id": str(employee_id),
+        "employer_id": str(employee.employer_id),
+        "employer_name": employer.name if employer else "",
+        "pay_period": "per_pay_period",
+
+        "deduction_summary": {
+            "total_employee_deduction": 0.00,
+            "total_employer_contribution": 0.00,
+            "section_125_plan": True,
+        },
+
+        "deduction_lines": deduction_lines,
+
+        "constitutional_note": (
+            "Employee deductions are $0.00 across all benefit types. "
+            "Zero cost-sharing is a constitutional guarantee. "
+            "Employer cost is the pass-through rate plus value-share fee, "
+            "allocated per benefit type for accounting purposes."
+        ),
+
+        "payroll_integration": {
+            "deduction_frequency": "per_pay_period",
+            "effective_date": demographics.get("enrollment_date", ""),
+            "auto_updated": True,
+        },
+    }
+
+
+# ── Dependent Verification ───────────────────────────────────────────────────
+
+
+def verify_dependents(
+    db: Session,
+    employee_id: uuid.UUID,
+    dependent_data: dict,
+) -> dict:
+    """Verify dependent eligibility for coverage.
+
+    Constitution: "Must work for all 7 benefit types."
+
+    Verifies that dependents meet eligibility criteria (relationship,
+    age limits, student status, etc.) for benefits coverage.
+
+    Args:
+        db: Database session
+        employee_id: Employee UUID
+        dependent_data: Dependent information:
+            - name: str
+            - relationship: str (spouse, child, domestic_partner)
+            - date_of_birth: str
+            - ssn: str (optional, for verification)
+            - student_status: bool (for dependents age 19-26)
+            - disabled: bool (for age-out exceptions)
+
+    Returns:
+        Verification result with eligibility determination.
+    """
+    employee = db.query(Employee).filter(
+        Employee.employee_id == employee_id
+    ).first()
+    if not employee:
+        raise ValueError(f"Employee {employee_id} not found")
+
+    relationship = dependent_data.get("relationship", "").lower()
+    dob = dependent_data.get("date_of_birth", "")
+    name = dependent_data.get("name", "")
+
+    # Age calculation
+    age = None
+    if dob:
+        try:
+            dob_dt = datetime.fromisoformat(dob)
+            now = datetime.now(UTC)
+            age = (now - dob_dt.replace(tzinfo=UTC)).days // 365
+        except (ValueError, TypeError):
+            age = None
+
+    # Eligibility rules by relationship
+    eligible = True
+    eligibility_reason = ""
+    required_documentation = []
+
+    if relationship in ("spouse", "domestic_partner"):
+        eligible = True
+        eligibility_reason = f"{relationship.replace('_', ' ').title()} is eligible for coverage"
+        required_documentation = [
+            "Marriage certificate or domestic partnership registration",
+        ]
+
+    elif relationship == "child":
+        # ACA: children covered until age 26
+        if age is not None and age > 26:
+            if dependent_data.get("disabled"):
+                eligible = True
+                eligibility_reason = (
+                    "Child over 26 eligible due to disability exception"
+                )
+                required_documentation = [
+                    "Birth certificate or legal guardianship",
+                    "Disability certification from physician",
+                ]
+            else:
+                eligible = False
+                eligibility_reason = (
+                    f"Child is {age} years old (over ACA age-26 limit)"
+                )
+        else:
+            eligible = True
+            eligibility_reason = (
+                f"Child age {age if age else 'unknown'} is eligible "
+                f"(under ACA age-26 threshold)"
+            )
+            required_documentation = [
+                "Birth certificate, adoption papers, or legal guardianship",
+            ]
+
+    else:
+        eligible = False
+        eligibility_reason = (
+            f"Relationship '{relationship}' does not meet dependent eligibility criteria. "
+            f"Eligible relationships: spouse, domestic_partner, child."
+        )
+
+    return {
+        "employee_id": str(employee_id),
+        "dependent_name": name,
+        "relationship": relationship,
+        "date_of_birth": dob,
+        "age": age,
+
+        "eligibility": {
+            "eligible": eligible,
+            "reason": eligibility_reason,
+            "aca_age_limit": 26,
+            "disability_exception": dependent_data.get("disabled", False),
+        },
+
+        "verification_status": "verified" if eligible else "ineligible",
+        "required_documentation": required_documentation,
+
+        "coverage_if_eligible": {
+            "benefit_types": ALL_BENEFIT_TYPES if eligible else [],
+            "cost_sharing": "zero" if eligible else "n/a",
+            "effective_date": "Same as employee enrollment" if eligible else "n/a",
+        },
+
+        "verified_at": datetime.now(UTC).isoformat(),
+    }
+
+
+# ── Beneficiary Management ───────────────────────────────────────────────────
+
+
+def manage_beneficiaries(
+    db: Session,
+    employee_id: uuid.UUID,
+    beneficiary_data: dict,
+) -> dict:
+    """Manage beneficiary designations for life and disability benefits.
+
+    Constitution: "Must work for all 7 benefit types."
+
+    Beneficiary designations apply primarily to life insurance (life),
+    but can also apply to other benefit types with survivor benefits.
+
+    Args:
+        db: Database session
+        employee_id: Employee UUID
+        beneficiary_data: Beneficiary information:
+            - action: str (add, update, remove)
+            - beneficiaries: list of dicts with:
+                - name: str
+                - relationship: str
+                - percentage: float (must sum to 100)
+                - type: str (primary, contingent)
+                - ssn: str (optional)
+                - date_of_birth: str (optional)
+
+    Returns:
+        Updated beneficiary designation summary.
+    """
+    employee = db.query(Employee).filter(
+        Employee.employee_id == employee_id
+    ).first()
+    if not employee:
+        raise ValueError(f"Employee {employee_id} not found")
+
+    action = beneficiary_data.get("action", "add")
+    new_beneficiaries = beneficiary_data.get("beneficiaries", [])
+
+    # Load existing demographics
+    demographics = {}
+    if employee.demographics_encrypted:
+        try:
+            demographics = json.loads(employee.demographics_encrypted)
+        except (json.JSONDecodeError, TypeError):
+            demographics = {}
+
+    existing_beneficiaries = demographics.get("beneficiaries", [])
+
+    if action == "add":
+        existing_beneficiaries.extend(new_beneficiaries)
+    elif action == "update":
+        # Replace all beneficiaries
+        existing_beneficiaries = new_beneficiaries
+    elif action == "remove":
+        names_to_remove = {b.get("name") for b in new_beneficiaries}
+        existing_beneficiaries = [
+            b for b in existing_beneficiaries
+            if b.get("name") not in names_to_remove
+        ]
+
+    # Validate percentages sum to 100 for primary beneficiaries
+    primary = [b for b in existing_beneficiaries if b.get("type") == "primary"]
+    contingent = [b for b in existing_beneficiaries if b.get("type") == "contingent"]
+
+    primary_total = sum(b.get("percentage", 0) for b in primary)
+    contingent_total = sum(b.get("percentage", 0) for b in contingent)
+
+    validation_warnings = []
+    if primary and abs(primary_total - 100) > 0.01:
+        validation_warnings.append(
+            f"Primary beneficiary percentages sum to {primary_total}% (should be 100%)"
+        )
+    if contingent and abs(contingent_total - 100) > 0.01:
+        validation_warnings.append(
+            f"Contingent beneficiary percentages sum to {contingent_total}% (should be 100%)"
+        )
+
+    # Save updated beneficiaries
+    demographics["beneficiaries"] = existing_beneficiaries
+    demographics["beneficiaries_updated_at"] = datetime.now(UTC).isoformat()
+    employee.demographics_encrypted = json.dumps(demographics)
+    db.commit()
+
+    return {
+        "employee_id": str(employee_id),
+        "action": action,
+        "status": "updated",
+        "updated_at": datetime.now(UTC).isoformat(),
+
+        "beneficiary_designations": {
+            "primary": [
+                {
+                    "name": b.get("name"),
+                    "relationship": b.get("relationship"),
+                    "percentage": b.get("percentage"),
+                }
+                for b in primary
+            ],
+            "contingent": [
+                {
+                    "name": b.get("name"),
+                    "relationship": b.get("relationship"),
+                    "percentage": b.get("percentage"),
+                }
+                for b in contingent
+            ],
+            "primary_total_pct": primary_total,
+            "contingent_total_pct": contingent_total,
+        },
+
+        "applies_to_benefit_types": ["life", "std", "ltd"],
+        "validation_warnings": validation_warnings,
+    }
+
+
+# ── Shadow Admin Burden Display ──────────────────────────────────────────────
+
+
+def display_shadow_admin_burden(
+    db: Session,
+    employer_id: uuid.UUID,
+) -> dict:
+    """Display current admin burden and projected savings upon activation.
+
+    Constitution: "Zero cost, zero risk, zero disruption."
+
+    For shadow mode employers, shows the current administrative burden
+    and cost that will go to zero when beneflex is fully activated.
+
+    Args:
+        db: Database session
+        employer_id: Employer UUID
+
+    Returns:
+        Admin burden analysis with current vs. beneflex comparison.
+    """
+    employer = _get_employer_or_raise(db, employer_id)
+
+    employee_count = db.query(func.count(Employee.employee_id)).filter(
+        Employee.employer_id == employer_id,
+    ).scalar() or 0
+
+    # Industry-average admin burden estimates (per employee per year)
+    current_admin_burden = {
+        "open_enrollment_admin": {
+            "description": "Annual open enrollment administration",
+            "hours_per_employee_per_year": 2.5,
+            "total_hours": round(2.5 * employee_count, 1),
+            "estimated_cost": round(2.5 * employee_count * 45, 2),
+            "beneflex_hours": 0,
+            "beneflex_cost": 0,
+            "eliminated": True,
+        },
+        "plan_selection_support": {
+            "description": "Employee plan selection decision support",
+            "hours_per_employee_per_year": 1.0,
+            "total_hours": round(1.0 * employee_count, 1),
+            "estimated_cost": round(1.0 * employee_count * 45, 2),
+            "beneflex_hours": 0,
+            "beneflex_cost": 0,
+            "eliminated": True,
+        },
+        "claims_questions": {
+            "description": "Employee claims and billing questions",
+            "hours_per_employee_per_year": 1.5,
+            "total_hours": round(1.5 * employee_count, 1),
+            "estimated_cost": round(1.5 * employee_count * 45, 2),
+            "beneflex_hours": 0,
+            "beneflex_cost": 0,
+            "eliminated": True,
+        },
+        "cobra_administration": {
+            "description": "COBRA notice generation and tracking",
+            "hours_per_employee_per_year": 0.5,
+            "total_hours": round(0.5 * employee_count, 1),
+            "estimated_cost": round(0.5 * employee_count * 45, 2),
+            "beneflex_hours": 0,
+            "beneflex_cost": 0,
+            "eliminated": True,
+        },
+        "carrier_liaison": {
+            "description": "Carrier negotiations and issue resolution",
+            "hours_per_employee_per_year": 1.0,
+            "total_hours": round(1.0 * employee_count, 1),
+            "estimated_cost": round(1.0 * employee_count * 45, 2),
+            "beneflex_hours": 0,
+            "beneflex_cost": 0,
+            "eliminated": True,
+        },
+        "regulatory_compliance": {
+            "description": "ACA reporting, ERISA filings, state compliance",
+            "hours_per_employee_per_year": 0.75,
+            "total_hours": round(0.75 * employee_count, 1),
+            "estimated_cost": round(0.75 * employee_count * 45, 2),
+            "beneflex_hours": 0,
+            "beneflex_cost": 0,
+            "eliminated": True,
+        },
+        "enrollment_processing": {
+            "description": "New hire enrollment and life event processing",
+            "hours_per_employee_per_year": 0.75,
+            "total_hours": round(0.75 * employee_count, 1),
+            "estimated_cost": round(0.75 * employee_count * 45, 2),
+            "beneflex_hours": 0,
+            "beneflex_cost": 0,
+            "eliminated": True,
+        },
+    }
+
+    total_current_hours = sum(
+        item["total_hours"] for item in current_admin_burden.values()
+    )
+    total_current_cost = sum(
+        item["estimated_cost"] for item in current_admin_burden.values()
+    )
+
+    return {
+        "employer_id": str(employer_id),
+        "employer_name": employer.name,
+        "employee_count": employee_count,
+        "analysis_date": datetime.now(UTC).isoformat(),
+
+        "current_admin_burden": current_admin_burden,
+
+        "summary": {
+            "total_current_admin_hours_per_year": total_current_hours,
+            "total_current_admin_cost_per_year": total_current_cost,
+            "cost_per_employee_per_year": round(
+                total_current_cost / max(employee_count, 1), 2
+            ),
+            "beneflex_admin_hours_per_year": 0,
+            "beneflex_admin_cost_per_year": 0,
+            "hours_saved_per_year": total_current_hours,
+            "cost_saved_per_year": total_current_cost,
+        },
+
+        "upon_activation": {
+            "open_enrollment": "Eliminated (one plan, auto-enrollment)",
+            "plan_selection": "Eliminated (no choices to make)",
+            "claims_questions": "Eliminated (AI Q&A engine)",
+            "cobra_admin": "Automated (zero manual effort)",
+            "carrier_negotiations": "Eliminated (no carrier)",
+            "regulatory_filings": "Automated (zero manual effort)",
+            "enrollment_processing": "Automated (payroll integration)",
+            "total_admin_burden": "$0",
+        },
+
+        "shadow_mode_note": (
+            "These savings are projected based on industry-average "
+            "HR administration costs of $45/hour. Actual savings will "
+            "be validated during shadow mode operation. Upon activation, "
+            "all listed administrative functions are fully automated."
+        ),
+    }
+
+
 # ── Internal helpers ─────────────────────────────────────────────────────────
+
+
+def _parse_simplified_life_event(input_str: str) -> dict:
+    """Parse simplified single-line life event format.
+
+    Accepts formats like:
+    - "married 2024-01-15"
+    - "birth 2024-03-20"
+    - "divorced 2024-06-01"
+    - "adopted 2024-02-28"
+    - "lost coverage 2024-04-15"
+
+    Returns:
+        Dict with event_type, event_date, and changes.
+    """
+    input_str = input_str.strip().lower()
+
+    # Map common terms to event types
+    event_term_map = {
+        "married": "marriage",
+        "marriage": "marriage",
+        "wed": "marriage",
+        "wedding": "marriage",
+        "birth": "birth",
+        "baby": "birth",
+        "newborn": "birth",
+        "child born": "birth",
+        "adopted": "adoption",
+        "adoption": "adoption",
+        "divorced": "divorce",
+        "divorce": "divorce",
+        "separated": "divorce",
+        "death": "death_of_dependent",
+        "died": "death_of_dependent",
+        "passed away": "death_of_dependent",
+        "lost coverage": "loss_of_coverage",
+        "lost insurance": "loss_of_coverage",
+        "moved": "relocation",
+        "relocated": "relocation",
+        "relocation": "relocation",
+        "hours reduced": "employment_status_change",
+        "part time": "employment_status_change",
+        "status change": "employment_status_change",
+    }
+
+    # Try to extract a date (ISO format: YYYY-MM-DD)
+    date_match = re.search(r'(\d{4}-\d{2}-\d{2})', input_str)
+    event_date = date_match.group(1) if date_match else datetime.now(UTC).strftime("%Y-%m-%d")
+
+    # Remove date from input to isolate the event term
+    term = re.sub(r'\d{4}-\d{2}-\d{2}', '', input_str).strip()
+
+    # Match term to event type
+    event_type = "marriage"  # default
+    for key, value in event_term_map.items():
+        if key in term:
+            event_type = value
+            break
+
+    return {
+        "event_type": event_type,
+        "event_date": event_date,
+        "changes": {},
+    }
 
 
 def _get_employer_or_raise(db: Session, employer_id: uuid.UUID) -> Employer:

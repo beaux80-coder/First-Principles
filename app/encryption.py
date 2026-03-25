@@ -42,6 +42,40 @@ def decrypt_value(ciphertext: str) -> str:
     return f.decrypt(ciphertext.encode()).decode()
 
 
+import os
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+
+class AES256GCMEncryptor:
+    """AES-256-GCM encryption — HIPAA best-practice standard.
+
+    Provides authenticated encryption with 12-byte nonce. The nonce is
+    prepended to the ciphertext and stripped on decryption.
+    """
+
+    def __init__(self, key: str):
+        derived = hashlib.sha256(key.encode()).digest()  # 32 bytes = AES-256
+        self._gcm = AESGCM(derived)
+
+    def encrypt(self, plaintext: str) -> str:
+        nonce = os.urandom(12)
+        ct = self._gcm.encrypt(nonce, plaintext.encode(), None)
+        return base64.urlsafe_b64encode(nonce + ct).decode()
+
+    def decrypt(self, ciphertext: str) -> str:
+        data = base64.urlsafe_b64decode(ciphertext.encode())
+        nonce, ct = data[:12], data[12:]
+        return self._gcm.decrypt(nonce, ct, None).decode()
+
+
+def get_aes256_encryptor() -> AES256GCMEncryptor:
+    """Return an AES-256-GCM encryptor initialized from the app encryption key."""
+    key = settings.encryption_key
+    if not key:
+        raise RuntimeError("ENCRYPTION_KEY is not set")
+    return AES256GCMEncryptor(key)
+
+
 class EncryptedString(TypeDecorator):
     """Column type that transparently encrypts on write and decrypts on read.
 

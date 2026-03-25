@@ -723,3 +723,128 @@ def _evaluate_dpc_channel(
         "dpc_provider": dpc_provider,
         "feeding_f8": True,
     }
+
+
+def document_payment_speed_capabilities(db: Session) -> dict:
+    """Document actual payment speed from measured data.
+
+    Constitution F2: "Selects and pays the lowest verified price."
+    Payment speed is a competitive advantage — providers accept lower prices
+    for immediate guaranteed payment vs. 90-day float with collection risk.
+
+    This function queries the Payment table for charge_verified_at to
+    payment_initiated_at deltas to document actual payment speed.
+    """
+    from app.services.payment import Payment
+
+    total_payments = db.query(func.count(Payment.payment_id)).scalar() or 0
+
+    if total_payments == 0:
+        return {
+            "total_payments": 0,
+            "message": "No payments recorded yet. Payment speed will be documented after first payment.",
+            "target_speed": {
+                "goal": "Same-day payment initiation after charge verification",
+                "rationale": (
+                    "Providers accept 10-15% lower prices for immediate guaranteed payment "
+                    "vs. 90-day float with 15-20% collection risk. Same-day payment unlocks "
+                    "the payment-speed discount channel in F2 price discovery."
+                ),
+            },
+        }
+
+    # Calculate payment speed: charge_verified_at -> payment_initiated_at
+    from sqlalchemy import text
+
+    speed_stats = db.execute(text(
+        "SELECT "
+        "  AVG(JULIANDAY(payment_initiated_at) - JULIANDAY(charge_verified_at)) * 24 * 60 as avg_minutes, "
+        "  MIN(JULIANDAY(payment_initiated_at) - JULIANDAY(charge_verified_at)) * 24 * 60 as min_minutes, "
+        "  MAX(JULIANDAY(payment_initiated_at) - JULIANDAY(charge_verified_at)) * 24 * 60 as max_minutes, "
+        "  COUNT(*) as total "
+        "FROM payment "
+        "WHERE payment_initiated_at IS NOT NULL AND charge_verified_at IS NOT NULL"
+    )).fetchone()
+
+    avg_minutes = float(speed_stats[0]) if speed_stats and speed_stats[0] else None
+    min_minutes = float(speed_stats[1]) if speed_stats and speed_stats[1] else None
+    max_minutes = float(speed_stats[2]) if speed_stats and speed_stats[2] else None
+    measured_count = int(speed_stats[3]) if speed_stats and speed_stats[3] else 0
+
+    # Calculate percentile distribution
+    percentile_data = {}
+    if measured_count > 0:
+        try:
+            all_deltas = db.execute(text(
+                "SELECT (JULIANDAY(payment_initiated_at) - JULIANDAY(charge_verified_at)) * 24 * 60 as delta_min "
+                "FROM payment "
+                "WHERE payment_initiated_at IS NOT NULL AND charge_verified_at IS NOT NULL "
+                "ORDER BY delta_min"
+            )).fetchall()
+            deltas = [float(row[0]) for row in all_deltas]
+            if deltas:
+                n = len(deltas)
+                percentile_data = {
+                    "p50_minutes": round(deltas[n // 2], 2),
+                    "p90_minutes": round(deltas[int(n * 0.9)], 2) if n > 1 else round(deltas[0], 2),
+                    "p95_minutes": round(deltas[int(n * 0.95)], 2) if n > 1 else round(deltas[0], 2),
+                    "p99_minutes": round(deltas[int(n * 0.99)], 2) if n > 1 else round(deltas[0], 2),
+                }
+        except Exception:
+            pass
+
+    # Classify payment speed
+    speed_category = "unknown"
+    if avg_minutes is not None:
+        if avg_minutes < 5:
+            speed_category = "instant"
+        elif avg_minutes < 60:
+            speed_category = "same_hour"
+        elif avg_minutes < 1440:
+            speed_category = "same_day"
+        elif avg_minutes < 4320:
+            speed_category = "within_3_days"
+        else:
+            speed_category = "standard"
+
+    # Calculate discount potential based on speed
+    discount_estimate = None
+    if speed_category in ("instant", "same_hour", "same_day"):
+        discount_estimate = {
+            "estimated_discount_pct": 12.0,
+            "rationale": (
+                "Same-day payment eliminates provider's collection risk (15-20% of revenue "
+                "at typical practices) and float cost (90-day average payment cycle). "
+                "Providers accept 10-15% lower rates for immediate guaranteed payment."
+            ),
+        }
+    elif speed_category == "within_3_days":
+        discount_estimate = {
+            "estimated_discount_pct": 8.0,
+            "rationale": "3-day payment significantly reduces float but not as impactful as same-day.",
+        }
+
+    return {
+        "total_payments": total_payments,
+        "measured_payments": measured_count,
+        "payment_speed": {
+            "average_minutes": round(avg_minutes, 2) if avg_minutes is not None else None,
+            "fastest_minutes": round(min_minutes, 2) if min_minutes is not None else None,
+            "slowest_minutes": round(max_minutes, 2) if max_minutes is not None else None,
+            "percentiles": percentile_data,
+            "category": speed_category,
+        },
+        "comparison_to_industry": {
+            "traditional_insurance_days": 90,
+            "traditional_insurance_minutes": 90 * 24 * 60,
+            "beneflex_avg_minutes": round(avg_minutes, 2) if avg_minutes is not None else None,
+            "speedup_factor": round(90 * 24 * 60 / avg_minutes, 0) if avg_minutes and avg_minutes > 0 else None,
+        },
+        "discount_potential": discount_estimate,
+        "feeds_f2": True,
+        "f2_integration": (
+            "Payment speed data feeds the payment_speed_discount channel in F2 "
+            "price discovery. Faster payment = larger discount negotiable with providers."
+        ),
+        "measured_at": datetime.now(UTC).isoformat(),
+    }

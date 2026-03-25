@@ -274,6 +274,9 @@ def _clinical_filtering(
                 "data_source": "gray_area_best_available",
             })
 
+    # Consume F8 cross-type quality signals
+    approved = _consume_f8_quality_signals(db, benefit_type, approved)
+
     return {
         "providers_evaluated": evaluated,
         "providers_approved": len(approved),
@@ -490,3 +493,55 @@ def _wilson_upper_bound(p: float, n: int, z: float = 1.96) -> float:
 def _wilson_confidence_width(p: float, n: int, z: float = 1.96) -> float:
     """Width of Wilson confidence interval."""
     return _wilson_upper_bound(p, n, z) - _wilson_lower_bound(p, n, z)
+
+
+def _consume_f8_quality_signals(db: Session, benefit_type: str, approved_providers: list[dict]) -> list[dict]:
+    """Consume F8 cross-type quality signals to refine provider scoring.
+
+    Constitution F8: "Is the pipeline actively detecting cross-benefit-type
+    patterns and feeding actionable intelligence to Functions 1, 3, 4, and 9?"
+    """
+    try:
+        from app.models.data_pipeline_metric import DataPipelineMetric
+
+        # Query F4-targeted quality signals
+        signals = db.query(DataPipelineMetric).filter(
+            DataPipelineMetric.metric_type.like("cross_type_signal:%"),
+            DataPipelineMetric.details.isnot(None),
+        ).order_by(DataPipelineMetric.measured_at.desc()).limit(50).all()
+
+        f4_signals = []
+        for s in signals:
+            details = s.details or {}
+            if details.get("target_function") == "F4":
+                f4_signals.append(details)
+
+        if not f4_signals:
+            return approved_providers
+
+        # Apply quality adjustments from cross-type signals
+        for provider in approved_providers:
+            quality_bonus = 0.0
+            for signal in f4_signals:
+                signal_type = signal.get("signal_type", "")
+                # Quality indicator signals suggest provider quality patterns
+                if "quality" in signal_type:
+                    # Boost providers with high quality scores when quality signals present
+                    if provider.get("quality_score", 0) >= 80:
+                        quality_bonus += 0.02
+                # Care coordination signals suggest multi-type care patterns
+                if "care_coordination" in signal_type:
+                    # Boost providers handling multiple benefit types effectively
+                    quality_bonus += 0.01
+
+            if quality_bonus > 0:
+                current_lb = provider.get("confidence_lower_bound", 0)
+                provider["confidence_lower_bound"] = round(min(current_lb + quality_bonus, 1.0), 4)
+                provider["f8_quality_adjustment"] = round(quality_bonus, 4)
+
+        # Re-sort by adjusted confidence
+        approved_providers.sort(key=lambda p: p.get("confidence_lower_bound", 0), reverse=True)
+        return approved_providers
+    except Exception as e:
+        logger.warning(f"F8 quality signal consumption failed: {e}")
+        return approved_providers

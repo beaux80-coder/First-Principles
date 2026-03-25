@@ -50,14 +50,16 @@ def run_in_enclave(
     if not _is_nitro_available():
         logger.debug("Nitro not available — falling back to subprocess isolation")
         from app.tee.subprocess_runner import run_in_isolation
-        return run_in_isolation(
-            claim_id=claim_id,
-            service_code=service_code,
-            benefit_type=benefit_type,
-            patient_symptoms=patient_symptoms,
-            patient_history=patient_history,
-            condition=condition,
-        )
+        request = {
+            "action": "determine",
+            "claim_id": claim_id,
+            "service_code": service_code,
+            "benefit_type": benefit_type,
+            "patient_symptoms": patient_symptoms,
+            "patient_history": patient_history,
+            "condition": condition,
+        }
+        return run_in_isolation(request)
 
     request = json.dumps({
         "action": "determine",
