@@ -2713,6 +2713,304 @@ def download_nppes_providers(db: Session) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Additional data source downloaders (Phase 5)
+# ---------------------------------------------------------------------------
+
+def download_va_community_care_rates() -> dict:
+    """Download VA Community Care rate schedules.
+
+    The VA publishes Community Care rate schedules that establish maximum
+    payment rates for services provided by community (non-VA) providers.
+    These rates are often based on Medicare rates with locality adjustments
+    and serve as a reference-based pricing benchmark.
+
+    Source: https://www.va.gov/communitycare/revenue_ops/fee_schedule.asp
+    """
+    logger.info("Downloading VA Community Care rate schedules...")
+
+    VA_FEE_URLS = [
+        "https://www.va.gov/communitycare/docs/pubfiles/ccn_fee_schedule.csv",
+        "https://www.va.gov/communitycare/revenue_ops/fee_schedule.asp",
+    ]
+
+    rates = []
+    source_url = ""
+    try:
+        for url in VA_FEE_URLS:
+            try:
+                resp = httpx.get(url, timeout=DOWNLOAD_TIMEOUT, follow_redirects=True)
+                if resp.status_code == 200 and len(resp.content) > 100:
+                    source_url = url
+                    # Parse CSV if content looks like CSV
+                    if resp.headers.get("content-type", "").startswith("text/csv") or "," in resp.text[:200]:
+                        reader = csv.DictReader(io.StringIO(resp.text))
+                        for row in reader:
+                            code = row.get("HCPCS", row.get("CPT", row.get("Code", ""))).strip()
+                            rate_str = row.get("Rate", row.get("Fee", row.get("Amount", ""))).strip()
+                            if code and rate_str:
+                                try:
+                                    rates.append({
+                                        "service_code": code,
+                                        "rate": float(rate_str.replace("$", "").replace(",", "")),
+                                        "locality": row.get("Locality", row.get("State", "National")),
+                                    })
+                                except ValueError:
+                                    continue
+                    break
+            except (httpx.HTTPError, httpx.TimeoutException) as e:
+                logger.warning(f"VA Community Care download failed from {url}: {e}")
+                continue
+
+    except Exception as e:
+        logger.error(f"VA Community Care rate download error: {e}")
+
+    return {
+        "source": "VA Community Care Rate Schedule",
+        "source_url": source_url,
+        "rates_downloaded": len(rates),
+        "sample_rates": rates[:10],
+        "description": (
+            "VA Community Care rates establish maximum payment amounts for "
+            "non-VA providers. Typically based on Medicare rates with locality "
+            "adjustments. Useful as a reference-based pricing benchmark."
+        ),
+        "downloaded_at": datetime.now(UTC).isoformat(),
+    }
+
+
+def download_medicaid_fees(state: str) -> dict:
+    """Download state Medicaid fee schedules.
+
+    Each state publishes Medicaid fee schedules that establish payment rates
+    for Medicaid-covered services. These rates serve as a lower-bound
+    pricing reference in the price discovery engine.
+
+    Parameters
+    ----------
+    state : str
+        Two-letter state abbreviation (e.g., "CA", "TX", "NY").
+    """
+    logger.info(f"Downloading Medicaid fee schedule for {state}...")
+
+    # State Medicaid fee schedule URLs (publicly accessible)
+    STATE_MEDICAID_URLS = {
+        "CA": "https://files.medi-cal.ca.gov/pubsdoco/rates/",
+        "TX": "https://www.tmhp.com/sites/default/files/fee-schedules/",
+        "NY": "https://www.emedny.org/ProviderManuals/AllProviders/PDFS/",
+        "FL": "https://ahca.myflorida.com/medicaid/fee-schedules/",
+        "PA": "https://www.dhs.pa.gov/providers/Providers/Pages/Fee-Schedule-Information.aspx",
+        "OH": "https://medicaid.ohio.gov/resources-for-providers/billing/fee-schedule-and-rates",
+        "IL": "https://www.illinois.gov/hfs/MedicalProviders/MedicaidReimbursement/Pages/default.aspx",
+        "GA": "https://dch.georgia.gov/providers/fee-schedules",
+        "NC": "https://medicaid.ncdhhs.gov/providers/fee-schedules",
+        "MI": "https://www.michigan.gov/mdhhs/keep-mi-healthy/medicaid/provider-fee-schedule",
+    }
+
+    state_upper = state.upper()
+    base_url = STATE_MEDICAID_URLS.get(state_upper, "")
+
+    rates = []
+    try:
+        if base_url:
+            resp = httpx.get(base_url, timeout=DOWNLOAD_TIMEOUT, follow_redirects=True)
+            if resp.status_code == 200:
+                # Parse if CSV content
+                content_type = resp.headers.get("content-type", "")
+                if "csv" in content_type or resp.text.strip().startswith('"') or "," in resp.text[:200]:
+                    reader = csv.DictReader(io.StringIO(resp.text))
+                    for row in reader:
+                        code = (row.get("Code", row.get("HCPCS", row.get("CPT", "")))).strip()
+                        rate_str = (row.get("Rate", row.get("Fee", row.get("Amount", "")))).strip()
+                        if code and rate_str:
+                            try:
+                                rates.append({
+                                    "service_code": code,
+                                    "rate": float(rate_str.replace("$", "").replace(",", "")),
+                                    "state": state_upper,
+                                })
+                            except ValueError:
+                                continue
+    except (httpx.HTTPError, httpx.TimeoutException) as e:
+        logger.warning(f"Medicaid fee schedule download failed for {state}: {e}")
+    except Exception as e:
+        logger.error(f"Medicaid fee schedule error for {state}: {e}")
+
+    return {
+        "source": f"Medicaid Fee Schedule ({state_upper})",
+        "source_url": base_url,
+        "state": state_upper,
+        "rates_downloaded": len(rates),
+        "sample_rates": rates[:10],
+        "description": (
+            f"State Medicaid fee schedule for {state_upper}. Establishes payment rates "
+            f"for Medicaid-covered services. Serves as lower-bound pricing reference."
+        ),
+        "downloaded_at": datetime.now(UTC).isoformat(),
+    }
+
+
+def download_dmepos_rates() -> dict:
+    """Download Durable Medical Equipment (DMEPOS) rates from CMS.
+
+    The DMEPOS fee schedule establishes payment amounts for durable medical
+    equipment, prosthetics, orthotics, and supplies. Published by CMS and
+    updated periodically.
+
+    Source: https://www.cms.gov/medicare/payment/fee-schedules/dmepos
+    """
+    logger.info("Downloading DMEPOS fee schedule from CMS...")
+
+    DMEPOS_URLS = [
+        "https://www.cms.gov/files/zip/dmepos-fee-schedule-2025.zip",
+        "https://www.cms.gov/Medicare/Medicare-Fee-for-Service-Payment/DMEPOSFeeSched/DMEPOS-Fee-Schedule",
+    ]
+
+    rates = []
+    source_url = ""
+    try:
+        for url in DMEPOS_URLS:
+            try:
+                resp = httpx.get(url, timeout=DOWNLOAD_TIMEOUT, follow_redirects=True)
+                if resp.status_code != 200:
+                    continue
+                source_url = url
+
+                content_type = resp.headers.get("content-type", "")
+                if "zip" in content_type or url.endswith(".zip"):
+                    # Handle ZIP file containing CSV
+                    try:
+                        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                            csv_names = [n for n in zf.namelist() if n.endswith(".csv")]
+                            if csv_names:
+                                with zf.open(csv_names[0]) as csv_file:
+                                    reader = csv.DictReader(io.TextIOWrapper(csv_file, encoding="utf-8"))
+                                    for row in reader:
+                                        code = (row.get("HCPCS", row.get("Code", ""))).strip()
+                                        fee_str = (row.get("Fee", row.get("Rate", row.get("Amount", "")))).strip()
+                                        if code and fee_str:
+                                            try:
+                                                rates.append({
+                                                    "service_code": code,
+                                                    "rate": float(fee_str.replace("$", "").replace(",", "")),
+                                                    "category": row.get("Category", "DMEPOS"),
+                                                })
+                                            except ValueError:
+                                                continue
+                    except zipfile.BadZipFile:
+                        logger.warning(f"Invalid ZIP file from {url}")
+                        continue
+                elif "csv" in content_type:
+                    reader = csv.DictReader(io.StringIO(resp.text))
+                    for row in reader:
+                        code = (row.get("HCPCS", row.get("Code", ""))).strip()
+                        fee_str = (row.get("Fee", row.get("Rate", ""))).strip()
+                        if code and fee_str:
+                            try:
+                                rates.append({
+                                    "service_code": code,
+                                    "rate": float(fee_str.replace("$", "").replace(",", "")),
+                                    "category": row.get("Category", "DMEPOS"),
+                                })
+                            except ValueError:
+                                continue
+
+                if rates:
+                    break
+            except (httpx.HTTPError, httpx.TimeoutException) as e:
+                logger.warning(f"DMEPOS download failed from {url}: {e}")
+                continue
+
+    except Exception as e:
+        logger.error(f"DMEPOS fee schedule download error: {e}")
+
+    return {
+        "source": "CMS DMEPOS Fee Schedule",
+        "source_url": source_url,
+        "rates_downloaded": len(rates),
+        "sample_rates": rates[:10],
+        "description": (
+            "CMS Durable Medical Equipment, Prosthetics, Orthotics, and Supplies "
+            "(DMEPOS) fee schedule. Establishes Medicare payment amounts for DME items."
+        ),
+        "downloaded_at": datetime.now(UTC).isoformat(),
+    }
+
+
+def download_asp_drug_pricing() -> dict:
+    """Download Average Sales Price (ASP) drug pricing from CMS.
+
+    ASP is the average price paid to manufacturers for drugs covered under
+    Medicare Part B. Published quarterly by CMS. Used as a pricing reference
+    for physician-administered drugs (typically injectables and infusions).
+
+    Source: https://www.cms.gov/medicare/payment/part-b-drugs/average-sales-price
+    """
+    logger.info("Downloading ASP drug pricing from CMS...")
+
+    ASP_URLS = [
+        "https://www.cms.gov/files/zip/asp-pricing-file-2025-q1.zip",
+        "https://www.cms.gov/medicare/payment/part-b-drugs/average-sales-price/asp-pricing-files",
+    ]
+
+    drugs = []
+    source_url = ""
+    try:
+        for url in ASP_URLS:
+            try:
+                resp = httpx.get(url, timeout=DOWNLOAD_TIMEOUT, follow_redirects=True)
+                if resp.status_code != 200:
+                    continue
+                source_url = url
+
+                content_type = resp.headers.get("content-type", "")
+                if "zip" in content_type or url.endswith(".zip"):
+                    try:
+                        with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                            csv_names = [n for n in zf.namelist() if n.endswith(".csv") or n.endswith(".txt")]
+                            if csv_names:
+                                with zf.open(csv_names[0]) as csv_file:
+                                    reader = csv.DictReader(io.TextIOWrapper(csv_file, encoding="utf-8"))
+                                    for row in reader:
+                                        hcpcs = (row.get("HCPCS Code", row.get("HCPCS", ""))).strip()
+                                        asp_str = (row.get("ASP", row.get("Payment Limit", row.get("Rate", "")))).strip()
+                                        drug_name = (row.get("Short Description", row.get("Drug Name", ""))).strip()
+                                        if hcpcs and asp_str:
+                                            try:
+                                                drugs.append({
+                                                    "hcpcs_code": hcpcs,
+                                                    "drug_name": drug_name,
+                                                    "asp_payment_limit": float(asp_str.replace("$", "").replace(",", "")),
+                                                })
+                                            except ValueError:
+                                                continue
+                    except zipfile.BadZipFile:
+                        logger.warning(f"Invalid ZIP file from {url}")
+                        continue
+
+                if drugs:
+                    break
+            except (httpx.HTTPError, httpx.TimeoutException) as e:
+                logger.warning(f"ASP download failed from {url}: {e}")
+                continue
+
+    except Exception as e:
+        logger.error(f"ASP drug pricing download error: {e}")
+
+    return {
+        "source": "CMS Average Sales Price (ASP) Drug Pricing",
+        "source_url": source_url,
+        "drugs_downloaded": len(drugs),
+        "sample_drugs": drugs[:10],
+        "description": (
+            "CMS Average Sales Price (ASP) quarterly file. Establishes Medicare Part B "
+            "drug payment limits at ASP + 6%. Used for physician-administered drugs "
+            "(injectables, infusions). Key reference for pharmacy price discovery."
+        ),
+        "downloaded_at": datetime.now(UTC).isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Run all downloaders
 # ---------------------------------------------------------------------------
 

@@ -397,6 +397,88 @@ def _validate_coding(db: Session, claim: Claim) -> dict:
                 ),
             })
 
+    # ---- F5 Coding Rules Integration ----
+    from app.services import coding_rules
+
+    # ICD-10 validation: check any diagnosis codes on the claim
+    icd_codes = []
+    if hasattr(claim, "coding_validation") and claim.coding_validation:
+        icd_codes = claim.coding_validation.get("icd_codes", []) if isinstance(claim.coding_validation, dict) else []
+    # Also check if the service has an associated ICD code pattern
+    if service_code and service_code[:1].isalpha() and len(service_code) >= 3:
+        # Check if service_code itself looks like an ICD-10 code
+        icd_result = coding_rules.validate_icd10_code(service_code)
+        if icd_result["valid"]:
+            icd_codes.append(service_code)
+
+    for icd_code in icd_codes:
+        icd_validation = coding_rules.validate_icd10_code(icd_code)
+        if not icd_validation["valid"]:
+            for fmt_err in icd_validation["format_errors"]:
+                errors.append({
+                    "type": "icd10_format_error",
+                    "message": fmt_err,
+                    "code": icd_code,
+                })
+
+    # Modifier validation
+    claim_modifiers = []
+    if hasattr(claim, "coding_validation") and isinstance(claim.coding_validation, dict):
+        claim_modifiers = claim.coding_validation.get("modifiers", [])
+    if service_code and claim_modifiers:
+        mod_result = coding_rules.validate_modifiers(service_code, claim_modifiers)
+        if not mod_result["valid"]:
+            for mod_err in mod_result["errors"]:
+                errors.append({
+                    "type": "modifier_error",
+                    "message": mod_err,
+                })
+        for mod_warn in mod_result.get("warnings", []):
+            warnings.append({
+                "type": "modifier_warning",
+                "message": mod_warn,
+            })
+
+    # Frequency limit check
+    if service_code:
+        freq_result = coding_rules.check_frequency_limit(
+            db=db,
+            employee_id=claim.employee_id,
+            cpt_code=service_code,
+            benefit_type=claim.benefit_type.value,
+        )
+        if not freq_result["within_limit"]:
+            errors.append({
+                "type": "frequency_limit_exceeded",
+                "message": freq_result.get("message", f"Frequency limit exceeded for {service_code}"),
+                "max_allowed": freq_result["max_allowed"],
+                "current_count": freq_result["current_count"],
+                "period": freq_result["period"],
+            })
+
+    # Benefit-type-specific rules
+    if service_code:
+        type_result = coding_rules.apply_benefit_type_rules(
+            benefit_type=claim.benefit_type.value,
+            service_code=service_code,
+            modifiers=claim_modifiers,
+        )
+        if not type_result["valid"]:
+            errors.append({
+                "type": "benefit_type_rule_violation",
+                "message": f"Benefit type rule violation for {claim.benefit_type.value}",
+            })
+        for adj in type_result.get("adjustments", []):
+            warnings.append({
+                "type": f"benefit_type_{adj['type']}",
+                "message": adj["message"],
+            })
+        for tw in type_result.get("warnings", []):
+            warnings.append({
+                "type": "benefit_type_warning",
+                "message": tw,
+            })
+
     # Amount validation
     if claim.amount_billed <= 0:
         errors.append({
@@ -432,38 +514,65 @@ def _run_clinical_determination(db: Session, claim: Claim) -> dict:
                 "source": "pre_existing",
             }
 
-    # In production, this calls the F1 clinical engine (TEE-isolated).
-    # For now, auto-approve claims that don't require clinical review.
-    # Benefit types like dental cleanings, vision exams, etc. are
-    # pre-approved per clinical guidelines.
-    auto_approve_types = {
-        BenefitType.dental,
-        BenefitType.vision,
-    }
+    # Call F1 clinical engine for actual determination
+    try:
+        from app.services.clinical_engine import make_determination
+        from app.models.employee import Employee
+        import json
 
-    if claim.benefit_type in auto_approve_types:
-        return {
-            "decision": "approved",
-            "reasoning": (
-                f"Benefit type {claim.benefit_type.value} is pre-approved "
-                f"per standard clinical guidelines."
-            ),
-            "guidelines": ["ADA preventive care guidelines", "AOA vision care standards"],
-            "source": "auto_approve_rule",
+        # Get employee data for clinical inputs
+        employee = db.query(Employee).filter(Employee.employee_id == claim.employee_id).first()
+        demographics = {}
+        if employee and employee.demographics_encrypted:
+            try:
+                demographics = json.loads(employee.demographics_encrypted)
+            except (json.JSONDecodeError, TypeError):
+                demographics = {}
+
+        # Get service code
+        service_code = ""
+        if claim.service_id:
+            from app.models.service import Service
+            service = db.query(Service).filter(Service.service_id == claim.service_id).first()
+            if service:
+                service_code = service.code or ""
+
+        patient_symptoms = demographics.get("symptoms", [])
+        patient_history = {
+            "age": demographics.get("age"),
+            "sex": demographics.get("sex"),
+            "diagnoses": demographics.get("diagnoses", []),
+            "medications": demographics.get("medications", []),
+            "risk_factors": demographics.get("risk_factors", []),
         }
 
-    # For health, mental_health, life, STD, LTD — request F1 determination
-    # In production, this would be a call to the clinical engine service
-    return {
-        "decision": "approved",
-        "reasoning": (
-            f"F1 clinical determination pending full integration. "
-            f"Claim auto-approved under current processing rules. "
-            f"Benefit type: {claim.benefit_type.value}."
-        ),
-        "guidelines": [],
-        "source": "pending_f1_integration",
-    }
+        det = make_determination(
+            db=db,
+            claim_id=str(claim.claim_id),
+            service_code=service_code,
+            benefit_type=claim.benefit_type.value,
+            patient_symptoms=patient_symptoms if patient_symptoms else ["general_evaluation"],
+            patient_history=patient_history,
+        )
+
+        claim.clinical_determination_id = det.determination_id
+
+        return {
+            "determination_id": str(det.determination_id),
+            "decision": det.decision.value if hasattr(det.decision, 'value') else str(det.decision),
+            "reasoning": det.reasoning,
+            "guidelines": det.guidelines_referenced or [],
+            "source": "f1_clinical_engine",
+        }
+    except Exception as e:
+        logger.warning(f"F1 clinical determination failed, using fallback: {e}")
+        # Fallback: auto-approve with documented reason
+        return {
+            "decision": "approved",
+            "reasoning": f"F1 clinical engine unavailable ({e}). Auto-approved under failsafe.",
+            "guidelines": [],
+            "source": "failsafe_auto_approve",
+        }
 
 
 def _run_price_verification(db: Session, claim: Claim) -> dict:
@@ -486,14 +595,46 @@ def _run_price_verification(db: Session, claim: Claim) -> dict:
                 "source": "pre_existing",
             }
 
-    # In production, calls the F2 price discovery engine.
-    # Returns the billed amount as the verified price for now.
-    return {
-        "lowest_price": float(claim.amount_billed),
-        "lowest_channel": "billed_amount",
-        "channels_compared": [],
-        "source": "pending_f2_integration",
-    }
+    # Call F2 price discovery for actual price comparison
+    try:
+        from app.services.price_discovery import compare_all_channels
+
+        # Get service code and state
+        service_code = ""
+        if claim.service_id:
+            from app.models.service import Service
+            service = db.query(Service).filter(Service.service_id == claim.service_id).first()
+            if service:
+                service_code = service.code or ""
+
+        state = None
+        if claim.provider_id:
+            from app.models.provider import Provider
+            provider = db.query(Provider).filter(Provider.provider_id == claim.provider_id).first()
+            if provider:
+                state = provider.state
+
+        price_result = compare_all_channels(
+            db=db,
+            service_code=service_code,
+            benefit_type=claim.benefit_type.value,
+            state=state,
+        )
+
+        return {
+            "lowest_price": price_result.get("lowest_price", float(claim.amount_billed)),
+            "lowest_channel": price_result.get("lowest_channel", "billed_amount"),
+            "channels_compared": price_result.get("channels_compared", []),
+            "source": "f2_price_discovery",
+        }
+    except Exception as e:
+        logger.warning(f"F2 price discovery failed, using billed amount: {e}")
+        return {
+            "lowest_price": float(claim.amount_billed),
+            "lowest_channel": "billed_amount",
+            "channels_compared": [],
+            "source": "failsafe_billed_amount",
+        }
 
 
 def _check_human_review_required(claim: Claim) -> bool:

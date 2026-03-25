@@ -8,7 +8,37 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError, jwt
 import httpx
 
+import asyncio
+from functools import wraps
+from enum import Enum
+
 from app.config import settings
+
+
+class RoleType(str, Enum):
+    admin = "admin"
+    employer_admin = "employer_admin"
+    employee = "employee"
+    broker = "broker"
+    provider = "provider"
+    auditor = "auditor"
+    system_service = "system_service"
+
+
+def require_role(*allowed_roles: str):
+    """Decorator to enforce RBAC on endpoints. Use with Depends(get_current_user)."""
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            user = kwargs.get("current_user") or kwargs.get("user")
+            if user is None:
+                raise HTTPException(status_code=401, detail="Authentication required")
+            user_roles = user.get("roles", [])
+            if not any(role in allowed_roles for role in user_roles):
+                raise HTTPException(status_code=403, detail=f"Requires one of: {allowed_roles}")
+            return await func(*args, **kwargs) if asyncio.iscoroutinefunction(func) else func(*args, **kwargs)
+        return wrapper
+    return decorator
 
 security = HTTPBearer(auto_error=False)
 
@@ -65,6 +95,10 @@ async def get_current_user(
     try:
         jwks = await _get_jwks()
         payload = _decode_token(credentials.credentials, jwks)
+        # Extract roles from Auth0 namespace claim
+        namespace = f"https://{settings.auth0_domain}/"
+        roles = payload.get(f"{namespace}roles", payload.get("roles", []))
+        payload["roles"] = roles if isinstance(roles, list) else [roles]
         return payload
     except JWTError as e:
         raise HTTPException(status_code=401, detail=f"Token validation failed: {e}")

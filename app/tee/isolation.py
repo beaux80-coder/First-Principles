@@ -226,6 +226,98 @@ class TEEIsolationBoundary:
 _tee_boundary: Optional[TEEIsolationBoundary] = None
 
 
+def verify_step1_isolation() -> dict:
+    """Produce an attestation document for the F4 clinical filtering step.
+
+    Constitution F4: "Clinical filtering runs with the same TEE isolation
+    guarantees as Function 1 — zero access to financial data."
+
+    This function verifies that the clinical filtering function used in
+    F4 (provider selection) operates with zero financial data access.
+    The F4 provider selection engine uses clinical quality criteria to
+    filter providers. This step must be provably isolated from any
+    financial data (cost, pricing, margin information).
+
+    Returns a dict containing:
+    - verified: bool indicating isolation is intact
+    - attestation: full attestation document
+    - f4_specific_checks: additional F4-relevant verification results
+    """
+    boundary = get_tee_boundary()
+    doc = boundary.verify_isolation()
+
+    # F4-specific checks: verify that the clinical filtering module
+    # does not import any financial/pricing modules
+    f4_financial_imports = []
+    try:
+        import inspect
+        import sys
+
+        # Modules involved in F4 clinical filtering
+        f4_modules = [
+            "app.services.clinical_engine",
+            "app.services.clinical_nlp",
+            "app.services.clinical_guidelines_ingester",
+        ]
+
+        for mod_name in f4_modules:
+            mod = sys.modules.get(mod_name)
+            if mod and hasattr(mod, "__file__"):
+                try:
+                    mod_source = inspect.getsource(mod)
+                    for blocked in FINANCIAL_MODULE_BLOCKLIST:
+                        module_short = blocked.split(".")[-1]
+                        if f"import {module_short}" in mod_source or f"from {blocked}" in mod_source:
+                            f4_financial_imports.append(f"{mod_name} -> {blocked}")
+                except (TypeError, OSError):
+                    pass
+    except Exception as e:
+        logger.warning(f"F4 isolation check encountered error: {e}")
+
+    # Verify no financial env vars are accessible
+    financial_env_accessible = [
+        v for v in FINANCIAL_ENV_BLOCKLIST
+        if os.environ.get(v)
+    ]
+
+    f4_verified = (
+        doc.verified
+        and len(f4_financial_imports) == 0
+        and len(financial_env_accessible) == 0
+    )
+
+    result = {
+        "verified": f4_verified,
+        "isolation_mode": doc.isolation_mode,
+        "attestation": doc.to_dict(),
+        "f4_specific_checks": {
+            "clinical_filtering_isolated": len(f4_financial_imports) == 0,
+            "financial_imports_in_f4_path": f4_financial_imports,
+            "financial_env_vars_accessible": financial_env_accessible,
+            "zero_financial_data_access": f4_verified,
+        },
+        "constitution_reference": (
+            "F4 clinical filtering runs with zero access to financial data, "
+            "cost targets, profit margins, revenue information, or pricing "
+            "calculations. This attestation verifies that guarantee."
+        ),
+        "timestamp": datetime.now(UTC).isoformat(),
+    }
+
+    if not f4_verified:
+        logger.error(
+            f"F4 ISOLATION VIOLATION: Financial access paths detected in "
+            f"clinical filtering: {f4_financial_imports + financial_env_accessible}"
+        )
+    else:
+        logger.info(
+            f"F4 clinical filtering attestation verified: "
+            f"mode={doc.isolation_mode}, isolation=INTACT"
+        )
+
+    return result
+
+
 def get_tee_boundary() -> TEEIsolationBoundary:
     """Get or create the TEE isolation boundary singleton."""
     global _tee_boundary

@@ -26,7 +26,7 @@ from sqlalchemy import func, and_
 from sqlalchemy.orm import Session
 
 from app.models.claim import Claim, ClaimStatus
-from app.models.employer import Employer, BaselineSource
+from app.models.employer import Employer, BaselineSource, EmployerStatus
 from app.models.employee import Employee, EmployeeStatus
 from app.models.service import BenefitType
 from app.services.benchmark import (
@@ -838,6 +838,131 @@ def _get_verification_sources(employer: Employer, baseline_pepm: float) -> list[
             ),
         },
     ]
+
+
+def setup_continuous_recalculation(db: Session) -> dict:
+    """Trigger mechanism for continuous pass-through recalculation.
+
+    Constitution F7 requirement 4:
+    "Baseline cost continuously updated, independently verifiable, never stale"
+
+    When new claim data arrives, this function:
+    1. Identifies all employers with new claims since last rate computation
+    2. Checks baseline staleness across all employers
+    3. Recomputes rates for employers with material changes
+    4. Returns a summary of recalculations performed
+
+    Designed to be called by a background worker whenever new claims
+    are ingested or on a scheduled interval.
+    """
+    now = datetime.now(UTC)
+    recalculations = []
+    stale_baselines = []
+    skipped = []
+
+    # Get all active/shadow employers
+    employers = db.query(Employer).filter(
+        Employer.status.in_([EmployerStatus.active, EmployerStatus.shadow]),
+    ).all()
+
+    for employer in employers:
+        employer_id = employer.employer_id
+
+        # Check baseline staleness
+        age_days = 999
+        if employer.updated_at:
+            age_days = (now - employer.updated_at.replace(tzinfo=UTC)).days
+
+        is_stale = age_days > BASELINE_MAX_AGE_DAYS
+
+        # Check for new claims since last baseline update
+        new_claims_count = 0
+        if employer.updated_at:
+            new_claims_count = db.query(func.count(Claim.claim_id)).filter(
+                Claim.employer_id == employer_id,
+                Claim.status == ClaimStatus.paid,
+                Claim.paid_at > employer.updated_at,
+            ).scalar() or 0
+
+        # Determine if recalculation is warranted
+        should_recalculate = False
+        reason = None
+
+        if is_stale:
+            should_recalculate = True
+            reason = f"Baseline stale ({age_days} days > {BASELINE_MAX_AGE_DAYS} threshold)"
+            stale_baselines.append({
+                "employer_id": str(employer_id),
+                "name": employer.name,
+                "age_days": age_days,
+            })
+        elif new_claims_count >= 10:
+            should_recalculate = True
+            reason = f"{new_claims_count} new paid claims since last update"
+        elif new_claims_count > 0 and not employer.baseline_cost_pepm:
+            should_recalculate = True
+            reason = "No baseline established yet, new claims available"
+
+        if should_recalculate:
+            try:
+                employee_count = _get_active_employee_count(db, employer_id, employer)
+                if employee_count > 0:
+                    # Recompute care delivery cost
+                    care = _compute_care_delivery_cost(db, employer_id, employee_count)
+
+                    # Update baseline if it was stale or missing
+                    if is_stale or not employer.baseline_cost_pepm:
+                        baseline = _get_or_compute_baseline(db, employer, employee_count)
+                    else:
+                        baseline = {
+                            "baseline_pepm": float(employer.baseline_cost_pepm),
+                        }
+
+                    recalculations.append({
+                        "employer_id": str(employer_id),
+                        "name": employer.name,
+                        "reason": reason,
+                        "new_claims_since_last_update": new_claims_count,
+                        "care_delivery_pepm": care["pepm"],
+                        "baseline_pepm": round(baseline["baseline_pepm"], 2),
+                        "employee_count": employee_count,
+                    })
+                else:
+                    skipped.append({
+                        "employer_id": str(employer_id),
+                        "reason": "No active employees",
+                    })
+            except Exception as e:
+                logger.warning(
+                    f"Recalculation failed for employer {employer_id}: {e}"
+                )
+                skipped.append({
+                    "employer_id": str(employer_id),
+                    "reason": f"Error: {str(e)}",
+                })
+        else:
+            skipped.append({
+                "employer_id": str(employer_id),
+                "reason": "No material changes detected",
+            })
+
+    return {
+        "triggered_at": now.isoformat(),
+        "employers_assessed": len(employers),
+        "recalculations_performed": len(recalculations),
+        "stale_baselines_found": len(stale_baselines),
+        "employers_skipped": len(skipped),
+        "recalculations": recalculations,
+        "stale_baselines": stale_baselines,
+        "configuration": {
+            "baseline_max_age_days": BASELINE_MAX_AGE_DAYS,
+            "min_new_claims_for_recalc": 10,
+            "value_share_pct": VALUE_SHARE_PCT,
+        },
+        "next_trigger": (
+            "Continuous — runs on each new claim batch or every 24 hours"
+        ),
+    }
 
 
 def _zero_rate_response(employer: Employer) -> dict:
