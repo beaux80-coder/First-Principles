@@ -13,17 +13,15 @@ import logging
 import uuid
 from datetime import datetime, UTC, timedelta
 
-from sqlalchemy import func, and_
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.claim import Claim, ClaimStatus
 from app.models.employer import Employer
 from app.models.employee import Employee, EmployeeStatus
-from app.models.service import BenefitType
 from app.services.benchmark import (
     NATIONAL_AVG_PEPM,
     INDUSTRY_COST_BREAKDOWN,
-    BENEFIT_TYPE_ALLOCATION,
 )
 from app.services.pricing_engine import VALUE_SHARE_PCT
 
@@ -212,7 +210,7 @@ def compare_vs_incumbent(db: Session, employer_id: uuid.UUID) -> dict:
         Claim.status == ClaimStatus.paid,
     ).scalar() or 0.0
 
-    total_billed = db.query(func.sum(Claim.amount_billed)).filter(
+    db.query(func.sum(Claim.amount_billed)).filter(
         Claim.employer_id == employer_id,
         Claim.status == ClaimStatus.paid,
     ).scalar() or 0.0

@@ -38,7 +38,7 @@ from app.services.cross_type_analytics import (
     generate_cross_type_signals,
     BENEFIT_TYPE_PREFIXES,
 )
-from app.services.ml_models import price_regression_by_state, provider_clustering
+from app.services.ml_models import price_regression_by_state
 
 logger = logging.getLogger(__name__)
 

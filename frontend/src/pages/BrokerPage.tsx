@@ -7,6 +7,7 @@ const API = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1'
 
 export default function BrokerPage() {
   const [loading, setLoading] = useState(false)
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [result, setResult] = useState<any>(null)
   const [form, setForm] = useState({
     employee_count: '',

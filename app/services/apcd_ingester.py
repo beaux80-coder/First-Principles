@@ -17,13 +17,11 @@ import csv
 import io
 import json
 import logging
-import re
 from datetime import datetime, UTC
 from typing import Optional
 
 import httpx
 from bs4 import BeautifulSoup
-from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
 from app.models.price_data import PriceData, PriceSource

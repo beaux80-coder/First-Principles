@@ -66,6 +66,7 @@ export default function CarePage() {
   const [benefitType, setBenefitType] = useState('health')
   const [result, setResult] = useState<CareResult | null>(null)
   const [error, setError] = useState('')
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const [episodes, setEpisodes] = useState<any[]>([])
 
   // TODO: Get from auth context
@@ -96,8 +97,8 @@ export default function CarePage() {
       const data = await resp.json()
       setResult(data)
       setStep('result')
-    } catch (e: any) {
-      setError(e.message)
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Something went wrong')
       setStep('describe')
     }
   }
@@ -109,7 +110,7 @@ export default function CarePage() {
         const data = await resp.json()
         setEpisodes(data.active_episodes || [])
       }
-    } catch {}
+    } catch { /* ignore fetch errors */ }
   }
 
   return (
@@ -199,6 +200,7 @@ export default function CarePage() {
           </button>
           {episodes.length > 0 && (
             <div className="mt-4 space-y-2">
+              {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
               {episodes.map((ep: any, i: number) => (
                 <div key={i} className="border rounded-lg p-3 bg-gray-50">
                   <p className="font-medium">{ep.condition || 'Care episode'}</p>

@@ -1,7 +1,6 @@
 """Tests for PII/PHI encryption."""
 
 import os
-import pytest
 
 
 def test_encrypt_decrypt():

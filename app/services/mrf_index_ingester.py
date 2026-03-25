@@ -19,12 +19,9 @@ import gzip
 import io
 import json
 import logging
-import os
 from datetime import datetime, UTC
-from typing import Optional
 
 import httpx
-from sqlalchemy import delete, func
 from sqlalchemy.orm import Session
 
 from app.models.price_data import PriceData, PriceSource

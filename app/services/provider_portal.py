@@ -31,7 +31,7 @@ from datetime import datetime, UTC
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional
 
-from sqlalchemy import func, and_, desc
+from sqlalchemy import func, desc
 from sqlalchemy.orm import Session
 
 from app.models.provider_portal import (
@@ -1092,7 +1092,6 @@ def _get_provider_published_prices(
         return []
 
     # Query by NPI first (most specific), then by name
-    filters = [PriceData.service_code == service_code]
 
     if provider.npi:
         npi_prices = (

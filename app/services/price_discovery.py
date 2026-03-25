@@ -754,7 +754,6 @@ def document_payment_speed_capabilities(db: Session) -> dict:
         }
 
     # Calculate payment speed: charge_verified_at -> payment_initiated_at
-    from sqlalchemy import text
 
     speed_stats = db.execute(text(
         "SELECT "

@@ -22,12 +22,11 @@ import uuid
 from datetime import datetime, UTC, timedelta
 from typing import Any
 
-from sqlalchemy import func, and_, or_, text, delete
+from sqlalchemy import func, or_, delete
 from sqlalchemy.orm import Session
 
 from app.models.price_data import PriceData, PriceSource
 from app.models.claim import Claim
-from app.models.service import BenefitType
 from app.models.data_pipeline_metric import DataPipelineMetric
 
 logger = logging.getLogger(__name__)
@@ -513,7 +512,7 @@ def detect_price_patterns(db: Session) -> dict[str, Any]:
                     f"Identified {len(leading)} benefit types that lead multi-type episodes"
                 ),
                 "feeds": ["F3 (Cost Prediction)", "F9 (Care Execution)"],
-                "leading_types": [l["benefit_type"] for l in leading],
+                "leading_types": [item["benefit_type"] for item in leading],
             })
 
     patterns["summary"] = {

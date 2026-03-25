@@ -25,7 +25,7 @@ import time
 from datetime import datetime, UTC
 from typing import Optional
 
-from sqlalchemy import and_, or_, func, case
+from sqlalchemy import and_, or_, func
 from sqlalchemy.orm import Session
 
 from app.models.clinical_determination import ClinicalDetermination
@@ -176,7 +176,7 @@ def _find_matching_guidelines(
     bt = BENEFIT_TYPE_MAP.get(benefit_type, BenefitTypeGuideline.health)
 
     filters = [
-        ClinicalGuideline.is_active == True,
+        ClinicalGuideline.is_active,
         or_(
             ClinicalGuideline.benefit_type == bt,
             ClinicalGuideline.benefit_type == BenefitTypeGuideline.all_types,
@@ -196,7 +196,7 @@ def _find_matching_guidelines(
             db.query(ClinicalGuideline)
             .filter(
                 and_(
-                    ClinicalGuideline.is_active == True,
+                    ClinicalGuideline.is_active,
                     or_(
                         ClinicalGuideline.benefit_type == bt,
                         ClinicalGuideline.benefit_type == BenefitTypeGuideline.all_types,
@@ -274,7 +274,7 @@ def _evaluate_criteria(
         if has_relevant_dx:
             reasons.append(f"Patient has documented diagnosis matching condition '{guideline.condition}'")
         elif symptoms_text:
-            reasons.append(f"Patient symptoms present; clinical evaluation of service appropriateness indicated")
+            reasons.append("Patient symptoms present; clinical evaluation of service appropriateness indicated")
 
     # Red flags / urgency check
     if "red flag" in criteria_text:
@@ -561,7 +561,6 @@ def make_determination(
     else:
         # Evaluate each matching guideline
         all_reasoning = []
-        any_approved = False
         any_denied = False
 
         for guideline in guidelines:
@@ -569,7 +568,7 @@ def make_determination(
             all_reasoning.append(f"[{guideline.title}] {reasoning_text}")
 
             if meets:
-                any_approved = True
+                pass
             else:
                 any_denied = True
 
@@ -1079,7 +1078,7 @@ def _compute_expected_rates_by_type(db: Session) -> dict:
     for bt_name, bt_enum in BENEFIT_TYPE_MAP.items():
         total_guidelines = db.query(func.count(ClinicalGuideline.guideline_id)).filter(
             and_(
-                ClinicalGuideline.is_active == True,
+                ClinicalGuideline.is_active,
                 or_(
                     ClinicalGuideline.benefit_type == bt_enum,
                     ClinicalGuideline.benefit_type == BenefitTypeGuideline.all_types,
@@ -1093,13 +1092,13 @@ def _compute_expected_rates_by_type(db: Session) -> dict:
 
         without_exclusion = db.query(func.count(ClinicalGuideline.guideline_id)).filter(
             and_(
-                ClinicalGuideline.is_active == True,
+                ClinicalGuideline.is_active,
                 or_(
                     ClinicalGuideline.benefit_type == bt_enum,
                     ClinicalGuideline.benefit_type == BenefitTypeGuideline.all_types,
                 ),
                 or_(
-                    ClinicalGuideline.criteria == None,
+                    ClinicalGuideline.criteria is None,
                     ClinicalGuideline.criteria == "",
                 ),
             )
@@ -1182,7 +1181,7 @@ def get_published_rates(db: Session) -> dict:
 
     # Accuracy metrics from outcome feedback
     outcomes_recorded = db.query(func.count(ClinicalDetermination.determination_id)).filter(
-        ClinicalDetermination.outcome_feedback != None
+        ClinicalDetermination.outcome_feedback is not None
     ).scalar() or 0
 
     accuracy_data = {}
@@ -1197,7 +1196,7 @@ def get_published_rates(db: Session) -> dict:
 
     # Latency metrics
     avg_latency = db.query(func.avg(ClinicalDetermination.latency_ms)).filter(
-        ClinicalDetermination.latency_ms != None
+        ClinicalDetermination.latency_ms is not None
     ).scalar()
 
     return {

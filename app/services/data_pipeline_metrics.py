@@ -19,7 +19,6 @@ from typing import Any
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.models.price_data import PriceData, PriceSource
 from app.models.data_pipeline_metric import DataPipelineMetric
 from app.models.clinical_determination import ClinicalDetermination
 

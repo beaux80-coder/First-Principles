@@ -10,7 +10,6 @@ and benefit-type-specific adjudication rules.
 import logging
 import re
 from datetime import datetime, UTC, timedelta
-from typing import Optional
 
 from sqlalchemy import and_, func
 from sqlalchemy.orm import Session

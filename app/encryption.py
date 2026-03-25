@@ -11,9 +11,11 @@ ORM layer with zero caller effort.
 
 import base64
 import hashlib
+import os
 
 from cryptography.fernet import Fernet
-from sqlalchemy import String, Text
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from sqlalchemy import Text
 from sqlalchemy.types import TypeDecorator
 
 from app.config import settings
@@ -40,10 +42,6 @@ def decrypt_value(ciphertext: str) -> str:
         return ciphertext
     f = _get_fernet()
     return f.decrypt(ciphertext.encode()).decode()
-
-
-import os
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
 class AES256GCMEncryptor:

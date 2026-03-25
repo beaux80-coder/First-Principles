@@ -24,16 +24,15 @@ The proof summary gives coverage metrics per layer.
 """
 
 import logging
-import uuid
 from datetime import datetime, UTC
 
-from sqlalchemy import func, and_, distinct
+from sqlalchemy import func, and_
 from sqlalchemy.orm import Session
 
 from app.models.claim import Claim, ClaimStatus, ClaimMode
 from app.models.benchmark_query import BenchmarkQuery, BenchmarkStage
 from app.models.price_data import PriceData
-from app.models.employer import Employer, EmployerStatus
+from app.models.employer import Employer
 
 logger = logging.getLogger(__name__)
 
@@ -188,7 +187,7 @@ def tag_proof_layer(
         "evidence": layer4_evidence,
     }
 
-    layers_covered = sum(1 for l in layers.values() if l["applies"])
+    layers_covered = sum(1 for layer in layers.values() if layer["applies"])
 
     return {
         "claim_id": claim_id,

@@ -17,9 +17,8 @@ import math
 import random
 import uuid
 from datetime import datetime, UTC
-from typing import Optional
 
-from sqlalchemy import func, and_
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.claim import Claim, ClaimStatus
@@ -470,7 +469,7 @@ def run_monte_carlo_simulation(
 
     # Actuarial parameters derived from risk profile
     claims_pepm = risk_profile["claims_pepm"] or 450.0
-    annual_expected = claims_pepm * employee_count * 12
+    claims_pepm * employee_count * 12
 
     # Claim size distribution parameters (lognormal)
     # Mean claim ~$2,500, with heavy right tail for catastrophic

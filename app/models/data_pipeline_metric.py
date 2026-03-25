@@ -7,7 +7,7 @@ in at least one downstream function."
 import uuid
 from datetime import datetime
 
-from sqlalchemy import String, Float, DateTime, Text, JSON
+from sqlalchemy import String, Float, DateTime, JSON
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.compat import GUID

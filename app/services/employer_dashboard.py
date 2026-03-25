@@ -15,7 +15,7 @@ import hashlib
 import secrets
 from datetime import datetime, UTC, timedelta
 
-from sqlalchemy import func, and_
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.claim import Claim, ClaimStatus
@@ -29,7 +29,6 @@ from app.services.pricing_engine import (
 )
 from app.services.benchmark import (
     NATIONAL_AVG_PEPM,
-    BENEFIT_TYPE_ALLOCATION,
 )
 
 logger = logging.getLogger(__name__)
@@ -198,7 +197,7 @@ def get_care_metrics(db: Session, employer_id: uuid.UUID) -> dict:
     Constitution: "Care execution metrics (episodes managed, appointments
     scheduled, referrals coordinated)."
     """
-    employer = _get_employer_or_raise(db, employer_id)
+    _get_employer_or_raise(db, employer_id)
 
     # Get employee IDs for this employer
     employee_ids = [
@@ -320,7 +319,7 @@ def get_employee_outcomes(db: Session, employer_id: uuid.UUID) -> dict:
 
     Constitution: "Employee health outcomes (resolution rates, satisfaction, NPS)."
     """
-    employer = _get_employer_or_raise(db, employer_id)
+    _get_employer_or_raise(db, employer_id)
 
     employee_ids = [
         eid for (eid,) in db.query(Employee.employee_id).filter(

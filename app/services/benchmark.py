@@ -673,9 +673,9 @@ def generate_employer_referral(db: Session, employer_id) -> dict:
             "call_to_action": "Request a free, no-obligation benchmark for your organization.",
         },
         "network_effect_context": (
-            f"This employer is part of a network generating group purchasing "
-            f"leverage across all participants. Each new employer strengthens "
-            f"the network for everyone."
+            "This employer is part of a network generating group purchasing "
+            "leverage across all participants. Each new employer strengthens "
+            "the network for everyone."
         ),
     }
 

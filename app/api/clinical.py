@@ -8,7 +8,7 @@ All endpoints in this module are part of the open-source F1 engine.
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 

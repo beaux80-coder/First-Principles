@@ -20,7 +20,6 @@ publications.
 import logging
 import uuid
 from datetime import datetime, UTC, timedelta
-from typing import Any
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -562,7 +561,7 @@ def generate_aca_1095c(
             demographics = {}
 
     hire_date = demographics.get("hire_date", f"{tax_year}-01-01")
-    enrollment_date = demographics.get(
+    demographics.get(
         "enrollment_date", f"{tax_year}-01-01"
     )
 
@@ -1109,7 +1108,7 @@ def run_compliance_checklist(db: Session, employer_id: uuid.UUID) -> dict:
         Employee.employer_id == employer_id,
     ).scalar() or 0
 
-    active_employees = db.query(func.count(Employee.employee_id)).filter(
+    db.query(func.count(Employee.employee_id)).filter(
         Employee.employer_id == employer_id,
         Employee.status == EmployeeStatus.active,
     ).scalar() or 0

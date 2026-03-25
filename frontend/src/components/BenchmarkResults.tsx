@@ -27,6 +27,7 @@ interface Props {
 }
 
 export default function BenchmarkResults({ result, onReset }: Props) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const r = result as any
   const { current_cost, system_cost, comparison, experience_comparison, transparency, data_quality } = r
 
@@ -108,6 +109,7 @@ export default function BenchmarkResults({ result, onReset }: Props) {
                 </tr>
               </thead>
               <tbody>
+                {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
                 {Object.entries(r.benefit_type_breakdown).map(([key, bt]: [string, any]) => (
                   <tr key={key} className="border-b">
                     <td className="py-3 pr-4 text-gray-700 font-medium">{benefitLabel(key)}</td>
@@ -139,6 +141,7 @@ export default function BenchmarkResults({ result, onReset }: Props) {
                 </tr>
               </thead>
               <tbody>
+                {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
                 {r.price_examples.map((ex: any) => (
                   <tr key={ex.code} className="border-b">
                     <td className="py-3 pr-4 text-gray-700">{ex.description}</td>
@@ -160,6 +163,7 @@ export default function BenchmarkResults({ result, onReset }: Props) {
           <h2 className="text-lg font-semibold text-gray-900 mb-2">Top-rated hospitals in your state</h2>
           <p className="text-sm text-gray-500 mb-4">{r.local_quality.hospitals_with_ratings_in_state} hospitals rated by CMS in your state</p>
           <div className="space-y-2">
+            {/* eslint-disable-next-line @typescript-eslint/no-explicit-any */}
             {r.local_quality.top_rated_hospitals.map((h: any, i: number) => (
               <div key={i} className="flex justify-between text-sm py-2 border-b border-gray-100">
                 <span className="text-gray-700">{h.name}</span>

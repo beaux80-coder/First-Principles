@@ -19,7 +19,7 @@ from datetime import datetime, UTC
 from enum import Enum
 from typing import Optional
 
-from sqlalchemy import String, Numeric, DateTime, Text, Boolean
+from sqlalchemy import String, Numeric, DateTime, Text
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column, Session
 

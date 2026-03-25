@@ -359,7 +359,7 @@ def intake_issue(
 
     # Step 5: Auto-chain referral if needed
     if interpretation["needs_referral"]:
-        referral_result = process_referral(db, episode.episode_id, condition)
+        process_referral(db, episode.episode_id, condition)
         steps.append(_make_step(
             StepType.referral.value,
             StepStatus.completed.value,
@@ -1062,17 +1062,17 @@ def get_care_metrics(db: Session) -> dict:
 
     # Prescription routing stats
     prescriptions_routed = db.query(func.count(CareEpisode.episode_id)).filter(
-        CareEpisode.prescription_routed == True
+        CareEpisode.prescription_routed
     ).scalar() or 0
 
     # Missed appointments
     missed_appointments = db.query(func.count(CareEpisode.episode_id)).filter(
-        CareEpisode.appointment_missed == True
+        CareEpisode.appointment_missed
     ).scalar() or 0
 
     # Provider concerns
     provider_concerns = db.query(func.count(CareEpisode.episode_id)).filter(
-        CareEpisode.provider_concern_flag == True
+        CareEpisode.provider_concern_flag
     ).scalar() or 0
 
     # Average NLP confidence
@@ -1167,7 +1167,7 @@ def _select_provider_for_chain_item(
         "specialist_referral": "physician",
         "referral": "physician",
     }
-    provider_type = type_map.get(item_type, "physician")
+    type_map.get(item_type, "physician")
 
     try:
         from app.services.provider_selection import select_provider
@@ -2011,7 +2011,7 @@ def verify_eligibility(
 
     # Step 3: Validate benefit type
     try:
-        bt = BenefitType(benefit_type)
+        BenefitType(benefit_type)
     except ValueError:
         return {
             "eligible": False,
@@ -3850,7 +3850,7 @@ def generate_fhir_bundle(db: Session, episode_id: uuid.UUID) -> dict:
     # 3. MedicationStatement — from prescription history on care episodes
     med_episodes = db.query(CareEpisode).filter(
         CareEpisode.employee_id == episode.employee_id,
-        CareEpisode.prescription_routed == True,
+        CareEpisode.prescription_routed,
     ).all()
 
     for med_ep in med_episodes:

@@ -40,7 +40,6 @@ def ingest_cms_ncd_guidelines(db: Session) -> int:
     logger.info("Ingesting CMS NCD guidelines...")
 
     # CMS NCDs accessible via the Medicare Coverage Database API
-    NCD_API = "https://www.cms.gov/medicare-coverage-database/search.aspx"
 
     # Core NCDs covering the most common medical necessity determinations
     # These are the foundational coverage rules that F1 must reference
@@ -438,7 +437,6 @@ def ingest_uspstf_recommendations(db: Session) -> int:
 
     count = 0
     try:
-        headers = {}
         url = USPSTF_URL
         if api_key:
             url = f"{USPSTF_URL}?key={api_key}"
@@ -1272,19 +1270,19 @@ def get_guideline_stats(db: Session) -> dict:
     from sqlalchemy import func
 
     total = db.query(func.count(ClinicalGuideline.guideline_id)).filter(
-        ClinicalGuideline.is_active == True
+        ClinicalGuideline.is_active
     ).scalar() or 0
 
     by_type = dict(
         db.query(ClinicalGuideline.benefit_type, func.count(ClinicalGuideline.guideline_id))
-        .filter(ClinicalGuideline.is_active == True)
+        .filter(ClinicalGuideline.is_active)
         .group_by(ClinicalGuideline.benefit_type)
         .all()
     )
 
     by_source = dict(
         db.query(ClinicalGuideline.source, func.count(ClinicalGuideline.guideline_id))
-        .filter(ClinicalGuideline.is_active == True)
+        .filter(ClinicalGuideline.is_active)
         .group_by(ClinicalGuideline.source)
         .all()
     )
@@ -1294,8 +1292,8 @@ def get_guideline_stats(db: Session) -> dict:
     # Measure incorporation latency where possible
     latency_data = []
     recent = db.query(ClinicalGuideline).filter(
-        ClinicalGuideline.publication_date != None,
-        ClinicalGuideline.ingested_at != None,
+        ClinicalGuideline.publication_date is not None,
+        ClinicalGuideline.ingested_at is not None,
     ).order_by(ClinicalGuideline.ingested_at.desc()).limit(10).all()
 
     for g in recent:

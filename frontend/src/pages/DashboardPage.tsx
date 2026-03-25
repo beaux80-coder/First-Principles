@@ -14,6 +14,7 @@ interface DashboardData {
     employee_out_of_pocket: number
     by_benefit_type: Record<string, { total_paid: number; claim_count: number; pepm: number }>
   }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   savings: Record<string, any>
   clinical_rates: {
     total_claims: number
@@ -42,7 +43,7 @@ interface DashboardData {
 export default function DashboardPage() {
   const [data, setData] = useState<DashboardData | null>(null)
   const [error, setError] = useState('')
-  const [employerId, setEmployerId] = useState('11111111-1111-1111-1111-111111111111')
+  const [employerId] = useState('11111111-1111-1111-1111-111111111111')
 
   useEffect(() => {
     fetch(`${API}/dashboard/${employerId}`)
@@ -84,8 +85,8 @@ export default function DashboardPage() {
           {Object.entries(bt).map(([type, info]) => (
             <div key={type} className="bg-gray-50 rounded-lg p-4">
               <p className="text-xs text-gray-500 uppercase tracking-wide">{type.replace('_', ' ')}</p>
-              <p className="text-lg font-semibold">${(info as any).total_paid?.toLocaleString()}</p>
-              <p className="text-xs text-gray-400">{(info as any).claim_count} claims &middot; ${(info as any).pepm}/PEPM</p>
+              <p className="text-lg font-semibold">${(info as Record<string, number>).total_paid?.toLocaleString()}</p>
+              <p className="text-xs text-gray-400">{(info as Record<string, number>).claim_count} claims &middot; ${(info as Record<string, number>).pepm}/PEPM</p>
             </div>
           ))}
         </div>

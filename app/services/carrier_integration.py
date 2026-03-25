@@ -13,7 +13,6 @@ import enum
 import logging
 import uuid
 from datetime import datetime, UTC
-from typing import Any
 
 logger = logging.getLogger(__name__)
 

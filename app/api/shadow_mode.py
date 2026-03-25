@@ -20,7 +20,7 @@ from app.services.shadow_mode import (
     activate_from_shadow,
 )
 from app.services.carrier_integration import ingest_carrier_claim
-from app.services.proof_chain import tag_proof_layer, get_proof_summary
+from app.services.proof_chain import get_proof_summary
 
 router = APIRouter(prefix="/shadow", tags=["shadow_mode"])
 
