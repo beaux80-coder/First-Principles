@@ -202,6 +202,15 @@ def process_shadow_claim(
     carrier_oop = carrier_claim.employee_oop
     savings = carrier_claim.billed_amount - system_paid
 
+    # Tag with proof layers (Constitution F6A Q21)
+    from app.services.proof_chain import tag_proof_layer
+    proof = tag_proof_layer(
+        db,
+        claim_id=str(shadow_claim.claim_id),
+        service_code=carrier_claim.service_code,
+        employer_id=employer_id,
+    )
+
     comparison = {
         "claim_id": str(shadow_claim.claim_id),
         "carrier_claim_id": carrier_claim.carrier_claim_id,
@@ -231,6 +240,19 @@ def process_shadow_claim(
             "savings_per_claim": round(savings, 2),
             "employee_oop_eliminated": round(carrier_oop, 2),
             "faster_decision": True,
+        },
+        "proof_layers": {
+            layer_num: {
+                "name": layer_data.get("name", ""),
+                "applies": layer_data.get("applies", False),
+                "evidence_count": len(layer_data.get("evidence", [])),
+            }
+            for layer_num, layer_data in proof.get("layers", {}).items()
+        },
+        "proof_coverage": {
+            "layers_covered": proof.get("layers_covered", 0),
+            "total_layers": proof.get("total_layers", 4),
+            "coverage_pct": proof.get("coverage_pct", 0),
         },
     }
 
