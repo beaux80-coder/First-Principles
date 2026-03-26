@@ -33,22 +33,72 @@ from app.models.clinical_guideline import ClinicalGuideline, BenefitTypeGuidelin
 
 logger = logging.getLogger(__name__)
 
-# Red-flag symptoms indicating meaningful risk of health deterioration
-RED_FLAG_SYMPTOMS = [
-    "chest pain", "shortness of breath", "severe pain", "trauma", "neurological deficit",
-    "loss of consciousness", "sudden vision loss", "sudden hearing loss", "suicidal ideation",
-    "self-harm", "psychosis", "seizure", "stroke symptoms", "cardiac arrest", "hemorrhage",
-    "acute abdomen", "anaphylaxis", "sepsis", "fever with rash", "progressive weakness",
-    "uncontrolled bleeding", "severe headache", "neck stiffness", "confusion", "delirium",
-    "substance overdose", "withdrawal symptoms", "severe depression", "panic attack",
-]
+# Red-flag symptoms with clinical severity tiers.
+# Tier weights: emergency (1.0), critical (0.7), serious (0.4), moderate (0.2).
+# The tier weight is multiplied by the category max (0.5) to produce the
+# per-symptom contribution.
+RED_FLAG_SYMPTOMS_TIERED: dict[str, float] = {
+    # Emergency tier (1.0) — immediate life threat
+    "cardiac arrest": 1.0,
+    "anaphylaxis": 1.0,
+    "hemorrhage": 1.0,
+    "uncontrolled bleeding": 1.0,
+    "stroke symptoms": 1.0,
+    "sepsis": 1.0,
+    "substance overdose": 1.0,
+    "loss of consciousness": 1.0,
+    # Critical tier (0.7) — high risk of rapid deterioration
+    "chest pain": 0.7,
+    "shortness of breath": 0.7,
+    "seizure": 0.7,
+    "acute abdomen": 0.7,
+    "suicidal ideation": 0.7,
+    "self-harm": 0.7,
+    "psychosis": 0.7,
+    "severe headache": 0.7,
+    "neck stiffness": 0.7,
+    "neurological deficit": 0.7,
+    # Serious tier (0.4) — significant concern
+    "severe pain": 0.4,
+    "trauma": 0.4,
+    "sudden vision loss": 0.4,
+    "sudden hearing loss": 0.4,
+    "fever with rash": 0.4,
+    "progressive weakness": 0.4,
+    "confusion": 0.4,
+    "delirium": 0.4,
+    "withdrawal symptoms": 0.4,
+    # Moderate tier (0.2) — warrants clinical attention
+    "severe depression": 0.2,
+    "panic attack": 0.2,
+}
 
-# High-complexity conditions that compound deterioration risk
-HIGH_COMPLEXITY_CONDITIONS = [
-    "diabetes", "hypertension", "heart failure", "copd", "cancer", "hiv", "hepatitis",
-    "kidney disease", "liver disease", "autoimmune", "transplant", "immunocompromised",
-    "chronic pain", "substance use disorder", "bipolar", "schizophrenia",
-]
+# Flat list kept for backward compat (used in _evaluate_criteria)
+RED_FLAG_SYMPTOMS = list(RED_FLAG_SYMPTOMS_TIERED.keys())
+
+# High-complexity conditions with severity weights.
+# Weight reflects how much the condition compounds deterioration risk.
+HIGH_COMPLEXITY_CONDITIONS_WEIGHTED: dict[str, float] = {
+    "cancer": 1.0,
+    "transplant": 1.0,
+    "immunocompromised": 0.9,
+    "hiv": 0.8,
+    "heart failure": 0.8,
+    "kidney disease": 0.7,
+    "liver disease": 0.7,
+    "copd": 0.6,
+    "hepatitis": 0.6,
+    "autoimmune": 0.6,
+    "diabetes": 0.5,
+    "hypertension": 0.4,
+    "schizophrenia": 0.5,
+    "bipolar": 0.5,
+    "substance use disorder": 0.5,
+    "chronic pain": 0.3,
+}
+
+# Flat list kept for backward compat
+HIGH_COMPLEXITY_CONDITIONS = list(HIGH_COMPLEXITY_CONDITIONS_WEIGHTED.keys())
 
 # Benefit type mapping from claim types to guideline types
 BENEFIT_TYPE_MAP = {
@@ -313,6 +363,12 @@ def _assess_meaningful_risk(
     does not support a meaningful risk of health deterioration, the service
     is declined. The determination is not a default in either direction."
 
+    Weighted scoring categories (max contribution):
+    1. Emergency red flags:       max 0.50  (tiered by clinical severity)
+    2. High-complexity conditions: max 0.30  (weighted by condition severity)
+    3. Age vulnerability:          max 0.20  (graduated scale)
+    4. Service invasiveness:       max 0.15  (by CPT category)
+
     Returns (risk_score, risk_factors_dict, reasoning).
     risk_score: 0.0-1.0 where higher = more risk of deterioration without service.
     """
@@ -324,91 +380,169 @@ def _assess_meaningful_risk(
 
     factors = {
         "red_flags_present": [],
+        "red_flag_severity_tiers": {},
         "high_complexity_conditions": [],
         "medication_count": len(medications),
         "active_diagnoses_count": len(diagnoses),
         "risk_factors_count": len(risk_factors_input),
         "age_vulnerability": False,
+        "age_vulnerability_score": 0.0,
         "symptom_severity": "low",
     }
 
-    # 1. Red-flag symptom scoring (0-0.4)
+    # ---- 1. Red-flag symptom scoring (max 0.50) ----
+    # Each flag contributes its tier weight * 0.5 (the category max).
+    # Multiple flags stack but are capped at 0.50.
     red_flag_score = 0.0
-    for flag in RED_FLAG_SYMPTOMS:
+    for flag, tier_weight in RED_FLAG_SYMPTOMS_TIERED.items():
         if flag in symptoms_text:
+            contribution = tier_weight * 0.5
             factors["red_flags_present"].append(flag)
-            red_flag_score += 0.1
-    red_flag_score = min(red_flag_score, 0.4)
+            tier_label = (
+                "emergency" if tier_weight >= 0.9
+                else "critical" if tier_weight >= 0.6
+                else "serious" if tier_weight >= 0.3
+                else "moderate"
+            )
+            factors["red_flag_severity_tiers"][flag] = tier_label
+            red_flag_score += contribution
+    red_flag_score = min(red_flag_score, 0.50)
 
-    # 2. History complexity scoring (0-0.3)
+    # ---- 2. High-complexity condition scoring (max 0.30) ----
+    # Each condition contributes its weight * 0.3 (the category max).
+    # Polypharmacy and multi-morbidity add supplementary points.
     complexity_score = 0.0
-    for condition in HIGH_COMPLEXITY_CONDITIONS:
+    for condition, cond_weight in HIGH_COMPLEXITY_CONDITIONS_WEIGHTED.items():
         if any(condition in d for d in diagnoses):
             factors["high_complexity_conditions"].append(condition)
-            complexity_score += 0.05
+            complexity_score += cond_weight * 0.15  # scaled so 2 major conditions ~ 0.3
+    # Polypharmacy bonus
     if len(medications) >= 5:
         complexity_score += 0.05
-    if len(diagnoses) >= 3:
+    elif len(medications) >= 3:
+        complexity_score += 0.02
+    # Multi-morbidity bonus
+    if len(diagnoses) >= 4:
         complexity_score += 0.05
-    if len(risk_factors_input) >= 2:
-        complexity_score += 0.05
-    complexity_score = min(complexity_score, 0.3)
+    elif len(diagnoses) >= 2:
+        complexity_score += 0.02
+    # Risk factor bonus
+    if len(risk_factors_input) >= 3:
+        complexity_score += 0.04
+    elif len(risk_factors_input) >= 1:
+        complexity_score += 0.02
+    complexity_score = min(complexity_score, 0.30)
 
-    # 3. Age vulnerability (0-0.15)
+    # ---- 3. Age vulnerability (max 0.20) ----
+    # Graduated scale rather than binary thresholds.
     age_score = 0.0
-    if age >= 65 or age <= 5:
-        factors["age_vulnerability"] = True
-        age_score = 0.15
-    elif age >= 55 or age <= 12:
-        factors["age_vulnerability"] = True
-        age_score = 0.08
+    if age <= 1:
+        age_score = 0.20
+    elif age <= 5:
+        age_score = 0.16
+    elif age <= 12:
+        age_score = 0.10
+    elif age >= 80:
+        age_score = 0.20
+    elif age >= 70:
+        age_score = 0.16
+    elif age >= 65:
+        age_score = 0.12
+    elif age >= 55:
+        age_score = 0.06
 
-    # 4. Service invasiveness context (0-0.15)
-    # More invasive services carry higher risk if denied when needed
+    if age_score > 0:
+        factors["age_vulnerability"] = True
+        factors["age_vulnerability_score"] = age_score
+
+    # ---- 4. Service invasiveness context (max 0.15) ----
+    # More invasive services carry higher risk if denied when needed.
     invasiveness_score = 0.0
     code_prefix = service_code[:2] if service_code else ""
     if code_prefix in ("10", "11", "12", "13", "14", "15", "16", "17", "19",
                        "20", "21", "22", "23", "24", "25", "26", "27", "28", "29"):
         # Surgical codes (10000-29999)
-        invasiveness_score = 0.10
+        invasiveness_score = 0.15
+        factors["symptom_severity"] = "high"
+    elif code_prefix in ("30", "31", "32", "33", "34", "35", "36", "37", "38", "39"):
+        # Cardiovascular/thoracic surgery (30000-39999)
+        invasiveness_score = 0.15
         factors["symptom_severity"] = "high"
     elif code_prefix in ("70", "71", "72", "73", "74", "75", "76", "77", "78"):
         # Imaging/radiology (70000-79999)
-        invasiveness_score = 0.05
+        invasiveness_score = 0.08
         factors["symptom_severity"] = "moderate"
     elif code_prefix in ("80", "81", "82", "83", "84", "85", "86", "87", "88", "89"):
         # Lab/pathology (80000-89999)
-        invasiveness_score = 0.03
+        invasiveness_score = 0.04
     elif code_prefix in ("90", "96", "97", "98", "99"):
         # E&M and medicine (90000-99999)
+        invasiveness_score = 0.06
+    elif code_prefix in ("D0", "D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8", "D9"):
+        # Dental CDT codes
         invasiveness_score = 0.05
 
-    total_risk = min(red_flag_score + complexity_score + age_score + invasiveness_score, 1.0)
-
-    if total_risk >= 0.3:
-        factors["symptom_severity"] = "high"
-    elif total_risk >= 0.15:
-        factors["symptom_severity"] = "moderate" if factors["symptom_severity"] == "low" else factors["symptom_severity"]
-
-    # Build patient-specific reasoning
-    reasoning_parts = []
-    reasoning_parts.append(
-        f"Gray-area assessment: No specific clinical guideline clearly addresses "
-        f"service {service_code} (benefit type: {benefit_type}) for this patient."
+    total_risk = min(
+        red_flag_score + complexity_score + age_score + invasiveness_score,
+        1.0,
     )
 
-    if factors["red_flags_present"]:
-        reasoning_parts.append(
-            f"Red-flag symptoms present: {', '.join(factors['red_flags_present'])}."
+    # Classify overall severity
+    if total_risk >= 0.4:
+        factors["symptom_severity"] = "high"
+    elif total_risk >= 0.2:
+        factors["symptom_severity"] = (
+            "moderate" if factors["symptom_severity"] == "low"
+            else factors["symptom_severity"]
         )
+
+    # Build patient-specific reasoning
+    reasoning_parts = [
+        f"Gray-area assessment: No specific clinical guideline clearly addresses "
+        f"service {service_code} (benefit type: {benefit_type}) for this patient."
+    ]
+
+    if factors["red_flags_present"]:
+        emergency_flags = [
+            f for f in factors["red_flags_present"]
+            if factors["red_flag_severity_tiers"].get(f) == "emergency"
+        ]
+        critical_flags = [
+            f for f in factors["red_flags_present"]
+            if factors["red_flag_severity_tiers"].get(f) == "critical"
+        ]
+        other_flags = [
+            f for f in factors["red_flags_present"]
+            if factors["red_flag_severity_tiers"].get(f) not in ("emergency", "critical")
+        ]
+        if emergency_flags:
+            reasoning_parts.append(
+                f"EMERGENCY red-flag symptoms: {', '.join(emergency_flags)}."
+            )
+        if critical_flags:
+            reasoning_parts.append(
+                f"Critical red-flag symptoms: {', '.join(critical_flags)}."
+            )
+        if other_flags:
+            reasoning_parts.append(
+                f"Additional red-flag symptoms: {', '.join(other_flags)}."
+            )
+
     if factors["high_complexity_conditions"]:
         reasoning_parts.append(
-            f"Patient has high-complexity conditions: {', '.join(factors['high_complexity_conditions'])}."
+            f"Patient has high-complexity conditions: "
+            f"{', '.join(factors['high_complexity_conditions'])}."
         )
     if factors["age_vulnerability"]:
-        reasoning_parts.append(f"Patient age ({age}) indicates elevated vulnerability.")
+        reasoning_parts.append(
+            f"Patient age ({age}) indicates elevated vulnerability "
+            f"(age risk contribution: {age_score:.2f})."
+        )
     if len(medications) >= 3:
-        reasoning_parts.append(f"Patient on {len(medications)} medications, indicating active management of multiple conditions.")
+        reasoning_parts.append(
+            f"Patient on {len(medications)} medications, indicating active "
+            f"management of multiple conditions."
+        )
     if len(diagnoses) >= 2:
         reasoning_parts.append(f"Patient has {len(diagnoses)} active diagnoses.")
 
@@ -1150,52 +1284,109 @@ def verify_audit_chain(db: Session, limit: int = 100) -> dict:
 def _compute_expected_rates_by_type(db: Session) -> dict:
     """Compute expected approval rates per benefit type from guideline criteria.
 
-    Guidelines WITH exclusion criteria predict lower approval rates (patients
-    may fail criteria). Guidelines WITHOUT criteria predict ~100% approval.
-    Expected rate = guidelines_without_exclusion / total_guidelines per type.
+    Constitution: rates should be evidence-based, derived from actual guideline
+    structure rather than hardcoded assumptions.
+
+    Analysis approach:
+    1. Count guidelines with explicit *approval* criteria (recommendation text
+       containing approve/recommend/indicated language).
+    2. Count guidelines with explicit *denial/exclusion* criteria
+       (contraindications, grade D, or criteria with restrictive language).
+    3. Classify remaining guidelines as neutral (no restrictive criteria).
+    4. Compute expected rate from the ratio:
+       - Approval-oriented guidelines predict high approval (~95%).
+       - Neutral guidelines (no criteria) predict moderate-high approval (~90%).
+       - Denial-oriented guidelines predict lower approval, weighted by grade:
+         Grade A/B restrictions are stricter (~60%), Grade C/I are looser (~75%).
     """
     expected = {}
     for bt_name, bt_enum in BENEFIT_TYPE_MAP.items():
-        total_guidelines = db.query(func.count(ClinicalGuideline.guideline_id)).filter(
-            and_(
-                ClinicalGuideline.is_active,
-                or_(
-                    ClinicalGuideline.benefit_type == bt_enum,
-                    ClinicalGuideline.benefit_type == BenefitTypeGuideline.all_types,
-                ),
-            )
-        ).scalar() or 0
-
-        if total_guidelines == 0:
-            expected[bt_name] = 87.0  # Fallback to industry average
-            continue
-
-        without_exclusion = db.query(func.count(ClinicalGuideline.guideline_id)).filter(
-            and_(
-                ClinicalGuideline.is_active,
-                or_(
-                    ClinicalGuideline.benefit_type == bt_enum,
-                    ClinicalGuideline.benefit_type == BenefitTypeGuideline.all_types,
-                ),
-                or_(
-                    ClinicalGuideline.criteria is None,
-                    ClinicalGuideline.criteria == "",
-                ),
-            )
-        ).scalar() or 0
-
         # Try outcome-based rate first (Constitution: evidence-based, not hardcoded)
         outcome_based_rate = _get_outcome_based_rate(db, bt_enum)
         if outcome_based_rate is not None:
             expected[bt_name] = outcome_based_rate
             continue
 
-        # Fall back to guideline-structure-based estimate only if insufficient outcomes
-        with_criteria = total_guidelines - without_exclusion
-        expected_rate = (
-            (without_exclusion / total_guidelines) * 95.0
-            + (with_criteria / total_guidelines) * 75.0
-        )
+        # Fetch all active guidelines for this benefit type
+        guidelines = db.query(ClinicalGuideline).filter(
+            and_(
+                ClinicalGuideline.is_active,
+                or_(
+                    ClinicalGuideline.benefit_type == bt_enum,
+                    ClinicalGuideline.benefit_type == BenefitTypeGuideline.all_types,
+                ),
+            )
+        ).all()
+
+        if not guidelines:
+            expected[bt_name] = 87.0  # Fallback to industry average
+            continue
+
+        # Classify each guideline and compute its predicted approval rate
+        weighted_rate_sum = 0.0
+        weight_sum = 0.0
+
+        for g in guidelines:
+            has_criteria = bool(g.criteria and g.criteria.strip())
+            has_contraindications = bool(
+                g.contraindications and g.contraindications.strip()
+            )
+            rec_text = (g.recommendation or "").lower()
+            criteria_text = (g.criteria or "").lower()
+            grade_val = g.grade.value if g.grade else "ungraded"
+
+            # Evidence grade weight: higher-grade guidelines get more influence
+            grade_weight = {
+                "A": 2.0, "B": 1.5, "C": 1.0, "D": 1.5, "I": 0.5, "ungraded": 0.8,
+            }.get(grade_val, 0.8)
+
+            # Determine predicted approval rate for this guideline
+            is_denial_oriented = (
+                grade_val == "D"
+                or has_contraindications
+                or any(
+                    kw in criteria_text
+                    for kw in (
+                        "must not", "should not", "contraindicated",
+                        "not indicated", "not recommended", "excluded",
+                        "fail first", "step therapy required",
+                    )
+                )
+            )
+
+            is_approval_oriented = (
+                not is_denial_oriented
+                and any(
+                    kw in rec_text
+                    for kw in (
+                        "recommended", "indicated", "should receive",
+                        "is appropriate", "approved", "standard of care",
+                    )
+                )
+            )
+
+            if is_denial_oriented:
+                # Guidelines with restrictive criteria: predict lower approval
+                # Stronger evidence (A/B) means criteria are more strictly enforced
+                if grade_val in ("A", "B"):
+                    predicted_rate = 60.0
+                else:
+                    predicted_rate = 72.0
+            elif is_approval_oriented:
+                # Guidelines that actively recommend the service
+                predicted_rate = 96.0
+            elif has_criteria:
+                # Guidelines with criteria but not clearly restrictive or approving
+                # Criteria create a filter, predicting moderate approval
+                predicted_rate = 80.0
+            else:
+                # No criteria at all: service is generally available
+                predicted_rate = 93.0
+
+            weighted_rate_sum += predicted_rate * grade_weight
+            weight_sum += grade_weight
+
+        expected_rate = weighted_rate_sum / max(weight_sum, 0.01)
         expected[bt_name] = round(expected_rate, 1)
 
     return expected

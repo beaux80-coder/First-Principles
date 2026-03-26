@@ -15,12 +15,46 @@ from sqlalchemy.orm import Session
 from app.models.price_data import PriceData
 from app.models.provider import Provider
 from app.models.claim import Claim, ClaimStatus
+from app.models.audit_log import AuditLog
 
 logger = logging.getLogger(__name__)
 
 # Cache for percentile calculations (10-min TTL)
 _FEED_CACHE: dict = {}
 _FEED_CACHE_TTL = 600
+
+
+def _log_feed_interaction(
+    db: Session,
+    provider_npi: str,
+    service_code: str,
+    action: str,
+    sections_viewed: list[str],
+) -> None:
+    """Record that a provider accessed their intelligence feed.
+
+    Uses AuditLog for persistent interaction tracking — feeds F8.
+    """
+    try:
+        entry = AuditLog(
+            actor=f"provider:{provider_npi}",
+            action=action,
+            resource_type="provider_intelligence_feed",
+            resource_id=f"{provider_npi}:{service_code}",
+            details={
+                "provider_npi": provider_npi,
+                "service_code": service_code,
+                "sections_viewed": sections_viewed,
+                "timestamp": datetime.now(UTC).isoformat(),
+            },
+        )
+        db.add(entry)
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning(
+            "Failed to log feed interaction for provider %s", provider_npi
+        )
 
 
 def generate_provider_feed(
@@ -78,6 +112,21 @@ def generate_provider_feed(
     }
 
     _FEED_CACHE[cache_key] = {"data": feed, "ts": time.time()}
+
+    # Log that the provider accessed their intelligence feed
+    _log_feed_interaction(
+        db,
+        provider_npi=provider_npi,
+        service_code=service_code,
+        action="view_provider_feed",
+        sections_viewed=[
+            "price_position",
+            "outcome_position",
+            "volume_data",
+            "volume_projection",
+        ],
+    )
+
     return feed
 
 
@@ -132,7 +181,7 @@ def generate_cross_metro_arbitrage(
                 "price_differential": round(float(provider_avg or 0) - float(row.avg_price), 2) if provider_avg else None,
             })
 
-    return {
+    result = {
         "provider_npi": provider_npi,
         "service_code": service_code,
         "provider_state": provider_state,
@@ -145,6 +194,17 @@ def generate_cross_metro_arbitrage(
         ),
         "feeding_f8": True,
     }
+
+    # Log that the provider accessed cross-metro arbitrage data
+    _log_feed_interaction(
+        db,
+        provider_npi=provider_npi,
+        service_code=service_code,
+        action="view_cross_metro_arbitrage",
+        sections_viewed=["lower_priced_metros", "volume_at_risk"],
+    )
+
+    return result
 
 
 def _calculate_price_percentile(

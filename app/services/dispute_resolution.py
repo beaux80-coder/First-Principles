@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 
 from app.models.dispute import Dispute, DisputeType, DisputeStatus
 from app.models.price_data import PriceData
+from app.models.provider_notification import ProviderNotification
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,26 @@ def auto_resolve(db: Session, dispute_id: str) -> dict:
         .all()
     )
 
+    # Look up pre-service confirmation (ProviderNotification) for this claim
+    pre_service_confirmation = (
+        db.query(ProviderNotification)
+        .filter(ProviderNotification.claim_id == dispute.claim_id)
+        .order_by(ProviderNotification.sent_at.desc())
+        .first()
+    )
+
+    pre_service_data = None
+    if pre_service_confirmation:
+        pre_service_data = {
+            "notification_id": str(pre_service_confirmation.notification_id),
+            "confirmed_amount": float(pre_service_confirmation.confirmed_amount),
+            "payment_method": pre_service_confirmation.payment_method,
+            "status": pre_service_confirmation.status.value if pre_service_confirmation.status else None,
+            "sent_at": pre_service_confirmation.sent_at.isoformat() if pre_service_confirmation.sent_at else None,
+            "confirmed_at": pre_service_confirmation.confirmed_at.isoformat() if pre_service_confirmation.confirmed_at else None,
+            "expected_payment_timeline": pre_service_confirmation.expected_payment_timeline,
+        }
+
     price_trail = [
         {
             "source": p.source.value if p.source else "unknown",
@@ -88,6 +109,15 @@ def auto_resolve(db: Session, dispute_id: str) -> dict:
         }
         for p in published_prices
     ]
+
+    # Include pre-service confirmation in price trail if available
+    if pre_service_data:
+        price_trail.append({
+            "source": "pre_service_confirmation",
+            "price": pre_service_data["confirmed_amount"],
+            "channel": "provider_notification",
+            "ingested_at": pre_service_data["sent_at"],
+        })
 
     # Resolution logic
     resolution = None
@@ -151,6 +181,7 @@ def auto_resolve(db: Session, dispute_id: str) -> dict:
         "resolution": resolution,
         "resolution_method": resolution_method,
         "price_trail": price_trail,
+        "pre_service_confirmation": pre_service_data,
         "published_price_reference": dispute.published_price_reference,
         "feeding_f8": True,
     }

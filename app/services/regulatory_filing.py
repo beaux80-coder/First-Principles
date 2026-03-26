@@ -1084,6 +1084,249 @@ def generate_renewal_reminder(db: Session, state: str) -> dict:
     }
 
 
+# ── TPA License Status Tracking (F11 Q14) ────────────────────────────────────
+
+
+class TPALicense:
+    """In-memory TPA license status record.
+
+    In production, this would be a SQLAlchemy model persisted to the database.
+    For now, it provides the structure for tracking license status per state.
+
+    Fields tracked:
+        state: Two-letter state code
+        license_number: Issued license/registration number
+        obtained_date: Date the license was obtained
+        expiry_date: Date the license expires
+        renewal_deadline: Date by which renewal must be filed (typically 30-90 days before expiry)
+        status: Current license status (active, expired, pending_renewal, applied, not_obtained)
+    """
+
+    VALID_STATUSES = ("active", "expired", "pending_renewal", "applied", "not_obtained")
+
+    def __init__(
+        self,
+        state: str,
+        license_number: str = "",
+        obtained_date: str = "",
+        expiry_date: str = "",
+        renewal_deadline: str = "",
+        status: str = "not_obtained",
+    ):
+        self.state = state.upper()
+        self.license_number = license_number
+        self.obtained_date = obtained_date
+        self.expiry_date = expiry_date
+        self.renewal_deadline = renewal_deadline
+        self.status = status if status in self.VALID_STATUSES else "not_obtained"
+
+    def to_dict(self) -> dict:
+        return {
+            "state": self.state,
+            "license_number": self.license_number,
+            "obtained_date": self.obtained_date,
+            "expiry_date": self.expiry_date,
+            "renewal_deadline": self.renewal_deadline,
+            "status": self.status,
+        }
+
+
+# In-memory license store — in production, this would be a DB table.
+_tpa_license_store: dict[str, TPALicense] = {}
+
+
+def _init_license_store():
+    """Pre-populate the license store with known states from STATE_TPA_REQUIREMENTS."""
+    global _tpa_license_store
+    if not _tpa_license_store:
+        for state_code in STATE_TPA_REQUIREMENTS:
+            _tpa_license_store[state_code] = TPALicense(state=state_code)
+
+
+def check_license_status(state: str) -> dict:
+    """Check the current TPA license status for a specific state.
+
+    Constitution F11 Q14: Track TPA licensing status per state to ensure
+    continuous compliance with state insurance department requirements.
+
+    Args:
+        state: Two-letter state code (e.g., 'CA', 'TX')
+
+    Returns:
+        License status dict with current status, dates, and requirements.
+    """
+    _init_license_store()
+    state = state.upper()
+
+    license_record = _tpa_license_store.get(state)
+    requirements = STATE_TPA_REQUIREMENTS.get(state)
+    now = datetime.now(UTC)
+
+    if not license_record:
+        return {
+            "state": state,
+            "status": "not_tracked",
+            "license_required": requirements["license_required"] if requirements else True,
+            "note": f"State {state} not in tracking system. Add via track_renewal_deadline().",
+        }
+
+    result = license_record.to_dict()
+
+    # Enrich with requirements data
+    if requirements:
+        result["regulatory_body"] = requirements["regulatory_body"]
+        result["license_type"] = requirements["license_type"]
+        result["governing_statute"] = requirements["statute"]
+        result["renewal_frequency_months"] = requirements["renewal_frequency_months"]
+        result["bond_required"] = requirements["bond_required"]
+        result["bond_amount"] = requirements["bond_amount"]
+
+    # Check if expired or approaching renewal
+    if license_record.expiry_date:
+        try:
+            expiry_dt = datetime.fromisoformat(license_record.expiry_date)
+            days_until_expiry = (expiry_dt - now).days
+            result["days_until_expiry"] = days_until_expiry
+            if days_until_expiry < 0:
+                result["status"] = "expired"
+                result["urgency"] = "critical"
+            elif days_until_expiry <= 30:
+                result["urgency"] = "critical"
+            elif days_until_expiry <= 60:
+                result["urgency"] = "high"
+            elif days_until_expiry <= 90:
+                result["urgency"] = "medium"
+            else:
+                result["urgency"] = "low"
+        except (ValueError, TypeError):
+            result["days_until_expiry"] = None
+            result["urgency"] = "unknown"
+
+    result["checked_at"] = now.isoformat()
+    return result
+
+
+def track_renewal_deadline(
+    state: str,
+    license_number: str,
+    obtained_date: str,
+    expiry_date: str,
+    renewal_deadline: str | None = None,
+    status: str = "active",
+) -> dict:
+    """Record or update TPA license information for a state.
+
+    Constitution F11 Q14: Persist license status per state for continuous
+    compliance tracking and automated renewal reminders.
+
+    Args:
+        state: Two-letter state code
+        license_number: Issued license/registration number
+        obtained_date: ISO date string when license was obtained
+        expiry_date: ISO date string when license expires
+        renewal_deadline: ISO date string for renewal filing deadline
+            (defaults to 90 days before expiry)
+        status: License status (active, pending_renewal, applied, etc.)
+
+    Returns:
+        Updated license record.
+    """
+    _init_license_store()
+    state = state.upper()
+
+    # If no renewal deadline provided, default to 90 days before expiry
+    if not renewal_deadline and expiry_date:
+        try:
+            expiry_dt = datetime.fromisoformat(expiry_date)
+            renewal_dt = expiry_dt - timedelta(days=90)
+            renewal_deadline = renewal_dt.strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            renewal_deadline = ""
+
+    license_record = TPALicense(
+        state=state,
+        license_number=license_number,
+        obtained_date=obtained_date,
+        expiry_date=expiry_date,
+        renewal_deadline=renewal_deadline or "",
+        status=status,
+    )
+
+    _tpa_license_store[state] = license_record
+
+    logger.info(
+        "TPA license tracked: state=%s, license=%s, status=%s, expiry=%s",
+        state, license_number, status, expiry_date,
+    )
+
+    result = license_record.to_dict()
+    result["tracked_at"] = datetime.now(UTC).isoformat()
+    result["message"] = f"TPA license for {state} tracked successfully."
+    return result
+
+
+def get_all_license_statuses() -> dict:
+    """Get TPA license status across all tracked states.
+
+    Constitution F11 Q14: Provide a comprehensive view of TPA licensing
+    compliance across all jurisdictions where the platform operates.
+
+    Returns:
+        Dict with per-state license status and overall compliance summary.
+    """
+    _init_license_store()
+    now = datetime.now(UTC)
+
+    statuses = {}
+    summary = {
+        "active": 0,
+        "expired": 0,
+        "pending_renewal": 0,
+        "applied": 0,
+        "not_obtained": 0,
+        "renewal_urgent": [],  # states needing renewal within 90 days
+    }
+
+    for state_code, license_record in sorted(_tpa_license_store.items()):
+        status = check_license_status(state_code)
+        statuses[state_code] = status
+
+        license_status = status.get("status", "not_obtained")
+        if license_status in summary:
+            summary[license_status] += 1
+
+        urgency = status.get("urgency", "")
+        if urgency in ("critical", "high", "medium"):
+            summary["renewal_urgent"].append({
+                "state": state_code,
+                "urgency": urgency,
+                "days_until_expiry": status.get("days_until_expiry"),
+                "expiry_date": status.get("expiry_date", ""),
+            })
+
+    total_tracked = len(_tpa_license_store)
+    total_active = summary["active"]
+
+    return {
+        "checked_at": now.isoformat(),
+        "total_states_tracked": total_tracked,
+        "total_states_in_requirements": len(STATE_TPA_REQUIREMENTS),
+        "compliance_summary": {
+            **summary,
+            "compliance_rate": (
+                round(total_active / total_tracked * 100, 1)
+                if total_tracked > 0 else 0.0
+            ),
+        },
+        "per_state": statuses,
+        "action_required": (
+            f"{len(summary['renewal_urgent'])} state(s) need renewal attention"
+            if summary["renewal_urgent"]
+            else "All tracked licenses current"
+        ),
+    }
+
+
 # ── Compliance Checklist ──────────────────────────────────────────────────────
 
 

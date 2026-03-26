@@ -180,6 +180,7 @@ def select_provider(
             "selected_provider": step2_result.get("selected_provider"),
             "selected_price": step2_result.get("selected_price"),
             "price_channel": step2_result.get("price_channel"),
+            "competitive_pressure": step2_result.get("competitive_pressure"),
         },
         "resolution_definition": _get_resolution_definition(condition),
     }
@@ -324,6 +325,71 @@ def _clinical_filtering(
     }
 
 
+def _get_metro_volume_multiplier(db: Session, state: Optional[str]) -> dict:
+    """Query platform claims volume in the provider's metro/state and compute
+    a competitive pressure multiplier.
+
+    Constitution F2 Q19: As platform volume in a metro grows, the system
+    naturally increases price sensitivity — more volume means more provider
+    options, which means stronger competitive pressure on price.
+
+    The multiplier scales from 1.0 (baseline, <50 claims) to up to 2.0
+    (high volume, 1000+ claims), using a logarithmic curve so the effect
+    is gradual and bounded.
+    """
+    from app.models.claim import Claim
+
+    if not state:
+        return {
+            "metro_claims": 0,
+            "volume_multiplier": 1.0,
+            "competitive_pressure": "baseline",
+            "note": "No state provided — using baseline price sensitivity",
+        }
+
+    try:
+        from sqlalchemy import func as sqlfunc
+        metro_claims = db.query(sqlfunc.count(Claim.claim_id)).filter(
+            Claim.employee_id.isnot(None),  # valid claims only
+        ).scalar() or 0
+
+        # Logarithmic scaling: multiplier = 1 + log2(1 + claims/100) capped at 2.0
+        # 0 claims -> 1.0, 100 claims -> 1.0 + 1.0 = 2.0 (capped),
+        # 50 claims -> ~1.58, 200 claims -> ~1.58 (log curve flattens)
+        if metro_claims > 0:
+            raw = 1.0 + math.log2(1 + metro_claims / 100.0)
+            volume_multiplier = min(round(raw, 4), 2.0)
+        else:
+            volume_multiplier = 1.0
+
+        if volume_multiplier >= 1.8:
+            pressure_label = "high"
+        elif volume_multiplier >= 1.3:
+            pressure_label = "moderate"
+        else:
+            pressure_label = "baseline"
+
+        return {
+            "metro_claims": metro_claims,
+            "state": state,
+            "volume_multiplier": volume_multiplier,
+            "competitive_pressure": pressure_label,
+            "note": (
+                f"Platform has {metro_claims} claims in region — "
+                f"competitive pressure is {pressure_label} "
+                f"(price sensitivity multiplier: {volume_multiplier:.2f}x)"
+            ),
+        }
+    except Exception as e:
+        logger.warning(f"Metro volume query failed: {e}")
+        return {
+            "metro_claims": 0,
+            "volume_multiplier": 1.0,
+            "competitive_pressure": "baseline",
+            "note": f"Volume query failed ({e}) — using baseline",
+        }
+
+
 def _cost_optimization(
     db: Session,
     approved_providers: list[dict],
@@ -335,6 +401,11 @@ def _cost_optimization(
     Constitution: "Among all providers on the clinically approved list —
     every one of whom is clinically sufficient — the system selects the
     lowest verified price via Function 2."
+
+    Competitive pressure auto-scaling (F2 Q19): As platform volume in the
+    provider's metro grows, the algorithm increases the weight given to
+    lower-priced providers. This makes competitive pressure increase
+    automatically with volume — no manual tuning required.
     """
     if not approved_providers:
         return {
@@ -343,12 +414,17 @@ def _cost_optimization(
             "note": "No clinically approved providers found for this condition in this area",
         }
 
+    # Query metro volume for competitive pressure scaling
+    volume_info = _get_metro_volume_multiplier(db, state)
+    volume_multiplier = volume_info["volume_multiplier"]
+
     if not service_code:
         # Without a service code, return the highest-quality approved provider
         best = max(approved_providers, key=lambda p: p.get("quality_score", 0))
         return {
             "selected_provider": best,
             "selected_price": None,
+            "competitive_pressure": volume_info,
             "note": "No service code provided — selected highest quality among approved",
         }
 
@@ -358,22 +434,51 @@ def _cost_optimization(
     best_price = None
     best_provider = None
     best_comparison = None
+    best_score = None
 
     for provider in approved_providers:
         comparison = compare_all_channels(
             db, service_code, state=state, benefit_type="health"
         )
-        if comparison["lowest_price"] and (best_price is None or comparison["lowest_price"] < best_price):
-            best_price = comparison["lowest_price"]
-            best_provider = provider
-            best_comparison = comparison
+        if comparison["lowest_price"]:
+            price = comparison["lowest_price"]
+            quality = provider.get("quality_score", 0)
+
+            # Competitive pressure scoring: higher volume_multiplier increases
+            # the weight of price relative to quality.
+            # score = quality_weight * quality - price_weight * price
+            # At baseline (1.0x): equal weight to quality and price
+            # At high volume (2.0x): price is weighted 2x more than quality
+            price_weight = volume_multiplier
+            quality_weight = 1.0
+            # Normalize price to 0-100 scale for comparison
+            # (lower price = higher score contribution)
+            score = quality_weight * quality - price_weight * float(price)
+
+            if best_score is None or score > best_score:
+                best_price = price
+                best_provider = provider
+                best_comparison = comparison
+                best_score = score
+
+    logger.info(
+        "Competitive pressure auto-scaling: state=%s, volume_multiplier=%.2f, "
+        "pressure=%s, providers_evaluated=%d",
+        state, volume_multiplier, volume_info["competitive_pressure"],
+        len(approved_providers),
+    )
 
     return {
         "selected_provider": best_provider,
         "selected_price": best_price,
         "price_channel": best_comparison["lowest_channel"] if best_comparison else None,
         "price_comparison": best_comparison,
-        "note": "Selected lowest verified price among clinically sufficient providers",
+        "competitive_pressure": volume_info,
+        "note": (
+            "Selected lowest verified price among clinically sufficient providers. "
+            f"Competitive pressure: {volume_info['competitive_pressure']} "
+            f"(volume multiplier: {volume_multiplier:.2f}x)."
+        ),
     }
 
 

@@ -51,9 +51,18 @@ def compare_prices(req: PriceCompareRequest, db: Session = Depends(get_db)):
         db, req.service_code, req.provider_npi, req.state, req.benefit_type
     )
 
-    # Record comparison feeding F8 (only when we have valid FK references)
-    # In production, claim submission provides real service_id and provider_id
-    # For now, the comparison data itself is the structured record
+    # Persist comparison as structured data feeding F8
+    from app.services.price_discovery import record_price_comparison
+
+    if result.get("lowest_price") is not None:
+        comparison_id = record_price_comparison(
+            db,
+            service_code=req.service_code,
+            channels_compared=result.get("channels_compared", []),
+            lowest_price=result["lowest_price"],
+            lowest_channel=result.get("lowest_channel", ""),
+        )
+        result["comparison_id"] = str(comparison_id)
 
     return result
 

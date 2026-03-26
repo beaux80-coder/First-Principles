@@ -401,6 +401,7 @@ def compute_benchmark(
             "top_rated_hospitals": price_stats["top_rated_hospitals"],
         },
         "cross_type_insights": _get_cross_type_insights(db, state),
+        "research_publications": _get_research_findings(db),
         "data_quality": {
             "price_data_points_in_state": price_stats["total_state_records"],
             "national_pharmacy_records": price_stats["pharmacy_records"],
@@ -454,6 +455,43 @@ def _get_cross_type_insights(db: Session, state: str | None) -> dict:
             "each benefit type separately can replicate this intelligence."
         ),
     }
+
+
+def _get_research_findings(db: Session) -> dict:
+    """Pull aggregate anonymized research findings into benchmark output.
+
+    Constitution requirement: "Publishes aggregate, anonymized findings
+    regularly as industry research." The benchmark is a downstream consumer
+    of these aggregate insights — they add credibility and context.
+    """
+    from app.services.research_publications import generate_research_report
+
+    try:
+        report = generate_research_report(db)
+        # Extract a summary of findings for the benchmark — not the full report
+        findings_summary = []
+        for finding in report.get("findings", []):
+            findings_summary.append({
+                "title": finding.get("title"),
+                "category": finding.get("category"),
+                "insight": finding.get("insight"),
+                "source": finding.get("source"),
+            })
+
+        return {
+            "generated_at": report.get("generated_at"),
+            "total_findings": len(findings_summary),
+            "findings_summary": findings_summary,
+            "methodology": report.get("methodology"),
+            "disclaimer": report.get("disclaimer"),
+        }
+    except Exception as e:
+        logger.warning("Failed to generate research findings for benchmark: %s", e)
+        return {
+            "total_findings": 0,
+            "findings_summary": [],
+            "note": "Research publications unavailable — benchmark data unaffected.",
+        }
 
 
 # ---------------------------------------------------------------------------
