@@ -22,12 +22,10 @@ import logging
 import uuid
 from abc import ABC, abstractmethod
 from datetime import datetime, UTC, timedelta
-from typing import Any
 
 from sqlalchemy.orm import Session
 
 from app.models.employee import Employee, EmployeeStatus
-from app.models.employer import Employer
 from app.models.service import BenefitType
 
 logger = logging.getLogger(__name__)

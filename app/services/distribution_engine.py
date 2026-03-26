@@ -16,18 +16,16 @@ This engine automates:
 
 import logging
 import math
-import uuid
 from datetime import datetime, UTC
-from typing import Optional
 
-from sqlalchemy import func, and_, text, distinct
+from sqlalchemy import func, and_, distinct
 from sqlalchemy.orm import Session
 
 from app.models.price_data import PriceData, PriceSource
 from app.models.employer import Employer, EmployerStatus
 from app.models.employee import Employee, EmployeeStatus
 from app.models.benchmark_query import BenchmarkQuery, BenchmarkStage
-from app.models.claim import Claim, ClaimStatus, ClaimMode
+from app.models.claim import Claim, ClaimMode
 
 logger = logging.getLogger(__name__)
 
@@ -306,7 +304,7 @@ def _analyze_topic(db: Session, topic: str, states: list, state_filter) -> dict:
         return _topic_employer_overpayment(db, states, state_filter)
     else:
         return {
-            "title": f"General Price Analysis",
+            "title": "General Price Analysis",
             "findings": [{"note": f"Topic '{topic}' not recognized. Use: hospital_pricing, pharmacy_costs, mental_health_access, price_variation, employer_overpayment."}],
         }
 
@@ -830,7 +828,7 @@ def generate_broker_specific_content(
         annual_spend = industry_pepm * size * 12
         overhead = annual_spend * INDUSTRY_COST_BREAKDOWN["carrier_overhead_pct"]
         waste = annual_spend * INDUSTRY_COST_BREAKDOWN["waste_pct"]
-        broker_comm = annual_spend * INDUSTRY_COST_BREAKDOWN["broker_commission_pct"]
+        annual_spend * INDUSTRY_COST_BREAKDOWN["broker_commission_pct"]
         estimated_savings = overhead + waste + (annual_spend * price_gap_pct / 100 * 0.5)
         savings_models.append({
             "employee_count": size,
@@ -1049,7 +1047,7 @@ def run_distribution_optimization(db: Session) -> dict:
     optimization_actions = []
 
     for channel, config in CHANNEL_WEIGHTS.items():
-        base_rate = config["conversion_rate"]
+        config["conversion_rate"]
         current_weight = config["initial_weight"]
 
         # Adjust weight based on funnel performance

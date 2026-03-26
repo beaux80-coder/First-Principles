@@ -38,7 +38,7 @@ from app.services.cross_type_analytics import (
     generate_cross_type_signals,
     BENEFIT_TYPE_PREFIXES,
 )
-from app.services.ml_models import price_regression_by_state, provider_clustering
+from app.services.ml_models import price_regression_by_state
 
 logger = logging.getLogger(__name__)
 
@@ -379,7 +379,6 @@ def _train_ensemble(
         )
         gs.fit(X_scaled, y)
         model = gs.best_estimator_
-        best_params = gs.best_params_
     else:
         model = GradientBoostingRegressor(
             n_estimators=200,
@@ -390,7 +389,6 @@ def _train_ensemble(
             random_state=42,
         )
         model.fit(X_scaled, y)
-        best_params = {"n_estimators": 200, "max_depth": 4, "learning_rate": 0.1, "subsample": 0.8}
 
     # Store scaler alongside model for inference
     model._scaler = scaler  # type: ignore
@@ -550,10 +548,13 @@ def _predict_from_public_data(
 
     for bt in selected_types:
         base_pepm = _NATIONAL_AVG_PEPM.get(bt.value, 50.0)
-        # Apply wider confidence interval for public-data-only prediction
-        ci = _compute_confidence_interval(
-            base_pepm, confidence_width_pct=0.40
-        )
+        # Wider confidence interval for public-data-only prediction (40%)
+        margin = base_pepm * 0.40
+        ci = {
+            "lower": round(max(base_pepm - margin, 0), 2),
+            "upper": round(base_pepm + margin, 2),
+            "confidence_pct": 60.0,
+        }
         monthly = base_pepm
         annual = base_pepm * 12
         aggregate_monthly += monthly

@@ -18,7 +18,6 @@ from app.models.audit_log import AuditLog
 from app.models.security import (
     BreachIncident,
     IncidentStatus,
-    Severity,
 )
 
 logger = logging.getLogger(__name__)
@@ -584,7 +583,7 @@ def generate_breach_notification(db: Session, incident_id: str) -> dict:
         notification_plan["notifications"].append({
             "recipient": "HHS_Annual_Log",
             "type": "annual_breach_log",
-            "deadline": f"Within 60 days of end of calendar year in which breach discovered",
+            "deadline": "Within 60 days of end of calendar year in which breach discovered",
             "status": "logged",
             "note": "Breaches affecting fewer than 500 individuals reported annually to HHS",
         })

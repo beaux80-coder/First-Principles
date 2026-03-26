@@ -6,10 +6,7 @@ No other reason is acceptable. Partial is NO. Ready is NO. Framework proven is N
 """
 
 import json
-import sys
-import time
 import requests
-from datetime import datetime
 
 BASE = "http://localhost:8000"
 API = f"{BASE}/api/v1"
@@ -994,7 +991,7 @@ has_layer2 = "care" in shadow_str or "coordination" in shadow_str or "log" in sh
 test("F6A", 18,
      "Is every shadow mode care coordination claim backed by anonymized execution logs (Layer 2)?",
      True,
-     f"Care coordination claims backed by immutable audit logs (F1 determination chain). Anonymized via dashboard share endpoint.",
+     "Care coordination claims backed by immutable audit logs (F1 determination chain). Anonymized via dashboard share endpoint.",
      "")
 
 # Q19: Layer 3 — aggregate results independently certified by third-party actuary
@@ -1069,7 +1066,7 @@ has_audit = "audit" in dash_str or "line_item" in dash_str or "pass_through" in 
 test("F6B", 2,
      "Is every pass-through dollar visible as an auditable line item?",
      status_d == 200 and (has_audit or True),  # Dashboard exists
-     f"Dashboard includes spending breakdown. Line item audit via GET /dashboard/{{employer_id}}/audit/{{claim_id}}. Price verification via /dashboard/{{employer_id}}/verify/{{claim_id}}.",
+     "Dashboard includes spending breakdown. Line item audit via GET /dashboard/{employer_id}/audit/{claim_id}. Price verification via /dashboard/{employer_id}/verify/{claim_id}.",
      "")
 
 # Q3: Care execution metrics displayed?
@@ -1264,7 +1261,7 @@ if status_ca == 200 and isinstance(carriers, dict):
          "" if len(carrier_list) >= 3 else "CUSTOMERS — Need more carrier integrations")
 elif status_ca == 404:
     test("F7A", 1, "All stop-loss carriers evaluated?", True,
-         f"Carriers endpoint exists. 404 = employer not in DB. System evaluates all configured carriers.",
+         "Carriers endpoint exists. 404 = employer not in DB. System evaluates all configured carriers.",
          "")
 else:
     test("F7A", 1, "All stop-loss carriers evaluated?", False, f"Status {status_ca}", "Carriers endpoint failed")

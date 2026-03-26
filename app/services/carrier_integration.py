@@ -13,7 +13,6 @@ import enum
 import logging
 import uuid
 from datetime import datetime, UTC
-from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -346,7 +345,7 @@ class FHIRR4Adapter(BaseCarrierAdapter):
 
         # Provider reference
         provider_ref = fhir_resource.get("provider", {}).get("identifier", {})
-        provider_npi = provider_ref.get("value", "")
+        provider_ref.get("value", "")
 
         # Total amount
         total = fhir_resource.get("total", {}).get("value", 0.0)
@@ -375,7 +374,7 @@ class FHIRR4Adapter(BaseCarrierAdapter):
                 benefit_type = "health"
 
         # Service date
-        service_date_str = fhir_resource.get("created", "")
+        fhir_resource.get("created", "")
 
         return NormalisedCarrierClaim(
             carrier_claim_id=claim_id,

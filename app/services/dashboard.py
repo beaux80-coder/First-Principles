@@ -12,17 +12,16 @@ import logging
 import uuid
 from datetime import datetime, UTC
 
-from sqlalchemy import func, and_
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.models.claim import Claim, ClaimStatus, ClaimMode
+from app.models.claim import Claim, ClaimStatus
 from app.models.employer import Employer
 from app.models.employee import Employee, EmployeeStatus
 from app.models.care_episode import CareEpisode, EpisodeStatus
 from app.models.service import BenefitType
 from app.services.benchmark import (
     NATIONAL_AVG_PEPM,
-    BENEFIT_TYPE_ALLOCATION,
 )
 
 logger = logging.getLogger(__name__)
@@ -237,7 +236,7 @@ def get_line_item_audit(
     determination, price comparison, adjudication decision, payment,
     and all associated reasoning.
     """
-    employer = _get_employer_or_raise(db, employer_id)
+    _get_employer_or_raise(db, employer_id)
 
     claim = db.query(Claim).filter(
         Claim.claim_id == claim_id,
@@ -485,7 +484,6 @@ def _get_care_execution_metrics(db: Session, employer_id: uuid.UUID) -> dict:
     appointments scheduled, referrals coordinated, prescriptions routed,
     follow-ups completed — all without employee action."
     """
-    from app.models.care_episode import CareEpisode, EpisodeStatus
 
     # CareEpisode links through employee_id, join to get employer's episodes
     employer_episodes = db.query(CareEpisode).join(

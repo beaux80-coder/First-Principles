@@ -11,7 +11,6 @@ Every dispute and resolution recorded as structured data feeding F8.
 import logging
 from datetime import datetime, UTC
 
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.dispute import Dispute, DisputeType, DisputeStatus

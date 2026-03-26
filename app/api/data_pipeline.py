@@ -1,9 +1,8 @@
 """Data pipeline API endpoints for managing public data ingestion."""
 
 import logging
-from datetime import datetime, UTC
 
-from fastapi import APIRouter, BackgroundTasks, Depends, UploadFile, File, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, UploadFile, File
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user
@@ -16,9 +15,6 @@ from app.services.data_ingestion import (
     get_ingestion_stats,
 )
 from app.services.data_downloaders import (
-    download_nadac,
-    download_medicare_pfs,
-    download_hospital_transparency,
     download_hospital_compare,
     download_physician_quality,
     match_quality_to_providers,
@@ -279,7 +275,7 @@ def goodrx_status(db: Session = Depends(get_db)):
 
     Shows scraped prices, comparison results vs NADAC, and any barriers.
     """
-    from app.services.goodrx_scraper import scrape_goodrx_batch, TOP_PRESCRIBED_DRUGS
+    from app.services.goodrx_scraper import TOP_PRESCRIBED_DRUGS
     from app.models.price_data import PriceData, PriceSource
     from app.models.data_pipeline_metric import DataPipelineMetric
     from sqlalchemy import func

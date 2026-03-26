@@ -280,7 +280,7 @@ def validate_employer_improvement(db: Session, employer_id: str) -> dict:
     ).scalar() or 0
 
     # Price data verified by this employer's claims
-    price_data_points = db.query(func.count(PriceData.price_id)).filter(
+    db.query(func.count(PriceData.price_id)).filter(
         PriceData.provider_npi.isnot(None),
     ).scalar() or 0
 
@@ -594,7 +594,6 @@ def detect_model_bias(db: Session) -> dict:
     total_dets = db.query(func.count(ClinicalDetermination.determination_id)).scalar() or 0
 
     if total_dets > 0:
-        from sqlalchemy import case
         approval_by_type = db.execute(text(
             "SELECT benefit_type, "
             "COUNT(*) as total, "

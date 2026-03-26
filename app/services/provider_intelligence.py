@@ -9,12 +9,11 @@ import logging
 import time
 from datetime import datetime, UTC
 
-from sqlalchemy import func, and_
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.price_data import PriceData
 from app.models.provider import Provider
-from app.models.care_episode import CareEpisode
 from app.models.claim import Claim, ClaimStatus
 
 logger = logging.getLogger(__name__)
@@ -221,7 +220,7 @@ def _calculate_volume_data(
 ) -> dict:
     """Platform volume received vs total available."""
     provider_claims = db.query(func.count(Claim.claim_id)).filter(
-        Claim.provider_id != None,
+        Claim.provider_id is not None,
         Claim.status.in_([ClaimStatus.approved, ClaimStatus.paid]),
     ).scalar() or 0
 

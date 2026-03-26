@@ -11,12 +11,11 @@ more, and earn zero when savings are zero.
 
 import logging
 import uuid
-from datetime import datetime, UTC
 
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.models.broker import Broker, BrokerActivation, BrokerStatus
+from app.models.broker import Broker, BrokerActivation
 from app.models.employer import Employer
 from app.models.employee import Employee, EmployeeStatus
 from app.services.pricing_engine import VALUE_SHARE_PCT

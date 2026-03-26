@@ -299,7 +299,6 @@ def get_shadow_report(db: Session, employer_id: uuid.UUID) -> dict:
     total_billed = 0.0
     total_system_paid = 0.0
     total_carrier_est = 0.0
-    total_oop_eliminated = 0.0
     benefit_type_agg: dict[str, dict] = {}
     auto_count = 0
     adjudicated_count = 0

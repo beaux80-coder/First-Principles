@@ -34,7 +34,6 @@ import uuid
 from datetime import datetime, timedelta, UTC
 from typing import Optional
 
-from sqlalchemy import and_
 from sqlalchemy.orm import Session
 
 from app.models.appeal import (

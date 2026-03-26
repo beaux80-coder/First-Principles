@@ -8,7 +8,6 @@ the confirmed payment amount, payment method, and expected timeline.
 import logging
 from datetime import datetime, UTC
 
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.provider_notification import ProviderNotification, NotificationStatus

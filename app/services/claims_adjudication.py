@@ -16,12 +16,11 @@ import logging
 import time
 import uuid
 from datetime import datetime, UTC
-from typing import Optional
 
 from sqlalchemy import func, and_
 from sqlalchemy.orm import Session
 
-from app.models.claim import Claim, ClaimStatus, ClaimMode
+from app.models.claim import Claim, ClaimStatus
 from app.models.service import BenefitType
 
 logger = logging.getLogger(__name__)
@@ -262,7 +261,6 @@ def _detect_duplicates(db: Session, claim: Claim) -> dict:
     Constitution: "Duplicates auto-detected."
     """
     # Window: same employee + provider + service + amount within 30 days
-    from sqlalchemy import and_
     from datetime import timedelta
 
     window_start = claim.submitted_at - timedelta(days=30)

@@ -18,9 +18,8 @@ executed — they are recorded as "shadow" outcomes for comparison.
 import logging
 import uuid
 from datetime import datetime, UTC
-from typing import Any
 
-from sqlalchemy import func, and_
+from sqlalchemy import and_
 from sqlalchemy.orm import Session
 
 from app.models.claim import Claim, ClaimStatus, ClaimMode

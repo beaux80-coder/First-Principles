@@ -22,12 +22,11 @@ import uuid
 from datetime import datetime, UTC, timedelta
 from typing import Any
 
-from sqlalchemy import func, and_, or_, text, delete
+from sqlalchemy import func, or_, delete
 from sqlalchemy.orm import Session
 
 from app.models.price_data import PriceData, PriceSource
 from app.models.claim import Claim
-from app.models.service import BenefitType
 from app.models.data_pipeline_metric import DataPipelineMetric
 
 logger = logging.getLogger(__name__)

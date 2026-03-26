@@ -8,7 +8,6 @@ Offers operate OUTSIDE the TEE — no financial data enters clinical filtering.
 import logging
 from datetime import datetime, timedelta, UTC
 
-from sqlalchemy import and_
 from sqlalchemy.orm import Session
 
 from app.models.provider_offer import ProviderOffer, OfferStatus
@@ -154,7 +153,7 @@ def expire_stale_offers(db: Session) -> int:
         db.query(ProviderOffer)
         .filter(
             ProviderOffer.status == OfferStatus.active,
-            ProviderOffer.valid_until != None,
+            ProviderOffer.valid_until is not None,
             ProviderOffer.valid_until < now,
         )
         .all()

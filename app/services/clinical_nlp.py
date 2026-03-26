@@ -158,7 +158,7 @@ def _ensure_bert_embeddings(db: Session, guideline_ids: list[str]) -> None:
     logger.info("Computing ClinicalBERT embeddings for guidelines...")
     embeddings = {}
     guidelines = db.query(ClinicalGuideline).filter(
-        ClinicalGuideline.is_active == True
+        ClinicalGuideline.is_active
     ).all()
 
     for g in guidelines:
@@ -209,7 +209,7 @@ def _ensure_model(db: Session) -> bool:
 
     from sqlalchemy import func
     current_count = db.query(func.count(ClinicalGuideline.guideline_id)).filter(
-        ClinicalGuideline.is_active == True
+        ClinicalGuideline.is_active
     ).scalar() or 0
 
     if current_count == _guideline_count and _vectorizer is not None:
@@ -244,7 +244,7 @@ def _ensure_model(db: Session) -> bool:
 
     # Load all active guidelines and train
     guidelines = db.query(ClinicalGuideline).filter(
-        ClinicalGuideline.is_active == True
+        ClinicalGuideline.is_active
     ).all()
 
     corpus = _build_guideline_corpus(guidelines)

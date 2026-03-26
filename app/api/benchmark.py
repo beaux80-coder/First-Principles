@@ -4,7 +4,7 @@ Function 6A, Stage 1: static benchmark showing employers what their benefits
 could look like under the system vs. what they have now.
 """
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 

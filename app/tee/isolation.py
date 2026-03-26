@@ -24,7 +24,6 @@ isolation boundary differs.
 """
 
 import hashlib
-import json
 import logging
 import os
 import time

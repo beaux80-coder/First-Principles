@@ -7,7 +7,7 @@ const API = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1'
 
 export default function BrokerPage() {
   const [loading, setLoading] = useState(false)
-  const [result, setResult] = useState<any>(null)
+  const [result, setResult] = useState<Record<string, unknown> | null>(null)
   const [form, setForm] = useState({
     employee_count: '',
     current_spend_pepm: '',

@@ -13,7 +13,7 @@ import base64
 import hashlib
 
 from cryptography.fernet import Fernet
-from sqlalchemy import String, Text
+from sqlalchemy import Text
 from sqlalchemy.types import TypeDecorator
 
 from app.config import settings

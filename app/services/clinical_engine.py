@@ -25,7 +25,7 @@ import time
 from datetime import datetime, UTC
 from typing import Optional
 
-from sqlalchemy import and_, or_, func, case
+from sqlalchemy import and_, or_, func
 from sqlalchemy.orm import Session
 
 from app.models.clinical_determination import ClinicalDetermination
@@ -176,7 +176,7 @@ def _find_matching_guidelines(
     bt = BENEFIT_TYPE_MAP.get(benefit_type, BenefitTypeGuideline.health)
 
     filters = [
-        ClinicalGuideline.is_active == True,
+        ClinicalGuideline.is_active,
         or_(
             ClinicalGuideline.benefit_type == bt,
             ClinicalGuideline.benefit_type == BenefitTypeGuideline.all_types,
@@ -196,7 +196,7 @@ def _find_matching_guidelines(
             db.query(ClinicalGuideline)
             .filter(
                 and_(
-                    ClinicalGuideline.is_active == True,
+                    ClinicalGuideline.is_active,
                     or_(
                         ClinicalGuideline.benefit_type == bt,
                         ClinicalGuideline.benefit_type == BenefitTypeGuideline.all_types,
@@ -274,7 +274,7 @@ def _evaluate_criteria(
         if has_relevant_dx:
             reasons.append(f"Patient has documented diagnosis matching condition '{guideline.condition}'")
         elif symptoms_text:
-            reasons.append(f"Patient symptoms present; clinical evaluation of service appropriateness indicated")
+            reasons.append("Patient symptoms present; clinical evaluation of service appropriateness indicated")
 
     # Red flags / urgency check
     if "red flag" in criteria_text:
@@ -472,8 +472,8 @@ def calibrate_risk_threshold(db: Session) -> float:
         ClinicalDetermination.decision,
         ClinicalDetermination.outcome_feedback,
     ).filter(
-        ClinicalDetermination.risk_score != None,
-        ClinicalDetermination.outcome_feedback != None,
+        ClinicalDetermination.risk_score is not None,
+        ClinicalDetermination.outcome_feedback is not None,
     ).all()
 
     if len(outcomes) < 20:
@@ -641,7 +641,6 @@ def make_determination(
     else:
         # Evaluate each matching guideline
         all_reasoning = []
-        any_approved = False
         any_denied = False
 
         for guideline in guidelines:
@@ -649,7 +648,7 @@ def make_determination(
             all_reasoning.append(f"[{guideline.title}] {reasoning_text}")
 
             if meets:
-                any_approved = True
+                pass
             else:
                 any_denied = True
 
@@ -1159,7 +1158,7 @@ def _compute_expected_rates_by_type(db: Session) -> dict:
     for bt_name, bt_enum in BENEFIT_TYPE_MAP.items():
         total_guidelines = db.query(func.count(ClinicalGuideline.guideline_id)).filter(
             and_(
-                ClinicalGuideline.is_active == True,
+                ClinicalGuideline.is_active,
                 or_(
                     ClinicalGuideline.benefit_type == bt_enum,
                     ClinicalGuideline.benefit_type == BenefitTypeGuideline.all_types,
@@ -1173,13 +1172,13 @@ def _compute_expected_rates_by_type(db: Session) -> dict:
 
         without_exclusion = db.query(func.count(ClinicalGuideline.guideline_id)).filter(
             and_(
-                ClinicalGuideline.is_active == True,
+                ClinicalGuideline.is_active,
                 or_(
                     ClinicalGuideline.benefit_type == bt_enum,
                     ClinicalGuideline.benefit_type == BenefitTypeGuideline.all_types,
                 ),
                 or_(
-                    ClinicalGuideline.criteria == None,
+                    ClinicalGuideline.criteria is None,
                     ClinicalGuideline.criteria == "",
                 ),
             )
@@ -1208,23 +1207,13 @@ def _get_outcome_based_rate(db: Session, benefit_type_enum) -> float | None:
     Returns the real-world approval rate for this benefit type based on
     determinations with outcome feedback, or None if insufficient data (<10).
     """
-    from app.models.clinical_guideline import BenefitTypeGuideline
 
     # Map service BenefitType to guideline BenefitTypeGuideline
-    bt_mapping = {
-        "health": BenefitTypeGuideline.health,
-        "dental": BenefitTypeGuideline.dental,
-        "vision": BenefitTypeGuideline.vision,
-        "mental_health": BenefitTypeGuideline.mental_health,
-        "life": BenefitTypeGuideline.life,
-        "std": BenefitTypeGuideline.all_types,
-        "ltd": BenefitTypeGuideline.all_types,
-    }
 
     bt_value = benefit_type_enum.value if hasattr(benefit_type_enum, 'value') else str(benefit_type_enum)
 
     total_with_outcome = db.query(func.count(ClinicalDetermination.determination_id)).filter(
-        ClinicalDetermination.outcome_feedback != None,
+        ClinicalDetermination.outcome_feedback is not None,
         ClinicalDetermination.benefit_type == bt_value,
     ).scalar() or 0
 
@@ -1239,12 +1228,12 @@ def _get_outcome_based_rate(db: Session, benefit_type_enum) -> float | None:
     approved_total = db.query(func.count(ClinicalDetermination.determination_id)).filter(
         ClinicalDetermination.decision == "approved",
         ClinicalDetermination.benefit_type == bt_value,
-        ClinicalDetermination.outcome_feedback != None,
+        ClinicalDetermination.outcome_feedback is not None,
     ).scalar() or 0
 
     # Expected rate = proportion of determinations that were approved
     # weighted by accuracy (correct outcomes)
-    accuracy = correct_outcomes / max(total_with_outcome, 1)
+    correct_outcomes / max(total_with_outcome, 1)
     approval_rate = approved_total / max(total_with_outcome, 1) * 100
 
     return round(approval_rate, 1)
@@ -1315,7 +1304,7 @@ def get_published_rates(db: Session) -> dict:
 
     # Accuracy metrics from outcome feedback
     outcomes_recorded = db.query(func.count(ClinicalDetermination.determination_id)).filter(
-        ClinicalDetermination.outcome_feedback != None
+        ClinicalDetermination.outcome_feedback is not None
     ).scalar() or 0
 
     accuracy_data = {}
@@ -1330,7 +1319,7 @@ def get_published_rates(db: Session) -> dict:
 
     # Latency metrics
     avg_latency = db.query(func.avg(ClinicalDetermination.latency_ms)).filter(
-        ClinicalDetermination.latency_ms != None
+        ClinicalDetermination.latency_ms is not None
     ).scalar()
 
     return {

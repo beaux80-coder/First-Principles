@@ -11,7 +11,6 @@ ACA 2719 requires: internal and external review options.
 import logging
 from datetime import datetime, timedelta, UTC
 
-from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
 

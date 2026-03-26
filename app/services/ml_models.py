@@ -14,7 +14,7 @@ import logging
 import time
 from collections import defaultdict
 
-from sqlalchemy import func, and_, or_
+from sqlalchemy import func, and_
 from sqlalchemy.orm import Session
 
 from app.models.price_data import PriceData, PriceSource

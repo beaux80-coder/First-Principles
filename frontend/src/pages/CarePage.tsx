@@ -66,7 +66,7 @@ export default function CarePage() {
   const [benefitType, setBenefitType] = useState('health')
   const [result, setResult] = useState<CareResult | null>(null)
   const [error, setError] = useState('')
-  const [episodes, setEpisodes] = useState<any[]>([])
+  const [episodes, setEpisodes] = useState<Record<string, unknown>[]>([])
 
   // TODO: Get from auth context
   const employeeId = '22222222-2222-2222-2222-222222222221'
@@ -96,8 +96,8 @@ export default function CarePage() {
       const data = await resp.json()
       setResult(data)
       setStep('result')
-    } catch (e: any) {
-      setError(e.message)
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Unknown error')
       setStep('describe')
     }
   }
@@ -109,7 +109,7 @@ export default function CarePage() {
         const data = await resp.json()
         setEpisodes(data.active_episodes || [])
       }
-    } catch {}
+    } catch (_) { /* ignore fetch errors for episode loading */ }
   }
 
   return (
@@ -199,7 +199,7 @@ export default function CarePage() {
           </button>
           {episodes.length > 0 && (
             <div className="mt-4 space-y-2">
-              {episodes.map((ep: any, i: number) => (
+              {episodes.map((ep: Record<string, unknown>, i: number) => (
                 <div key={i} className="border rounded-lg p-3 bg-gray-50">
                   <p className="font-medium">{ep.condition || 'Care episode'}</p>
                   <p className="text-sm text-gray-600">

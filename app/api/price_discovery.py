@@ -45,7 +45,7 @@ def compare_prices(req: PriceCompareRequest, db: Session = Depends(get_db)):
     Constitution completion test: "Is there any pricing channel that physically
     exists and is legally accessible that the system does not compare?"
     """
-    from app.services.price_discovery import compare_all_channels, record_price_comparison
+    from app.services.price_discovery import compare_all_channels
 
     result = compare_all_channels(
         db, req.service_code, req.provider_npi, req.state, req.benefit_type

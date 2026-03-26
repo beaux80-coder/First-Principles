@@ -19,12 +19,12 @@ import uuid
 import json
 from datetime import datetime, UTC, timedelta
 
-from sqlalchemy import func, and_
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.employer import Employer
 from app.models.employee import Employee, EmployeeStatus
-from app.models.claim import Claim, ClaimStatus
+from app.models.claim import Claim
 from app.models.service import BenefitType
 
 logger = logging.getLogger(__name__)
@@ -479,7 +479,7 @@ def configure_plan(
             - eligibility_rules: Eligibility criteria
             - contribution_strategy: Employer contribution approach
     """
-    employer = _get_employer_or_raise(db, employer_id)
+    _get_employer_or_raise(db, employer_id)
 
     benefit_types_enabled = plan_config.get(
         "benefit_types_enabled", ALL_BENEFIT_TYPES
@@ -1258,7 +1258,7 @@ def manage_payroll_deductions(
             demographics = {}
 
     elections = demographics.get("benefit_elections", {})
-    dependents = demographics.get("dependents", [])
+    demographics.get("dependents", [])
 
     # Build per-benefit-type deduction breakdown
     deduction_lines = {}

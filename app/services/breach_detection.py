@@ -8,7 +8,6 @@ through the incident response pipeline.
 """
 
 import logging
-import uuid
 from datetime import datetime, timedelta, UTC
 from collections import Counter, defaultdict
 

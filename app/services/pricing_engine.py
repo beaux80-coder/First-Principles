@@ -20,9 +20,8 @@ verified, auditable savings against an independently verifiable baseline.
 import logging
 import uuid
 from datetime import datetime, UTC
-from typing import Optional
 
-from sqlalchemy import func, and_
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.claim import Claim, ClaimStatus

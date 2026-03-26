@@ -24,16 +24,15 @@ The proof summary gives coverage metrics per layer.
 """
 
 import logging
-import uuid
 from datetime import datetime, UTC
 
-from sqlalchemy import func, and_, distinct
+from sqlalchemy import func, and_
 from sqlalchemy.orm import Session
 
 from app.models.claim import Claim, ClaimStatus, ClaimMode
 from app.models.benchmark_query import BenchmarkQuery, BenchmarkStage
 from app.models.price_data import PriceData
-from app.models.employer import Employer, EmployerStatus
+from app.models.employer import Employer
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +150,7 @@ def tag_proof_layer(
                 )
             elif not price_verified:
                 layer1_evidence.append(
-                    f"UNVERIFIED: No published prices found for this provider/service combination"
+                    "UNVERIFIED: No published prices found for this provider/service combination"
                 )
 
     layers[1] = {

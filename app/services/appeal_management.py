@@ -11,7 +11,6 @@ secured log with the same integrity as clinical determinations.
 import hashlib
 import json
 import logging
-import uuid
 from datetime import datetime, timedelta, UTC
 
 from sqlalchemy import func
@@ -19,7 +18,6 @@ from sqlalchemy.orm import Session
 
 from app.models.appeal import Appeal, AppealType, AppealStage, AppealStatus
 from app.models.claim import Claim, ClaimStatus
-from app.models.service import BenefitType
 
 logger = logging.getLogger(__name__)
 
