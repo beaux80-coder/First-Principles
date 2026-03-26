@@ -14,6 +14,9 @@ from app.services.payment import Payment
 from app.models.appeal import Appeal, AppealTimeline
 from app.models.provider_portal import ProviderAuthorization, ProviderDispute
 from app.models.security import BAARecord, BreachIncident, SecurityAssessment
+from app.models.provider_offer import ProviderOffer
+from app.models.dispute import Dispute
+from app.models.provider_notification import ProviderNotification
 
 __all__ = [
     "Employer",
@@ -36,4 +39,7 @@ __all__ = [
     "BAARecord",
     "BreachIncident",
     "SecurityAssessment",
+    "ProviderOffer",
+    "Dispute",
+    "ProviderNotification",
 ]

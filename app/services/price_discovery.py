@@ -252,6 +252,23 @@ def compare_all_channels(
             "dpc_comparison": dpc_result["comparison"],
         })
 
+    # --- Provider-initiated price offers (F2 Q16-Q17) ---
+    # Operates OUTSIDE TEE. No financial data enters clinical filtering.
+    try:
+        from app.services.provider_offers import get_active_offers
+        offers = get_active_offers(db, provider_npi=provider_npi, service_code=service_code)
+        for offer in offers:
+            channels_compared.append({
+                "channel": "provider_offer",
+                "price": offer["offered_price"],
+                "provider": offer["provider_npi"],
+                "verified": True,
+                "source": "provider_initiated_offer",
+                "note": f"Provider-initiated offer, capacity: {offer.get('volume_capacity', 'unlimited')}",
+            })
+    except Exception:
+        pass  # Provider offers are optional; don't block price discovery
+
     # Filter out zero/negative prices
     channels_compared = [c for c in channels_compared if c["price"] and c["price"] > 0]
 

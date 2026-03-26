@@ -11,6 +11,7 @@ from app.models import *  # noqa: F401,F403 — ensure all models are registered
 from app.api import health, benchmark, employers, data_pipeline, clinical, price_discovery, providers, cost_prediction, claims, pricing, care
 from app.api import shadow, dashboard, broker_channel, benefits_admin, carrier_integration
 from app.api import appeals, provider_portal, security_ops
+from app.api import provider_intelligence, provider_offers, disputes
 
 logging.basicConfig(level=logging.INFO)
 
@@ -66,3 +67,6 @@ app.include_router(carrier_integration.router, prefix="/api/v1")
 app.include_router(appeals.router, prefix="/api/v1")
 app.include_router(provider_portal.router, prefix="/api/v1")
 app.include_router(security_ops.router, prefix="/api/v1")
+app.include_router(provider_intelligence.router, prefix="/api/v1")
+app.include_router(provider_offers.router, prefix="/api/v1")
+app.include_router(disputes.router, prefix="/api/v1")

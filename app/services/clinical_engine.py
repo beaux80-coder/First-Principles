@@ -412,15 +412,20 @@ def _assess_meaningful_risk(
     if len(diagnoses) >= 2:
         reasoning_parts.append(f"Patient has {len(diagnoses)} active diagnoses.")
 
-    if total_risk >= 0.25:
+    # Use calibrated threshold from outcome data if available, else 0.25 default
+    threshold = _get_calibrated_risk_threshold()
+
+    if total_risk >= threshold:
         reasoning_parts.append(
-            f"Risk score: {total_risk:.2f}. Evidence supports meaningful risk of health "
+            f"Risk score: {total_risk:.2f} (threshold: {threshold:.2f}). "
+            f"Evidence supports meaningful risk of health "
             f"deterioration without the requested service. Service APPROVED based on "
             f"patient-specific clinical risk assessment."
         )
     else:
         reasoning_parts.append(
-            f"Risk score: {total_risk:.2f}. Evidence does not support meaningful risk of "
+            f"Risk score: {total_risk:.2f} (threshold: {threshold:.2f}). "
+            f"Evidence does not support meaningful risk of "
             f"health deterioration without the requested service. The patient's symptoms, "
             f"history, and available clinical evidence do not indicate that absence of this "
             f"service creates a clinically supported probability of health worsening. "
@@ -428,6 +433,81 @@ def _assess_meaningful_risk(
         )
 
     return total_risk, factors, " ".join(reasoning_parts)
+
+
+# Cache for calibrated risk threshold (recalculated every 100 determinations)
+_calibrated_threshold: float | None = None
+_calibrated_at_count: int = 0
+
+
+def _get_calibrated_risk_threshold() -> float:
+    """Get risk threshold calibrated from outcome data, or 0.25 default.
+
+    Constitution: thresholds should be evidence-based, not hardcoded.
+    Uses determinations with outcome feedback to find the threshold
+    that maximizes accuracy (correct approvals + correct denials).
+    """
+    global _calibrated_threshold, _calibrated_at_count
+
+    # Return cached value if recent
+    if _calibrated_threshold is not None:
+        return _calibrated_threshold
+
+    # Try to calibrate from database — need a session
+    # This will be set by the calibration function below
+    return 0.25  # Default fallback
+
+
+def calibrate_risk_threshold(db: Session) -> float:
+    """Calibrate the gray-area risk threshold from actual outcome data.
+
+    Finds the threshold that maximizes correct decisions:
+    - Approvals where outcome was "correct" (true positives)
+    - Denials where outcome was "correct" (true negatives)
+    """
+    global _calibrated_threshold, _calibrated_at_count
+
+    outcomes = db.query(
+        ClinicalDetermination.risk_score,
+        ClinicalDetermination.decision,
+        ClinicalDetermination.outcome_feedback,
+    ).filter(
+        ClinicalDetermination.risk_score != None,
+        ClinicalDetermination.outcome_feedback != None,
+    ).all()
+
+    if len(outcomes) < 20:
+        _calibrated_threshold = 0.25
+        return 0.25  # Insufficient data
+
+    # Grid search over thresholds 0.10 to 0.50
+    best_threshold = 0.25
+    best_accuracy = 0.0
+
+    for threshold_candidate in [x / 100 for x in range(10, 51, 5)]:
+        correct = 0
+        total = len(outcomes)
+        for risk_score, decision, outcome in outcomes:
+            would_approve = (risk_score or 0) >= threshold_candidate
+            was_correct = outcome == "correct"
+            if would_approve and was_correct and decision == "approved":
+                correct += 1
+            elif not would_approve and was_correct and decision == "denied":
+                correct += 1
+            elif would_approve and not was_correct:
+                pass  # false positive
+            elif not would_approve and not was_correct:
+                pass  # false negative
+
+        accuracy = correct / max(total, 1)
+        if accuracy > best_accuracy:
+            best_accuracy = accuracy
+            best_threshold = threshold_candidate
+
+    _calibrated_threshold = best_threshold
+    _calibrated_at_count = len(outcomes)
+    logger.info(f"Risk threshold calibrated to {best_threshold:.2f} from {len(outcomes)} outcomes (accuracy: {best_accuracy:.1%})")
+    return best_threshold
 
 
 def record_determination_outcome(
@@ -1105,8 +1185,13 @@ def _compute_expected_rates_by_type(db: Session) -> dict:
             )
         ).scalar() or 0
 
-        # Expected approval = proportion without strict criteria * 100 + proportion
-        # with criteria * typical pass rate (~75%)
+        # Try outcome-based rate first (Constitution: evidence-based, not hardcoded)
+        outcome_based_rate = _get_outcome_based_rate(db, bt_enum)
+        if outcome_based_rate is not None:
+            expected[bt_name] = outcome_based_rate
+            continue
+
+        # Fall back to guideline-structure-based estimate only if insufficient outcomes
         with_criteria = total_guidelines - without_exclusion
         expected_rate = (
             (without_exclusion / total_guidelines) * 95.0
@@ -1115,6 +1200,54 @@ def _compute_expected_rates_by_type(db: Session) -> dict:
         expected[bt_name] = round(expected_rate, 1)
 
     return expected
+
+
+def _get_outcome_based_rate(db: Session, benefit_type_enum) -> float | None:
+    """Compute expected approval rate from actual outcome feedback data.
+
+    Returns the real-world approval rate for this benefit type based on
+    determinations with outcome feedback, or None if insufficient data (<10).
+    """
+    from app.models.clinical_guideline import BenefitTypeGuideline
+
+    # Map service BenefitType to guideline BenefitTypeGuideline
+    bt_mapping = {
+        "health": BenefitTypeGuideline.health,
+        "dental": BenefitTypeGuideline.dental,
+        "vision": BenefitTypeGuideline.vision,
+        "mental_health": BenefitTypeGuideline.mental_health,
+        "life": BenefitTypeGuideline.life,
+        "std": BenefitTypeGuideline.all_types,
+        "ltd": BenefitTypeGuideline.all_types,
+    }
+
+    bt_value = benefit_type_enum.value if hasattr(benefit_type_enum, 'value') else str(benefit_type_enum)
+
+    total_with_outcome = db.query(func.count(ClinicalDetermination.determination_id)).filter(
+        ClinicalDetermination.outcome_feedback != None,
+        ClinicalDetermination.benefit_type == bt_value,
+    ).scalar() or 0
+
+    if total_with_outcome < 10:
+        return None  # Insufficient data for reliable rate
+
+    correct_outcomes = db.query(func.count(ClinicalDetermination.determination_id)).filter(
+        ClinicalDetermination.outcome_feedback == "correct",
+        ClinicalDetermination.benefit_type == bt_value,
+    ).scalar() or 0
+
+    approved_total = db.query(func.count(ClinicalDetermination.determination_id)).filter(
+        ClinicalDetermination.decision == "approved",
+        ClinicalDetermination.benefit_type == bt_value,
+        ClinicalDetermination.outcome_feedback != None,
+    ).scalar() or 0
+
+    # Expected rate = proportion of determinations that were approved
+    # weighted by accuracy (correct outcomes)
+    accuracy = correct_outcomes / max(total_with_outcome, 1)
+    approval_rate = approved_total / max(total_with_outcome, 1) * 100
+
+    return round(approval_rate, 1)
 
 
 def get_published_rates(db: Session) -> dict:

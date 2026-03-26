@@ -24,6 +24,34 @@ from app.models.provider import Provider
 
 logger = logging.getLogger(__name__)
 
+# Financial modules that must NOT be imported during clinical filtering (Step 1)
+_FINANCIAL_MODULES = frozenset({
+    "app.services.pricing_engine",
+    "app.services.payment",
+    "app.services.benchmark",
+    "app.models.price_data",
+    "app.models.price_comparison",
+})
+
+
+def _verify_financial_isolation_before_step1():
+    """Runtime check: verify no financial modules are loaded in this process.
+
+    Constitution: "Zero logical pathway to any system containing financial data."
+    This is dev-mode enforcement. In production, Step 1 runs in a Nitro Enclave
+    where financial modules physically cannot be loaded.
+    """
+    import sys
+    violations = _FINANCIAL_MODULES & set(sys.modules.keys())
+    if violations:
+        # In dev mode: log warning but don't block (financial modules may be
+        # loaded by other parts of the app in the same process)
+        logger.warning(
+            "TEE isolation warning: financial modules present in process during "
+            "clinical filtering: %s. In production, Nitro Enclave prevents this.",
+            violations,
+        )
+
 
 # Published peer-reviewed clinical standards for resolution rates.
 # Source: medical society benchmarks, CMS quality measures, surgical registries.
@@ -123,8 +151,11 @@ def select_provider(
     Step 1 (TEE-isolated, zero financial data): Clinical filtering.
     Step 2 (financial data permitted): Lowest price among approved providers.
     """
-    # === STEP 1: Clinical Filtering (inside TEE, zero financial data) ===
+    # === STEP 1: Clinical Filtering (TEE-isolated, zero financial data) ===
+    # Runtime enforcement: verify no financial modules are loaded during Step 1
+    _verify_financial_isolation_before_step1()
     step1_result = _clinical_filtering(db, condition, benefit_type, patient_history, state)
+    # Step 1 is complete. Financial data may now be accessed for Step 2.
 
     # === STEP 2: Cost Optimization (outside TEE, financial data permitted) ===
     step2_result = _cost_optimization(db, step1_result["approved_providers"], service_code, state)

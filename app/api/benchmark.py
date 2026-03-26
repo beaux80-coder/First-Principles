@@ -33,6 +33,11 @@ class BenchmarkResponse(BaseModel):
     experience_comparison: dict
     transparency: dict
     data_quality: dict
+    benefit_type_breakdown: dict = {}
+    pharmacy_insights: dict = {}
+    cross_type_insights: dict = {}
+    price_examples: list = []
+    local_quality: dict = {}
     share_url: str
 
 
@@ -76,6 +81,11 @@ def create_benchmark(request: BenchmarkRequest, db: Session = Depends(get_db)):
         experience_comparison=result["experience_comparison"],
         transparency=result["transparency"],
         data_quality=result["data_quality"],
+        benefit_type_breakdown=result.get("benefit_type_breakdown", {}),
+        pharmacy_insights=result.get("pharmacy_insights", {}),
+        cross_type_insights=result.get("cross_type_insights", {}),
+        price_examples=result.get("price_examples", []),
+        local_quality=result.get("local_quality", {}),
         share_url=f"/benchmark/{query_record.query_id}",
     )
 

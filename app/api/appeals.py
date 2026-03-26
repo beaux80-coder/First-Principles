@@ -1,247 +1,126 @@
-"""Appeals Process API (Function 1, Questions 9-11).
+"""Appeals API — Constitution F1 Q9-Q11.
 
-Constitution:
-Q9: "Clear, plain-language explanation of denial and complete appeal rights."
-Q10: "Internal review, external IRO review, expedited review for urgent cases."
-Q11: "All appeal proceedings recorded in immutable, cryptographically secured log."
-
-Endpoints:
-- POST /appeals/           -- File an appeal against a denied claim
-- GET  /appeals/overdue    -- Check for overdue appeal deadlines
-- GET  /appeals/{appeal_id} -- Get appeal status with full timeline
-- POST /appeals/{appeal_id}/review     -- Process an appeal review decision
-- POST /appeals/{appeal_id}/assign-iro -- Assign IRO for external review
-- GET  /appeals/claim/{claim_id}       -- Get all appeals for a claim
+Full appeals process compliant with ERISA 503, ACA 2719, and state mandates.
+Every step that is legally automatable is fully automated.
 """
 
-import logging
-import uuid
-from typing import Optional
-
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.database import get_db
+from app.services.appeal_management import (
+    file_appeal,
+    process_internal_review,
+    escalate_to_external_review,
+    request_expedited_review,
+    resolve_appeal,
+    get_appeal_metrics,
+)
 
-logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/appeals", tags=["appeals-process"])
+router = APIRouter(prefix="/appeals", tags=["appeals"])
 
-
-# ---------------------------------------------------------------------------
-# Request/Response models
-# ---------------------------------------------------------------------------
 
 class AppealFileRequest(BaseModel):
-    claim_id: str
-    appeal_reason: str
-    appeal_type: str = "internal_level_1"
-    is_expedited: bool = False
-    expedited_reason: Optional[str] = None
+    claim_id: str = Field(description="ID of the denied claim to appeal")
+    employee_id: str = Field(description="ID of the employee filing the appeal")
+    appeal_rationale: str = Field(description="Reason for appealing the denial")
+    new_evidence: dict | None = Field(default=None, description="New clinical evidence")
+    appeal_type: str = Field(default="standard", description="standard, expedited, or external_iro")
 
 
-class AppealReviewRequest(BaseModel):
-    reviewer_id: str
-    reviewer_notes: str
-    outcome: str  # upheld, overturned, partial_reversal
-    reviewer_type: str = "clinical_professional"
+class ExpediteRequest(BaseModel):
+    urgency_reason: str = Field(description="Reason this qualifies for expedited review")
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
+class ResolveRequest(BaseModel):
+    decision: str = Field(description="overturned, partially_overturned, or upheld")
+    decision_reasoning: str = Field(description="Full reasoning for the decision")
+    guidelines_referenced: list[str] | None = Field(default=None)
 
-@router.post("/")
-def file_appeal(req: AppealFileRequest, db: Session = Depends(get_db)):
-    """File an appeal against a denied claim.
 
-    Constitution Q9: generates a plain-language denial notice explaining what
-    was denied, why, and the employee's complete appeal rights at each level.
-
-    The appeal is recorded in the immutable, cryptographically secured audit log
-    and a review deadline is set based on the appeal type:
-    - internal_level_1: 30 days
-    - internal_level_2: 30 days
-    - external_iro: 45 days
-    - expedited: 72 hours
-    """
-    from app.services.appeals_process import file_appeal as svc_file_appeal
-
-    try:
-        claim_uuid = uuid.UUID(req.claim_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid claim_id format. Must be a valid UUID.",
-        )
-
-    result = svc_file_appeal(
+@router.post("/file")
+def api_file_appeal(request: AppealFileRequest, db: Session = Depends(get_db)):
+    """File an appeal on a denied claim. ERISA 503 compliant."""
+    return file_appeal(
         db=db,
-        claim_id=claim_uuid,
-        appeal_reason=req.appeal_reason,
-        appeal_type=req.appeal_type,
-        is_expedited=req.is_expedited,
-        expedited_reason=req.expedited_reason,
+        claim_id=request.claim_id,
+        employee_id=request.employee_id,
+        appeal_rationale=request.appeal_rationale,
+        new_evidence=request.new_evidence,
+        appeal_type=request.appeal_type,
     )
-
-    if "error" in result:
-        status_map = {
-            "claim_not_found": 404,
-            "claim_not_denied": 400,
-            "invalid_appeal_type": 400,
-        }
-        raise HTTPException(
-            status_code=status_map.get(result["error"], 400),
-            detail=result.get("detail", result["error"]),
-        )
-
-    return result
-
-
-@router.get("/overdue")
-def check_overdue_appeals(db: Session = Depends(get_db)):
-    """Check all open appeals for overdue or approaching deadlines.
-
-    ERISA requires timely processing of all appeals. This endpoint
-    returns a compliance summary with:
-    - Overdue appeals (past their review deadline)
-    - Approaching-deadline appeals (within 5 days of deadline)
-    - On-track appeals
-    - Overall compliance status (compliant / at_risk / non_compliant)
-    """
-    from app.services.appeals_process import check_appeal_deadlines
-
-    return check_appeal_deadlines(db)
-
-
-@router.get("/{appeal_id}")
-def get_appeal(appeal_id: str, db: Session = Depends(get_db)):
-    """Get full appeal status with complete timeline.
-
-    Constitution Q11: all appeal proceedings, decisions, and outcomes are
-    recorded in the immutable audit log. This endpoint returns the complete
-    record including every timeline event.
-    """
-    from app.services.appeals_process import get_appeal_status
-
-    try:
-        aid = uuid.UUID(appeal_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid appeal_id format. Must be a valid UUID.",
-        )
-
-    result = get_appeal_status(db, aid)
-    if not result:
-        raise HTTPException(status_code=404, detail="Appeal not found.")
-
-    return result
 
 
 @router.post("/{appeal_id}/review")
-def process_appeal_review(
-    appeal_id: str,
-    req: AppealReviewRequest,
-    db: Session = Depends(get_db),
-):
-    """Process an appeal review decision.
+def api_internal_review(appeal_id: str, db: Session = Depends(get_db)):
+    """Process internal appeal review by independent clinical professional."""
+    return process_internal_review(db, appeal_id)
 
-    Constitution Q10: the reviewer must be a qualified clinical professional
-    who was not involved in the original determination.
 
-    Outcomes:
-    - overturned: claim is approved, payment proceeds
-    - upheld (Level 1): auto-escalated to Level 2
-    - upheld (Level 2): external IRO information provided
-    - partial_reversal: some services approved, employee may appeal remainder
-    """
-    from app.services.appeals_process import process_appeal
+@router.post("/{appeal_id}/expedite")
+def api_expedite(appeal_id: str, request: ExpediteRequest, db: Session = Depends(get_db)):
+    """Request expedited review for urgent/emergent situations (72-hr turnaround)."""
+    return request_expedited_review(db, appeal_id, request.urgency_reason)
 
-    try:
-        aid = uuid.UUID(appeal_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid appeal_id format. Must be a valid UUID.",
-        )
 
-    result = process_appeal(
+@router.post("/{appeal_id}/external-review")
+def api_external_review(appeal_id: str, db: Session = Depends(get_db)):
+    """Escalate to external Independent Review Organization (IRO). ACA 2719."""
+    return escalate_to_external_review(db, appeal_id)
+
+
+@router.post("/{appeal_id}/resolve")
+def api_resolve(appeal_id: str, request: ResolveRequest, db: Session = Depends(get_db)):
+    """Record appeal decision with full audit trail."""
+    return resolve_appeal(
         db=db,
-        appeal_id=aid,
-        reviewer_id=req.reviewer_id,
-        reviewer_notes=req.reviewer_notes,
-        outcome=req.outcome,
-        reviewer_type=req.reviewer_type,
+        appeal_id=appeal_id,
+        decision=request.decision,
+        decision_reasoning=request.decision_reasoning,
+        guidelines_referenced=request.guidelines_referenced,
     )
 
-    if "error" in result:
-        status_map = {
-            "appeal_not_found": 404,
-            "appeal_already_decided": 409,
-            "invalid_outcome": 400,
-            "invalid_reviewer_type": 400,
-        }
-        raise HTTPException(
-            status_code=status_map.get(result["error"], 400),
-            detail=result.get("detail", result["error"]),
-        )
 
-    return result
-
-
-@router.post("/{appeal_id}/assign-iro")
-def assign_iro(appeal_id: str, db: Session = Depends(get_db)):
-    """Assign an Independent Review Organization for external review.
-
-    Constitution Q10: external independent review by a qualified IRO.
-    The IRO is URAC-accredited with no conflicts of interest.
-
-    Auto-selects from the IRO registry using round-robin assignment
-    and sets a 45-day review deadline.
-    """
-    from app.services.appeals_process import assign_iro as svc_assign_iro
-
-    try:
-        aid = uuid.UUID(appeal_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid appeal_id format. Must be a valid UUID.",
-        )
-
-    result = svc_assign_iro(db, aid)
-
-    if "error" in result:
-        status_map = {
-            "appeal_not_found": 404,
-            "not_external_appeal": 400,
-            "iro_already_assigned": 409,
-            "no_active_iros": 503,
-        }
-        raise HTTPException(
-            status_code=status_map.get(result["error"], 400),
-            detail=result.get("detail", result["error"]),
-        )
-
-    return result
+@router.get("/{appeal_id}")
+def api_get_appeal(appeal_id: str, db: Session = Depends(get_db)):
+    """Get appeal status and history."""
+    from app.models.appeal import Appeal
+    appeal = db.query(Appeal).filter(Appeal.appeal_id == appeal_id).first()
+    if not appeal:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=404, detail="Appeal not found")
+    return {
+        "appeal_id": str(appeal.appeal_id),
+        "claim_id": str(appeal.claim_id),
+        "appeal_type": appeal.appeal_type.value,
+        "stage": appeal.stage.value,
+        "status": appeal.status.value,
+        "deadline_at": appeal.deadline_at.isoformat(),
+        "decision": appeal.decision,
+        "decision_reasoning": appeal.decision_reasoning,
+        "audit_hash": appeal.audit_hash,
+    }
 
 
 @router.get("/claim/{claim_id}")
-def get_appeals_for_claim(claim_id: str, db: Session = Depends(get_db)):
-    """Get all appeals filed for a specific claim.
+def api_get_claim_appeals(claim_id: str, db: Session = Depends(get_db)):
+    """List all appeals for a claim."""
+    from app.models.appeal import Appeal
+    appeals = db.query(Appeal).filter(Appeal.claim_id == claim_id).all()
+    return [
+        {
+            "appeal_id": str(a.appeal_id),
+            "appeal_type": a.appeal_type.value,
+            "stage": a.stage.value,
+            "status": a.status.value,
+            "requested_at": a.requested_at.isoformat(),
+        }
+        for a in appeals
+    ]
 
-    Returns the full appeal chain showing how the appeal has progressed
-    through internal Level 1, Level 2, and external IRO stages.
-    """
-    from app.services.appeals_process import get_appeals_for_claim as svc_get
 
-    try:
-        cid = uuid.UUID(claim_id)
-    except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid claim_id format. Must be a valid UUID.",
-        )
-
-    return svc_get(db, cid)
+@router.get("/metrics/summary")
+def api_appeal_metrics(db: Session = Depends(get_db)):
+    """Appeal metrics: overturn rates, resolution times, compliance status."""
+    return get_appeal_metrics(db)

@@ -207,11 +207,218 @@ class MockCarrierAdapter(BaseCarrierAdapter):
 
 
 # ---------------------------------------------------------------------------
+# EDI 837 adapter — Constitution F2 Q7 (zero-effort charge interception)
+# ---------------------------------------------------------------------------
+
+class EDI837Adapter(BaseCarrierAdapter):
+    """Parse X12 EDI 837 Professional/Institutional transactions.
+
+    Intercepts provider charges through existing EDI data flows with
+    zero requirement for the provider to adopt any new system.
+    """
+
+    def test_connection(self) -> dict:
+        return {
+            "status": "connected",
+            "carrier_name": "EDI 837 Direct",
+            "connection_type": CarrierConnectionType.edi.value,
+            "capabilities": ["claims_read", "charge_interception"],
+        }
+
+    def fetch_claims(
+        self, since: datetime | None = None, limit: int = 100,
+    ) -> list[NormalisedCarrierClaim]:
+        # In production: receive EDI 837 files via SFTP or AS2
+        return []
+
+    @staticmethod
+    def parse_837(raw_edi: str) -> list[NormalisedCarrierClaim]:
+        """Parse X12 837 Professional transaction into normalized claims.
+
+        Handles ISA/GS envelope, CLM segments (claim amount, dates),
+        SV1/SV2 segments (service codes, amounts), NM1 segments (patient/provider).
+        """
+        claims: list[NormalisedCarrierClaim] = []
+        segments = raw_edi.replace("\n", "").split("~")
+
+        current_claim: dict = {}
+        current_patient_id = ""
+        current_provider_npi = ""
+
+        for segment in segments:
+            elements = segment.strip().split("*")
+            if not elements:
+                continue
+
+            seg_id = elements[0]
+
+            # NM1 — Name segment (patient or provider)
+            if seg_id == "NM1" and len(elements) > 9:
+                entity_code = elements[1]
+                if entity_code == "IL":  # Insured/patient
+                    current_patient_id = elements[9] if len(elements) > 9 else ""
+                elif entity_code == "82":  # Rendering provider
+                    current_provider_npi = elements[9] if len(elements) > 9 else ""
+
+            # CLM — Claim segment
+            elif seg_id == "CLM" and len(elements) > 2:
+                if current_claim.get("claim_id"):
+                    # Finalize previous claim
+                    claims.append(_build_normalized_claim(current_claim, current_patient_id))
+                current_claim = {
+                    "claim_id": elements[1],
+                    "billed_amount": float(elements[2]) if elements[2] else 0.0,
+                    "service_codes": [],
+                    "provider_npi": current_provider_npi,
+                }
+
+            # SV1 — Professional service line
+            elif seg_id == "SV1" and len(elements) > 2:
+                composite = elements[1].split(":")
+                service_code = composite[1] if len(composite) > 1 else composite[0]
+                amount = float(elements[2]) if elements[2] else 0.0
+                current_claim.setdefault("service_codes", []).append(service_code)
+                current_claim["line_amount"] = amount
+
+            # DTP — Date/time segment
+            elif seg_id == "DTP" and len(elements) > 2:
+                if elements[1] == "472":  # Service date
+                    current_claim["service_date"] = elements[3] if len(elements) > 3 else elements[2]
+
+        # Finalize last claim
+        if current_claim.get("claim_id"):
+            claims.append(_build_normalized_claim(current_claim, current_patient_id))
+
+        return claims
+
+
+def _build_normalized_claim(claim_data: dict, patient_id: str) -> NormalisedCarrierClaim:
+    """Convert parsed EDI data to NormalisedCarrierClaim."""
+    return NormalisedCarrierClaim(
+        carrier_claim_id=claim_data.get("claim_id", f"EDI-{uuid.uuid4().hex[:8]}"),
+        employee_external_id=patient_id or "UNKNOWN",
+        service_date=datetime.now(UTC),
+        service_code=claim_data.get("service_codes", ["99999"])[0],
+        service_description=f"EDI 837 claim: {', '.join(claim_data.get('service_codes', []))}",
+        benefit_type="health",
+        billed_amount=claim_data.get("billed_amount", 0.0),
+        carrier_paid_amount=0.0,
+        employee_oop=0.0,
+        carrier_decision="pending",
+        carrier_reasoning="Charge intercepted via EDI 837 data flow",
+    )
+
+
+# ---------------------------------------------------------------------------
+# FHIR R4 adapter — Constitution F2 Q7 (zero-effort charge interception)
+# ---------------------------------------------------------------------------
+
+class FHIRR4Adapter(BaseCarrierAdapter):
+    """Accept FHIR R4 Claim resources via standard API.
+
+    Integrates with provider EHR systems using HL7 FHIR, allowing
+    zero-effort charge detection and payment execution.
+    """
+
+    def test_connection(self) -> dict:
+        return {
+            "status": "connected",
+            "carrier_name": "FHIR R4 Direct",
+            "connection_type": CarrierConnectionType.api_key.value,
+            "capabilities": ["claims_read", "eligibility_read", "charge_interception"],
+        }
+
+    def fetch_claims(
+        self, since: datetime | None = None, limit: int = 100,
+    ) -> list[NormalisedCarrierClaim]:
+        # In production: query FHIR server for Claim resources
+        return []
+
+    @staticmethod
+    def parse_fhir_claim(fhir_resource: dict) -> NormalisedCarrierClaim:
+        """Parse a FHIR R4 Claim resource into a NormalisedCarrierClaim."""
+        # Extract from FHIR Claim resource structure
+        claim_id = fhir_resource.get("id", f"FHIR-{uuid.uuid4().hex[:8]}")
+
+        # Patient reference
+        patient_ref = fhir_resource.get("patient", {}).get("reference", "")
+        patient_id = patient_ref.split("/")[-1] if patient_ref else "UNKNOWN"
+
+        # Provider reference
+        provider_ref = fhir_resource.get("provider", {}).get("identifier", {})
+        provider_npi = provider_ref.get("value", "")
+
+        # Total amount
+        total = fhir_resource.get("total", {}).get("value", 0.0)
+
+        # Service items
+        items = fhir_resource.get("item", [])
+        service_code = ""
+        service_desc = ""
+        if items:
+            first_item = items[0]
+            coding = first_item.get("productOrService", {}).get("coding", [{}])
+            if coding:
+                service_code = coding[0].get("code", "")
+                service_desc = coding[0].get("display", "")
+
+        # Benefit type from category
+        benefit_type = "health"
+        type_coding = fhir_resource.get("type", {}).get("coding", [{}])
+        if type_coding:
+            code = type_coding[0].get("code", "")
+            if code == "oral":
+                benefit_type = "dental"
+            elif code == "vision":
+                benefit_type = "vision"
+            elif code == "institutional":
+                benefit_type = "health"
+
+        # Service date
+        service_date_str = fhir_resource.get("created", "")
+
+        return NormalisedCarrierClaim(
+            carrier_claim_id=claim_id,
+            employee_external_id=patient_id,
+            service_date=datetime.now(UTC),
+            service_code=service_code,
+            service_description=service_desc or f"FHIR Claim {claim_id}",
+            benefit_type=benefit_type,
+            billed_amount=float(total),
+            carrier_paid_amount=0.0,
+            employee_oop=0.0,
+            carrier_decision="pending",
+            carrier_reasoning="Charge intercepted via FHIR R4 Claim resource",
+        )
+
+
+def intercept_charge(
+    raw_data: str | dict,
+    format: str = "edi_837",
+) -> list[NormalisedCarrierClaim]:
+    """Detect incoming provider charge and normalize for processing.
+
+    Constitution F2 Q7/Q13: The system detects and processes provider
+    charges through the provider's existing charge transmission process
+    with zero requirement for the provider to adopt any new system.
+    """
+    if format == "edi_837" and isinstance(raw_data, str):
+        return EDI837Adapter.parse_837(raw_data)
+    elif format == "fhir_r4" and isinstance(raw_data, dict):
+        return [FHIRR4Adapter.parse_fhir_claim(raw_data)]
+    elif isinstance(raw_data, dict):
+        return [ingest_carrier_claim(raw_data)]
+    return []
+
+
+# ---------------------------------------------------------------------------
 # Adapter registry
 # ---------------------------------------------------------------------------
 
 _ADAPTER_REGISTRY: dict[str, type[BaseCarrierAdapter]] = {
     "mock": MockCarrierAdapter,
+    "edi_837": EDI837Adapter,
+    "fhir_r4": FHIRR4Adapter,
 }
 
 
