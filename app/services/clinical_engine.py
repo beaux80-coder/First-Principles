@@ -829,6 +829,23 @@ def make_determination(
     # Measure latency
     latency_ms = (time.perf_counter() - t_start) * 1000
 
+    # Determine routing: standing protocol vs individual Medical Director review
+    # Build Manifest items 3, 8, 17:
+    #   - Approvals matching standing protocols: processed instantly, no queue
+    #   - Denials and gray-area: routed to contracted Medical Director for final determination
+    #   - Log records whether standing protocol or individual review, and by whom
+    is_gray_area = risk_score is not None
+    if decision == "approved" and not is_gray_area:
+        # Approval with clear guideline support → standing protocol (auto-final)
+        determination_authority = "standing_protocol"
+        reviewed_by = "Medical Director standing orders (auto-approved)"
+        is_recommendation = False  # Final under standing protocol
+    else:
+        # Denials and gray-area → recommendation pending MD review
+        determination_authority = "individual_review"
+        reviewed_by = None  # Pending assignment to contracted Medical Director / UR
+        is_recommendation = True  # Recommendation, not final
+
     # Create determination record
     determination = ClinicalDetermination(
         claim_id=claim_id,
@@ -842,6 +859,9 @@ def make_determination(
         risk_score=risk_score,
         risk_factors=risk_factors,
         latency_ms=latency_ms,
+        determination_authority=determination_authority,
+        reviewed_by=reviewed_by,
+        is_recommendation=is_recommendation,
     )
 
     db.add(determination)
