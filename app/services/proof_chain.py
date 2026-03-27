@@ -232,7 +232,7 @@ def tag_proof_layer(
         "evidence": layer4_evidence,
     }
 
-    layers_covered = sum(1 for l in layers.values() if l["applies"])
+    layers_covered = sum(1 for layer in layers.values() if layer["applies"])
 
     return {
         "claim_id": claim_id,

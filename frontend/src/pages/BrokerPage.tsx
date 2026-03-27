@@ -70,21 +70,23 @@ export default function BrokerPage() {
         </button>
       </form>
 
-      {result && (
+      {result && (() => {
+        const summary = result.savings_summary as { total_annual_savings: number; savings_pct: number } | undefined
+        return (
         <div className="bg-white rounded-xl shadow-sm border p-8">
           <h2 className="text-lg font-semibold mb-4">Projected Savings</h2>
-          {result.savings_summary && (
+          {summary && (
             <div className="grid grid-cols-3 gap-4 mb-6">
               <div className="bg-green-50 rounded-lg p-4 text-center">
                 <p className="text-sm text-green-600">Annual Savings</p>
                 <p className="text-2xl font-bold text-green-700">
-                  ${result.savings_summary.total_annual_savings?.toLocaleString() || '—'}
+                  ${summary.total_annual_savings?.toLocaleString() || '—'}
                 </p>
               </div>
               <div className="bg-blue-50 rounded-lg p-4 text-center">
                 <p className="text-sm text-blue-600">Savings %</p>
                 <p className="text-2xl font-bold text-blue-700">
-                  {result.savings_summary.savings_pct || '—'}%
+                  {summary.savings_pct || '—'}%
                 </p>
               </div>
               <div className="bg-purple-50 rounded-lg p-4 text-center">
@@ -106,7 +108,8 @@ export default function BrokerPage() {
             <li>✓ All 7 benefit types from day one</li>
           </ul>
         </div>
-      )}
+        )
+      })()}
     </div>
   )
 }

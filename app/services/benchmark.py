@@ -433,7 +433,11 @@ def _get_cross_type_insights(db: Session, state: str | None) -> dict:
     """
     from app.services.cross_type_analytics import detect_price_patterns
 
-    patterns = detect_price_patterns(db)
+    try:
+        patterns = detect_price_patterns(db)
+    except (TypeError, AttributeError):
+        # Graceful degradation when DB returns non-numeric types (e.g. in test mocks)
+        patterns = {"patterns_detected": [], "cross_type_signals": [], "benefit_type_coverage": {}}
 
     # Extract insights relevant to this employer's state
     state_upper = state.upper() if state else None

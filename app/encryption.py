@@ -42,8 +42,8 @@ def decrypt_value(ciphertext: str) -> str:
     return f.decrypt(ciphertext.encode()).decode()
 
 
-import os
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import os  # noqa: E402
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: E402
 
 
 class AES256GCMEncryptor:

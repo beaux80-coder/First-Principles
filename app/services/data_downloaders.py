@@ -2934,7 +2934,7 @@ def download_dmepos_rates() -> dict:
     }
 
 
-def download_asp_drug_pricing() -> dict:
+def download_asp_drug_pricing_summary() -> dict:
     """Download Average Sales Price (ASP) drug pricing from CMS.
 
     ASP is the average price paid to manufacturers for drugs covered under

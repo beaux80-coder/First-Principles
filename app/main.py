@@ -12,6 +12,7 @@ from app.api import health, benchmark, employers, data_pipeline, clinical, price
 from app.api import shadow, dashboard, broker_channel, benefits_admin, carrier_integration
 from app.api import appeals, provider_portal, security_ops
 from app.api import provider_intelligence, provider_offers, disputes
+from app.api import distribution, regulatory
 
 logging.basicConfig(level=logging.INFO)
 
@@ -45,7 +46,7 @@ app.add_middleware(
 )
 
 # HIPAA audit logging — logs every API request (no PHI in logs)
-from app.middleware.audit import AuditLoggingMiddleware
+from app.middleware.audit import AuditLoggingMiddleware  # noqa: E402
 app.add_middleware(AuditLoggingMiddleware)
 
 app.include_router(health.router)
@@ -70,3 +71,5 @@ app.include_router(security_ops.router, prefix="/api/v1")
 app.include_router(provider_intelligence.router, prefix="/api/v1")
 app.include_router(provider_offers.router, prefix="/api/v1")
 app.include_router(disputes.router, prefix="/api/v1")
+app.include_router(distribution.router, prefix="/api/v1")
+app.include_router(regulatory.router, prefix="/api/v1")

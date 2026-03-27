@@ -209,3 +209,150 @@ def get_enrollment_summary(employer_id: str, db: Session = Depends(get_db)):
         return _summary(db, employer_id)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+
+
+# -- Payroll Integration -----------------------------------------------------
+
+
+class PayrollConnectRequest(BaseModel):
+    """Request to connect employer payroll/HRIS integration."""
+    employer_id: str
+    integration_type: str = Field(
+        description="Payroll system: adp, workday, paychex, csv"
+    )
+    config: dict = Field(
+        default_factory=dict,
+        description="Integration-specific config (credentials, company code, etc.)",
+    )
+
+
+@router.post("/payroll/connect")
+def connect_payroll(
+    request: PayrollConnectRequest,
+    db: Session = Depends(get_db),
+):
+    """Connect to employer's payroll/HRIS and sync employees.
+
+    Constitution F11: "Integrates with employer's payroll or HRIS via API.
+    New hires auto-enrolled upon detection."
+    """
+    import uuid as uuid_mod
+    from app.services.payroll_integration import PayrollIntegrationManager
+
+    try:
+        employer_uuid = uuid_mod.UUID(request.employer_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid employer_id format")
+
+    manager = PayrollIntegrationManager()
+
+    try:
+        result = manager.sync_and_enroll(
+            db,
+            employer_id=employer_uuid,
+            integration_type=request.integration_type,
+            config=request.config,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return result
+
+
+# -- Employee Q&A ------------------------------------------------------------
+
+
+class EmployeeQARequest(BaseModel):
+    """Employee question in plain language."""
+    employee_id: str
+    question: str
+
+
+@router.post("/qa")
+def employee_qa(
+    request: EmployeeQARequest,
+    db: Session = Depends(get_db),
+):
+    """Answer employee benefits question in plain language.
+
+    Constitution: "Employees ask in plain language. System answers
+    immediately with full context on the employee's history and plan
+    terms. Not a chatbot reading an FAQ."
+    """
+    import uuid as uuid_mod
+    from app.services.employee_qa import answer_employee_question
+
+    try:
+        employee_uuid = uuid_mod.UUID(request.employee_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid employee_id format")
+
+    result = answer_employee_question(
+        db,
+        employee_id=employee_uuid,
+        question=request.question,
+    )
+
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+
+    return result
+
+
+# -- Shadow Admin Burden Display ---------------------------------------------
+
+
+@router.get("/shadow-burden/{employer_id}")
+def shadow_admin_burden(
+    employer_id: str,
+    db: Session = Depends(get_db),
+):
+    """Display current admin burden and projected savings upon activation.
+
+    Constitution: "Zero cost, zero risk, zero disruption." Shows shadow
+    mode employers what admin burden disappears when beneflex activates.
+    """
+    import uuid as uuid_mod
+    from app.services.benefits_admin import display_shadow_admin_burden
+
+    try:
+        employer_uuid = uuid_mod.UUID(employer_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid employer_id format")
+
+    try:
+        result = display_shadow_admin_burden(db, employer_id=employer_uuid)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    return result
+
+
+# -- Welcome Message ---------------------------------------------------------
+
+
+@router.post("/welcome/{employee_id}")
+def send_welcome(
+    employee_id: str,
+    db: Session = Depends(get_db),
+):
+    """Send welcome message to newly enrolled employee.
+
+    Constitution F11: "Welcome to [company]. Your health, dental, vision,
+    and all other benefits are active now. When you need care, text this
+    number. Everything is covered. You will never receive a bill."
+    """
+    import uuid as uuid_mod
+    from app.services.benefits_admin import send_welcome_message
+
+    try:
+        employee_uuid = uuid_mod.UUID(employee_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid employee_id format")
+
+    result = send_welcome_message(db, employee_id=employee_uuid)
+
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+
+    return result

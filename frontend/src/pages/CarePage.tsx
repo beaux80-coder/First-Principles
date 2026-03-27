@@ -245,9 +245,9 @@ export default function CarePage() {
             <div className="mt-4 space-y-2">
               {episodes.map((ep: Record<string, unknown>, i: number) => (
                 <div key={i} className="border rounded-lg p-3 bg-gray-50">
-                  <p className="font-medium">{ep.condition || 'Care episode'}</p>
+                  <p className="font-medium">{String(ep.condition) || 'Care episode'}</p>
                   <p className="text-sm text-gray-600">
-                    Status: {ep.status} | Type: {ep.benefit_type}
+                    Status: {String(ep.status)} | Type: {String(ep.benefit_type)}
                   </p>
                 </div>
               ))}

@@ -446,3 +446,59 @@ def cross_type_signals(db: Session = Depends(get_db)):
         "signals_by_function": {k: len(v) for k, v in by_function.items()},
         "signals": signals,
     }
+
+
+@router.get("/competition-data")
+def competition_data(db: Session = Depends(get_db)):
+    """Aggregate provider competition data across markets.
+
+    Constitution F8: aggregate pricing and provider data to understand
+    competitive dynamics across benefit types and geographies.
+    """
+    from app.models.price_data import PriceData
+    from sqlalchemy import func
+
+    # Aggregate price data by source and state
+    rows = (
+        db.query(
+            PriceData.source,
+            PriceData.state,
+            func.count(PriceData.price_id).label("records"),
+            func.avg(PriceData.price).label("avg_price"),
+            func.min(PriceData.price).label("min_price"),
+            func.max(PriceData.price).label("max_price"),
+        )
+        .group_by(PriceData.source, PriceData.state)
+        .all()
+    )
+
+    by_source: dict = {}
+    for row in rows:
+        src = row.source.value if row.source else "unknown"
+        if src not in by_source:
+            by_source[src] = []
+        by_source[src].append({
+            "state": row.state,
+            "records": row.records,
+            "avg_price": round(float(row.avg_price or 0), 2),
+            "min_price": round(float(row.min_price or 0), 2),
+            "max_price": round(float(row.max_price or 0), 2),
+        })
+
+    return {
+        "sources": by_source,
+        "total_sources": len(by_source),
+        "total_state_markets": len(rows),
+    }
+
+
+@router.get("/tipping-points")
+def tipping_points():
+    """Get service-level thresholds that trigger employer switching.
+
+    Constitution F12/F8: understanding switching tipping points allows
+    targeted outreach when employers are most likely to change providers.
+    """
+    from app.services.distribution_engine import get_service_level_thresholds
+
+    return get_service_level_thresholds()

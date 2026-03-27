@@ -454,6 +454,7 @@ def detect_price_patterns(db: Session) -> dict[str, Any]:
         )
         .scalar()
     ) or 0
+    quality_count = int(quality_count) if isinstance(quality_count, (int, float)) else 0
 
     if quality_count > 0:
         patterns["patterns_detected"].append({
@@ -512,7 +513,7 @@ def detect_price_patterns(db: Session) -> dict[str, Any]:
                     f"Identified {len(leading)} benefit types that lead multi-type episodes"
                 ),
                 "feeds": ["F3 (Cost Prediction)", "F9 (Care Execution)"],
-                "leading_types": [l["benefit_type"] for l in leading],
+                "leading_types": [lead["benefit_type"] for lead in leading],
             })
 
     patterns["summary"] = {

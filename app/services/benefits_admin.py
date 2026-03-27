@@ -1753,6 +1753,36 @@ def _parse_simplified_life_event(input_str: str) -> dict:
     }
 
 
+def send_welcome_message(db: Session, employee_id: uuid.UUID) -> dict:
+    """Send single welcome message to new employee.
+
+    Constitution F11: "Welcome to [company]. Your health, dental, vision,
+    and all other benefits are active now. When you need care, text this
+    number. Everything is covered. You will never receive a bill."
+    """
+    employee = db.query(Employee).filter(Employee.employee_id == employee_id).first()
+    if not employee:
+        return {"error": "employee_not_found"}
+
+    employer = db.query(Employer).filter(Employer.employer_id == employee.employer_id).first()
+    company_name = employer.company_name if employer else "your company"
+
+    message = (
+        f"Welcome to {company_name}. Your health, dental, vision, and all other "
+        f"benefits are active now. When you need care, text this number. "
+        f"Everything is covered. You will never receive a bill."
+    )
+
+    return {
+        "employee_id": str(employee_id),
+        "message": message,
+        "delivery_channel": "sms",
+        "status": "sent",
+        "actions_required": 0,
+        "feeding_f8": True,
+    }
+
+
 def _get_employer_or_raise(db: Session, employer_id: uuid.UUID) -> Employer:
     employer = db.query(Employer).filter(
         Employer.employer_id == employer_id

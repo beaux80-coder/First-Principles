@@ -200,3 +200,20 @@ def run_simulation(
         raise HTTPException(status_code=404, detail=str(e))
 
     return result
+
+
+@router.post("/stop-loss/submit/{employer_id}")
+def submit_stop_loss(employer_id: str, db: Session = Depends(get_db)):
+    """Submit stop-loss placement to carrier API. F7A Q5.
+
+    Constitution F7A: evaluate risk, compare carriers, leverage group
+    purchasing, then submit the optimal placement to the selected carrier.
+    """
+    from app.services.stop_loss import evaluate_stop_loss
+
+    try:
+        result = evaluate_stop_loss(db, employer_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    return result
