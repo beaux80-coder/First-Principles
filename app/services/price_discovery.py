@@ -297,6 +297,42 @@ def compare_all_channels(
                          "vs. 90-day float with collections risk (15-20% of practice revenue)",
         }
 
+    # --- Price fairness flagging (Build Manifest item 7) ---
+    # If a provider's cash price is significantly above public benchmarks, flag it.
+    # "Significantly above" = more than 50% over the median of all public data.
+    price_fairness_flag = None
+    if provider_npi and channels_compared:
+        provider_channels = [
+            c for c in channels_compared
+            if c.get("provider") == provider_npi or c.get("channel") == "cash_price"
+        ]
+        benchmark_channels = [
+            c for c in channels_compared
+            if c.get("channel") in (
+                "reference_medicare", "hospital_transparency_rate",
+                "insurer_transparency_rate", "state_apcd",
+            )
+        ]
+        if provider_channels and benchmark_channels:
+            provider_price = provider_channels[0]["price"]
+            benchmark_prices = [c["price"] for c in benchmark_channels]
+            benchmark_median = sorted(benchmark_prices)[len(benchmark_prices) // 2]
+            if benchmark_median > 0 and provider_price > benchmark_median * 1.5:
+                price_fairness_flag = {
+                    "flagged": True,
+                    "provider_price": provider_price,
+                    "benchmark_median": round(benchmark_median, 2),
+                    "overage_pct": round(
+                        (provider_price - benchmark_median) / benchmark_median * 100, 1
+                    ),
+                    "reason": (
+                        f"Provider's price (${provider_price:.2f}) is "
+                        f"{round((provider_price - benchmark_median) / benchmark_median * 100, 1)}% "
+                        f"above the median public benchmark (${benchmark_median:.2f}). "
+                        f"System will pay the lowest verified price, not this rate."
+                    ),
+                }
+
     # Balance billing analysis
     balance_billing_eliminated = False
     if lowest_channel in ("cash_price", "hospital_transparency_rate"):
@@ -311,6 +347,7 @@ def compare_all_channels(
         "channels_with_data": len(channels_compared),
         "lowest_price": lowest_price,
         "lowest_channel": lowest_channel,
+        "price_fairness_flag": price_fairness_flag,
         "payment_speed_discount": payment_speed_discount,
         "balance_billing_eliminated": balance_billing_eliminated,
         "balance_billing_rationale": (
