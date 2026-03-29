@@ -52,6 +52,52 @@ def _verify_financial_isolation_before_step1():
         )
 
 
+# ---------------------------------------------------------------------------
+# Geographic range by service type (Build Manifest item 1)
+# ---------------------------------------------------------------------------
+# Short range for routine/frequent, wider for specialty, national for rare.
+
+SERVICE_RANGE_MILES: dict[str, float] = {
+    # Routine / frequent
+    "primary_care": 25,
+    "dental_cleaning": 25,
+    "therapy": 25,
+    "basic_lab": 25,
+    "preventive_care": 25,
+    "vision_exam": 25,
+    "mental_health_therapy": 30,
+    "general_medical": 30,
+    # Specialty
+    "orthopedic_surgery": 75,
+    "cardiac": 75,
+    "complex_imaging": 75,
+    "dental_surgical": 50,
+    "mental_health_medication": 50,
+    "disability_std": 50,
+    "disability_ltd": 50,
+    # Rare / high-cost — national
+    "transplant": 500,
+    "rare_disease": 500,
+    "life_insurance_exam": 100,
+}
+
+_DEFAULT_RANGE_MILES = 50
+
+
+def _haversine_miles(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Haversine distance between two lat/lon points in miles."""
+    R = 3958.8  # Earth radius in miles
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dlat / 2) ** 2
+        + math.cos(math.radians(lat1))
+        * math.cos(math.radians(lat2))
+        * math.sin(dlon / 2) ** 2
+    )
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
 # Published peer-reviewed clinical standards for resolution rates.
 # Source: medical society benchmarks, CMS quality measures, surgical registries.
 # The AI retrieves these — it does not set them.
@@ -144,6 +190,8 @@ def select_provider(
     patient_history: dict,
     state: Optional[str] = None,
     service_code: Optional[str] = None,
+    patient_lat: Optional[float] = None,
+    patient_lon: Optional[float] = None,
 ) -> dict:
     """Two-step provider selection per Constitution.
 
@@ -153,7 +201,10 @@ def select_provider(
     # === STEP 1: Clinical Filtering (TEE-isolated, zero financial data) ===
     # Runtime enforcement: verify no financial modules are loaded during Step 1
     _verify_financial_isolation_before_step1()
-    step1_result = _clinical_filtering(db, condition, benefit_type, patient_history, state)
+    step1_result = _clinical_filtering(
+        db, condition, benefit_type, patient_history, state,
+        patient_lat=patient_lat, patient_lon=patient_lon,
+    )
     # Step 1 is complete. Financial data may now be accessed for Step 2.
 
     # === STEP 2: Cost Optimization (outside TEE, financial data permitted) ===
@@ -223,6 +274,8 @@ def _clinical_filtering(
     benefit_type: str,
     patient_history: dict,
     state: Optional[str] = None,
+    patient_lat: Optional[float] = None,
+    patient_lon: Optional[float] = None,
 ) -> dict:
     """Step 1: Clinical sufficiency filtering (TEE-isolated, zero financial data).
 
@@ -233,9 +286,13 @@ def _clinical_filtering(
     category = _match_condition_to_category(condition, benefit_type)
     standard = CLINICAL_SUFFICIENCY_THRESHOLDS.get(category, CLINICAL_SUFFICIENCY_THRESHOLDS["general_medical"])
 
+    # Geographic range based on service type (item 1)
+    max_range_miles = SERVICE_RANGE_MILES.get(category, _DEFAULT_RANGE_MILES)
+
     # Query all providers that could serve this condition
     query = db.query(Provider)
-    if state:
+    if state and not (patient_lat and patient_lon):
+        # Fall back to state filter when no lat/lon available
         query = query.filter(Provider.state == state)
 
     # Filter by provider type matching benefit type
@@ -251,7 +308,25 @@ def _clinical_filtering(
     provider_types = type_map.get(benefit_type, ["physician", "hospital"])
     query = query.filter(Provider.provider_type.in_(provider_types))
 
-    all_providers = query.all()
+    candidates = query.all()
+
+    # Apply geographic range filter when patient location is available
+    if patient_lat is not None and patient_lon is not None:
+        all_providers = []
+        for p in candidates:
+            if p.latitude is not None and p.longitude is not None:
+                dist = _haversine_miles(patient_lat, patient_lon, p.latitude, p.longitude)
+                if dist <= max_range_miles:
+                    p._distance_miles = dist  # type: ignore[attr-defined]
+                    all_providers.append(p)
+            elif state and p.state == state:
+                # No coordinates — fall back to state match
+                p._distance_miles = None  # type: ignore[attr-defined]
+                all_providers.append(p)
+    else:
+        all_providers = candidates
+        for p in all_providers:
+            p._distance_miles = None  # type: ignore[attr-defined]
     approved = []
     evaluated = 0
 
@@ -272,22 +347,44 @@ def _clinical_filtering(
             lower_bound = quality / 100.0 if quality else 0.5  # Neutral prior
             confidence_width = 1.0  # Maximum uncertainty
 
-        # Provider passes if confidence-adjusted lower bound meets threshold
-        passes = lower_bound >= standard["threshold"] * 0.9  # 90% of threshold = floor
+        # Check employee concern flags — weight in future selections (item 14)
+        concern_penalty = 0.0
+        concern_count = 0
+        try:
+            from app.models.audit_log import AuditLog
+            concern_count = (
+                db.query(AuditLog)
+                .filter(
+                    AuditLog.action == "employee_provider_concern",
+                    AuditLog.resource_id == str(provider.provider_id),
+                )
+                .count()
+            )
+            if concern_count >= 3:
+                concern_penalty = 0.05  # Material penalty
+            elif concern_count >= 1:
+                concern_penalty = 0.02  # Minor penalty
+        except Exception:
+            pass
 
-        # For providers with zero platform data, use external quality score
-        if data_points == 0 and quality and quality >= 70:
-            passes = True  # Accept based on external data (Hospital Compare, etc.)
+        adjusted_lower = max(lower_bound - concern_penalty, 0.0)
+        passes_adjusted = adjusted_lower >= standard["threshold"] * 0.9
 
-        if passes:
+        if data_points == 0 and quality and quality >= 70 and concern_count < 3:
+            passes_adjusted = True
+
+        if passes_adjusted:
+            dist = getattr(provider, "_distance_miles", None)
             approved.append({
                 "provider_id": str(provider.provider_id),
                 "provider_name": provider.name,
                 "quality_score": quality,
                 "outcome_data_points": data_points,
-                "confidence_lower_bound": round(lower_bound, 4),
+                "confidence_lower_bound": round(adjusted_lower, 4),
                 "confidence_width": round(confidence_width, 4),
                 "data_source": "platform_verified" if data_points >= 30 else "external_supplemented",
+                "distance_miles": round(dist, 1) if dist is not None else None,
+                "employee_concern_flags": concern_count,
             })
 
     # Gray-area: if no providers meet threshold
@@ -315,9 +412,11 @@ def _clinical_filtering(
         "standard_referenced": category,
         "threshold_applied": standard["threshold"],
         "threshold_source": standard["source"],
+        "geographic_range_miles": max_range_miles,
         "reasoning": (
             f"Applied {standard['source']}. "
             f"Threshold: {standard['metric']} ≥ {standard['threshold']:.0%}. "
+            f"Geographic range: {max_range_miles} miles ({category} service type). "
             f"{evaluated} providers evaluated, {len(approved)} meet clinical sufficiency. "
             f"Resolution defined as: {_get_resolution_definition(condition)}"
         ),
@@ -680,3 +779,116 @@ def _consume_f8_quality_signals(db: Session, benefit_type: str, approved_provide
     except Exception as e:
         logger.warning(f"F8 quality signal consumption failed: {e}")
         return approved_providers
+
+
+# ---------------------------------------------------------------------------
+# Employee communication (Build Manifest item 13)
+# ---------------------------------------------------------------------------
+
+def explain_selection_to_employee(selection_result: dict) -> dict:
+    """Explain the selected provider and reasoning in plain language.
+
+    Constitution: "The selected provider and the reasoning are explained
+    to the employee in plain language with minimum cognitive load."
+    """
+    clinical = selection_result.get("clinical_filtering", {})
+    step2 = selection_result.get("selection", {})
+    provider_name = step2.get("selected_provider", "your provider")
+    price = step2.get("selected_price")
+    standard = clinical.get("standard_referenced", "published clinical standards")
+    approved_count = clinical.get("providers_approved", 0)
+    evaluated_count = clinical.get("providers_evaluated", 0)
+    range_miles = clinical.get("geographic_range_miles")
+
+    # Build plain-language explanation
+    lines = []
+    lines.append(f"We selected {provider_name} for your care.")
+
+    if range_miles:
+        lines.append(
+            f"We looked at {evaluated_count} providers within {range_miles} miles of you."
+        )
+    else:
+        lines.append(f"We looked at {evaluated_count} providers in your area.")
+
+    lines.append(
+        f"{approved_count} met the quality standards required by published "
+        f"medical guidelines ({standard})."
+    )
+
+    if price is not None:
+        lines.append(
+            f"Among those, {provider_name} offers the best verified price "
+            f"(${price:.2f}), so you pay nothing extra."
+        )
+    else:
+        lines.append(
+            f"Among those, {provider_name} was selected as the best option."
+        )
+
+    lines.append(
+        "If you have any concerns about this provider, you can flag them "
+        "at any time and we will factor that into future selections."
+    )
+
+    return {
+        "summary": " ".join(lines),
+        "provider_name": provider_name,
+        "quality_standard": standard,
+        "providers_evaluated": evaluated_count,
+        "providers_approved": approved_count,
+        "price": price,
+        "plain_language": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Employee concern flagging (Build Manifest item 14)
+# ---------------------------------------------------------------------------
+
+def flag_provider_concern(
+    db: Session,
+    employee_id: str,
+    provider_id: str,
+    concern_text: str,
+) -> dict:
+    """Record an employee's concern about a provider.
+
+    Constitution: "Employees can flag concerns about a provider at any
+    point, and those flags are weighted in future selections."
+
+    Concerns are stored in the audit log and weighted during clinical
+    filtering (see _clinical_filtering concern_penalty logic).
+    """
+    from app.models.audit_log import AuditLog
+
+    log = AuditLog(
+        actor=f"employee:{employee_id}",
+        action="employee_provider_concern",
+        resource_type="provider",
+        resource_id=provider_id,
+        details={
+            "employee_id": employee_id,
+            "provider_id": provider_id,
+            "concern_text": concern_text,
+            "flagged_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    db.add(log)
+    db.commit()
+
+    logger.info(
+        "Employee concern flagged: employee=%s, provider=%s",
+        employee_id, provider_id,
+    )
+
+    return {
+        "status": "recorded",
+        "employee_id": employee_id,
+        "provider_id": provider_id,
+        "message": (
+            "Your concern has been recorded. It will be factored into "
+            "future provider selections. Thank you for your feedback."
+        ),
+        "feeding_f8": True,
+    }
