@@ -17,6 +17,7 @@ from app.services.cost_prediction import (
     predict_employer_costs,
     get_prediction_accuracy,
     get_prediction_methodology,
+    detect_new_data_sources,
 )
 
 logger = logging.getLogger(__name__)
@@ -78,3 +79,13 @@ def prediction_methodology():
     (F7 pricing, F7A stop-loss).
     """
     return get_prediction_methodology()
+
+
+@router.get("/data-sources")
+def data_source_status(db: Session = Depends(get_db)):
+    """Check which public data sources are ingested, missing, or stale.
+
+    Constitution F3 item 13: automatically detects new public data sources
+    that would improve prediction accuracy.
+    """
+    return detect_new_data_sources(db)

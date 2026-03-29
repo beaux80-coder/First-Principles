@@ -17,6 +17,7 @@ from app.models.security import BAARecord, BreachIncident, SecurityAssessment
 from app.models.provider_offer import ProviderOffer
 from app.models.dispute import Dispute
 from app.models.provider_notification import ProviderNotification
+from app.models.cost_prediction import CostPredictionRecord, AccuracySnapshot
 
 __all__ = [
     "Employer",
@@ -42,4 +43,6 @@ __all__ = [
     "ProviderOffer",
     "Dispute",
     "ProviderNotification",
+    "CostPredictionRecord",
+    "AccuracySnapshot",
 ]
