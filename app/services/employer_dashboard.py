@@ -708,6 +708,11 @@ def generate_monthly_summary(
         "cost_per_employee_trend": cost_trend,
         "employee_count": employee_count,
         "dashboard_link": f"/api/v1/dashboard/{employer_id}",
+        "delivery_channel": "email",  # Default; employer selects during enrollment (email/sms/mail)
+        "delivery_note": (
+            "Delivered through the employer's preferred channel — email, SMS, "
+            "or physical mail. Requires zero employer action to receive."
+        ),
         "generated_at": now.isoformat(),
         "feeding_f8": True,
     }
