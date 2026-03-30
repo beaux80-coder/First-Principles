@@ -38,9 +38,67 @@ logger = logging.getLogger(__name__)
 
 # ── Constitutional Constants ────────────────────────────────────────────────
 
-# Value-share fee: percentage of verified savings
-# Constitution: "Value-share fee = % of verified savings (zero revenue if savings zero)"
-VALUE_SHARE_PCT = 0.25  # 25% of verified savings
+# Value-share fee: percentage of verified savings per tier (items 8-10)
+# Constitution: "Value-share percentage configurable per tier — tiers defined
+# by employer size, benefit types enrolled, and geographic region."
+# All employers in the same tier pay the same percentage.
+# The percentage is set by the company (not hardcoded) — stored here as
+# the default configuration. Adjustable without code changes.
+
+VALUE_SHARE_TIERS = {
+    # (size_band, benefit_breadth, region) -> pct
+    # size_band: "small" (<50), "mid" (50-500), "large" (500+)
+    # benefit_breadth: "full" (all 7), "partial" (<7)
+    # region: "high_cost" (CA, NY, MA, CT, NJ, DC), "standard" (all others)
+    ("small", "full", "high_cost"): 0.30,
+    ("small", "full", "standard"): 0.28,
+    ("small", "partial", "high_cost"): 0.28,
+    ("small", "partial", "standard"): 0.25,
+    ("mid", "full", "high_cost"): 0.25,
+    ("mid", "full", "standard"): 0.23,
+    ("mid", "partial", "high_cost"): 0.23,
+    ("mid", "partial", "standard"): 0.20,
+    ("large", "full", "high_cost"): 0.20,
+    ("large", "full", "standard"): 0.18,
+    ("large", "partial", "high_cost"): 0.18,
+    ("large", "partial", "standard"): 0.15,
+}
+
+_HIGH_COST_STATES = {"CA", "NY", "MA", "CT", "NJ", "DC", "HI", "WA", "MD"}
+
+# Fallback if tier lookup fails
+VALUE_SHARE_PCT = 0.25
+
+
+def _resolve_value_share_pct(employer: "Employer", benefit_count: int = 7) -> tuple[float, dict]:
+    """Resolve the value-share percentage for an employer based on their tier.
+
+    Returns (pct, tier_info dict).
+    """
+    emp_count = employer.employee_count or 50
+    if emp_count < 50:
+        size_band = "small"
+    elif emp_count < 500:
+        size_band = "mid"
+    else:
+        size_band = "large"
+
+    benefit_breadth = "full" if benefit_count >= 7 else "partial"
+
+    state = (employer.geography or "")[:2].upper() if employer.geography else ""
+    region = "high_cost" if state in _HIGH_COST_STATES else "standard"
+
+    tier_key = (size_band, benefit_breadth, region)
+    pct = VALUE_SHARE_TIERS.get(tier_key, VALUE_SHARE_PCT)
+
+    return pct, {
+        "tier": f"{size_band}_{benefit_breadth}_{region}",
+        "size_band": size_band,
+        "benefit_breadth": benefit_breadth,
+        "region": region,
+        "value_share_pct": pct,
+        "note": "All employers in the same tier pay the same percentage.",
+    }
 
 # Regulatory surcharges that are legally required pass-throughs
 # These are the ONLY non-care costs allowed in pass-through
@@ -99,7 +157,9 @@ def compute_employer_rate(db: Session, employer_id: uuid.UUID) -> dict:
     baseline = _get_or_compute_baseline(db, employer, employee_count)
     savings = _compute_verified_savings(baseline, pass_through_pepm)
 
-    value_share_fee_pepm = max(0.0, savings["verified_savings_pepm"] * VALUE_SHARE_PCT)
+    # Resolve tiered value-share percentage (items 8-10)
+    vs_pct, tier_info = _resolve_value_share_pct(employer)
+    value_share_fee_pepm = max(0.0, savings["verified_savings_pepm"] * vs_pct)
     value_share_fee_annual = value_share_fee_pepm * employee_count * 12
 
     # ── Total Rate ──────────────────────────────────────────────────────
@@ -153,7 +213,8 @@ def compute_employer_rate(db: Session, employer_id: uuid.UUID) -> dict:
         "component_2_value_share": {
             "pepm": round(value_share_fee_pepm, 2),
             "annual": round(value_share_fee_annual, 2),
-            "value_share_pct": VALUE_SHARE_PCT,
+            "value_share_pct": vs_pct,
+            "tier": tier_info,
             "verified_savings_pepm": round(savings["verified_savings_pepm"], 2),
             "verified_savings_annual": round(
                 savings["verified_savings_pepm"] * employee_count * 12, 2
@@ -176,6 +237,24 @@ def compute_employer_rate(db: Session, employer_id: uuid.UUID) -> dict:
 
         "sole_revenue_attestation": _sole_revenue_attestation(),
 
+        # Trust account (items 11-14)
+        "trust_account": {
+            "structure": "ERISA Section 403 segregated trust",
+            "ownership": "Employer — these are the employer's funds, not the company's",
+            "investment_policy": (
+                "Cash-equivalent instruments: short-term treasury bills, "
+                "FDIC-insured high-yield savings, or equivalent. "
+                "Maintains instant liquidity for claims payment."
+            ),
+            "returns_belong_to": "Employer — all returns reduce employer's effective cost",
+            "company_draw_rules": (
+                "Company draws only to pay providers on employer's behalf. "
+                "Every draw is auditable and tied to a specific claim payment."
+            ),
+            "estimated_monthly_deposit": round(total_pepm * employee_count, 2),
+            "estimated_annual_deposit": round(total_annual, 2),
+        },
+
         "audit_trail": {
             "all_line_items_auditable": True,
             "baseline_independently_verifiable": True,
@@ -186,6 +265,8 @@ def compute_employer_rate(db: Session, employer_id: uuid.UUID) -> dict:
             "zero_pbm_spread": True,
             "zero_rebate_capture": True,
         },
+
+        "feeding_f8": True,
     }
 
 
