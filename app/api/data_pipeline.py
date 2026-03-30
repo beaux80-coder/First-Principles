@@ -502,3 +502,70 @@ def tipping_points():
     from app.services.distribution_engine import get_service_level_thresholds
 
     return get_service_level_thresholds()
+
+
+@router.get("/employer-export/{employer_id}")
+def export_employer_data(employer_id: str, db: Session = Depends(get_db)):
+    """Export all of an employer's raw data. Constitution F8 items 34-36.
+
+    Employers own their raw data and may export it at any time.
+    AI models and aggregated datasets are company assets and are NOT exported.
+    """
+    from app.models.claim import Claim
+    from app.models.employee import Employee
+
+    claims = db.query(Claim).filter(Claim.employer_id == employer_id).all()
+    employees = db.query(Employee).filter(Employee.employer_id == employer_id).all()
+
+    return {
+        "employer_id": employer_id,
+        "data_ownership": "Employer owns all raw data. May export at any time.",
+        "company_assets_note": (
+            "AI models, aggregated datasets, and derived insights are company "
+            "assets and are not included in this export."
+        ),
+        "claims_count": len(claims),
+        "employees_count": len(employees),
+        "claims": [
+            {
+                "claim_id": str(c.claim_id),
+                "benefit_type": c.benefit_type.value if c.benefit_type else None,
+                "status": c.status.value if c.status else None,
+                "amount_billed": float(c.amount_billed) if c.amount_billed else None,
+                "amount_paid": float(c.amount_paid) if c.amount_paid else None,
+                "submitted_at": c.submitted_at.isoformat() if c.submitted_at else None,
+            }
+            for c in claims
+        ],
+        "employees": [
+            {
+                "employee_id": str(e.employee_id),
+                "status": e.status.value if e.status else None,
+                "enrolled_at": e.enrolled_at.isoformat() if e.enrolled_at else None,
+            }
+            for e in employees
+        ],
+        "proprietary_data_never_exposed": True,
+    }
+
+
+@router.get("/scale-patterns")
+def scale_dependent_patterns(db: Session = Depends(get_db)):
+    """Track patterns only detectable at current data density.
+
+    Constitution F8 item 40: measures compounding advantage.
+    """
+    from app.services.cross_type_analytics import detect_scale_dependent_patterns
+
+    return detect_scale_dependent_patterns(db)
+
+
+@router.get("/conventional-wisdom")
+def conventional_wisdom_contradictions(db: Session = Depends(get_db)):
+    """Find pricing anomalies that contradict industry assumptions.
+
+    Constitution F8 item 41: identifies structural inefficiencies.
+    """
+    from app.services.cross_type_analytics import detect_conventional_wisdom_contradictions
+
+    return detect_conventional_wisdom_contradictions(db)
