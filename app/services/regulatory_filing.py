@@ -1579,3 +1579,90 @@ def _get_employer_or_raise(db: Session, employer_id: uuid.UUID) -> Employer:
     if not employer:
         raise ValueError(f"Employer {employer_id} not found")
     return employer
+
+
+# ---------------------------------------------------------------------------
+# ERISA plan document generation (Build Manifest item 17)
+# ---------------------------------------------------------------------------
+
+def generate_erisa_plan_document(db: Session, employer_id) -> dict:
+    """Generate an ERISA plan document and service agreement for digital signing.
+
+    Build Manifest item 17: Digital signing on activation. Produces the
+    plan document content that will be hashed and signed during one-click
+    activation from shadow mode.
+
+    Returns a dict representing the document structure — the caller is
+    responsible for hashing and recording the signing event.
+    """
+    employer = db.query(Employer).filter(
+        Employer.employer_id == employer_id,
+    ).first()
+    if not employer:
+        return {"error": "employer_not_found", "employer_id": str(employer_id)}
+
+    now = datetime.now(UTC)
+    plan_year = now.year
+
+    employee_count = employer.employee_count or 0
+    active_employees = db.query(func.count(Employee.employee_id)).filter(
+        Employee.employer_id == employer_id,
+        Employee.status == EmployeeStatus.active,
+    ).scalar() or 0
+
+    return {
+        "document_type": "erisa_plan_document_and_service_agreement",
+        "plan_year": plan_year,
+        "generated_at": now.isoformat(),
+        "employer": {
+            "employer_id": str(employer.employer_id),
+            "name": employer.name,
+            "industry": employer.industry,
+            "geography": employer.geography,
+            "employee_count": employee_count,
+            "active_employees": active_employees,
+        },
+        "plan_details": {
+            "plan_name": f"{employer.name} Employee Welfare Benefit Plan",
+            "plan_type": "self_funded_welfare_benefit",
+            "erisa_section": "Section 3(1) welfare benefit plan",
+            "benefit_types_covered": [
+                "health", "dental", "vision", "mental_health",
+                "life_insurance", "short_term_disability", "long_term_disability",
+            ],
+            "plan_year_start": f"{plan_year}-01-01",
+            "plan_year_end": f"{plan_year}-12-31",
+            "plan_administrator": "System (automated administration)",
+            "named_fiduciary": employer.name,
+        },
+        "service_agreement": {
+            "services_provided": [
+                "Claims adjudication and payment",
+                "Clinical quality review",
+                "Price discovery and provider payment",
+                "Employee support and care coordination",
+                "Regulatory filing and compliance",
+                "Stop-loss procurement and management",
+            ],
+            "fee_structure": "Value-share: 25% of verified savings vs. prior cost basis",
+            "pass_through_guarantee": (
+                "All non-fee dollars pass through to care delivery and "
+                "stop-loss at cost. Zero markup, zero hidden fees."
+            ),
+            "termination_provision": (
+                "Employer may terminate at any time. All data returned. "
+                "No termination fees. No lock-in period."
+            ),
+        },
+        "compliance": {
+            "erisa_compliance": True,
+            "aca_compliance": True,
+            "hipaa_compliance": True,
+            "state_insurance_compliance": True,
+            "fiduciary_standard": (
+                "System operates under ERISA fiduciary standard: "
+                "all decisions made solely in the interest of plan "
+                "participants and beneficiaries."
+            ),
+        },
+    }
