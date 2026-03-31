@@ -3,7 +3,7 @@ from datetime import datetime
 
 import enum
 
-from sqlalchemy import ForeignKey, DateTime
+from sqlalchemy import ForeignKey, DateTime, JSON, String
 from sqlalchemy import Enum as SAEnum
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -34,6 +34,10 @@ class Employee(Base):
     terminated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     # Demographics stored as encrypted JSON (age, zip, dependents)
     demographics_encrypted: Mapped[str | None] = mapped_column(EncryptedString(), nullable=True)
+    # Scheduling availability (item 16: stored during first interaction, updatable via text)
+    availability: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # Preferred communication channel (item 22: works on any phone)
+    preferred_channel: Mapped[str | None] = mapped_column(String(20), nullable=True, default="sms")
 
     employer = relationship("Employer", back_populates="employees")
     claims = relationship("Claim", back_populates="employee")
