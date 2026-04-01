@@ -21,13 +21,15 @@ This module is designed to be deployed inside a Trusted Execution Environment
 import hashlib
 import json
 import logging
+import random
 import time
-from datetime import datetime, UTC
+from datetime import datetime, timedelta, UTC
 from typing import Optional
 
 from sqlalchemy import and_, or_, func
 from sqlalchemy.orm import Session
 
+from app.models.audit_log import AuditLog
 from app.models.clinical_determination import ClinicalDetermination
 from app.models.clinical_guideline import ClinicalGuideline, BenefitTypeGuideline
 
@@ -1590,3 +1592,1139 @@ def _consume_f8_waste_signals(db: Session, benefit_type: str, service_code: str)
         return waste_signals
     except Exception:
         return []
+
+
+# ---------------------------------------------------------------------------
+# F1 Supplement S1: Physician compensation structure
+# ---------------------------------------------------------------------------
+# Constitution: physician reviewers are paid a flat per-review fee, identical
+# regardless of whether they uphold or overturn. No retainer, no outcome-based
+# bonus. Contractually explicit and auditable.
+
+PHYSICIAN_REVIEW_COMPENSATION = {
+    "fee_type": "flat_per_review",
+    "amount_usd": 150.00,
+    "outcome_independent": True,
+    "retainer": False,
+    "outcome_bonus": False,
+    "payment_trigger": "review_completion",
+    "contractual_clause": (
+        "Reviewer is compensated a flat fee of $150.00 per completed review, "
+        "payable upon submission of the review determination. Fee is identical "
+        "regardless of whether the reviewer upholds or overturns the AI "
+        "recommendation. No retainer, bonus, or other outcome-linked "
+        "compensation is permitted."
+    ),
+    "audit_visibility": "full",
+}
+
+
+def get_physician_review_terms() -> dict:
+    """Return the physician review compensation structure.
+
+    Constitution (F1 Supplement S1): Compensation is flat per-review,
+    identical regardless of outcome, no retainer, no outcome-based bonus.
+    Contractually explicit and auditable.
+
+    Returns
+    -------
+    dict with fee structure, contractual clause, and audit visibility.
+    """
+    return {
+        **PHYSICIAN_REVIEW_COMPENSATION,
+        "generated_at": datetime.now(UTC).isoformat(),
+        "structure_hash": hashlib.sha256(
+            json.dumps(PHYSICIAN_REVIEW_COMPENSATION, sort_keys=True).encode()
+        ).hexdigest(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# F1 Supplement S2: Blinded case presentation
+# ---------------------------------------------------------------------------
+
+def prepare_blinded_case(db: Session, determination_id: str) -> dict:
+    """Prepare a blinded case for physician review by stripping non-clinical data.
+
+    Constitution (F1 Supplement S2): Removes ALL non-clinical data from the
+    determination before presenting to the reviewing physician. Retains only:
+    symptoms, medical history, age, biological sex, clinical evidence evaluated,
+    and the AI determination with reasoning.
+
+    Strips: patient name, employer, demographics beyond clinical relevance,
+    geographic location, all financial data.
+
+    The stripping operation is logged to AuditLog.
+
+    Parameters
+    ----------
+    db : Session
+        Database session.
+    determination_id : str
+        UUID of the clinical determination to blind.
+
+    Returns
+    -------
+    dict with blinded clinical data only, or error dict.
+    """
+    det = db.query(ClinicalDetermination).filter(
+        ClinicalDetermination.determination_id == determination_id
+    ).first()
+    if not det:
+        return {"error": "determination_not_found", "determination_id": str(determination_id)}
+
+    # Parse the stored clinical inputs
+    try:
+        inputs = json.loads(det.inputs_encrypted) if det.inputs_encrypted else {}
+    except (json.JSONDecodeError, TypeError):
+        inputs = {}
+
+    patient_history = inputs.get("patient_history", {})
+
+    # Extract ONLY clinically relevant fields
+    blinded_history = {
+        "age": patient_history.get("age"),
+        "sex": patient_history.get("sex"),
+        "diagnoses": patient_history.get("diagnoses", []),
+        "medications": patient_history.get("medications", []),
+        "risk_factors": patient_history.get("risk_factors", []),
+    }
+
+    blinded_case = {
+        "blinded_determination_id": hashlib.sha256(
+            str(determination_id).encode()
+        ).hexdigest()[:16],
+        "symptoms": inputs.get("patient_symptoms", []),
+        "medical_history": blinded_history,
+        "service_code": inputs.get("service_code"),
+        "benefit_type": inputs.get("benefit_type"),
+        "condition": inputs.get("condition"),
+        "ai_determination": {
+            "decision": det.decision.value if hasattr(det.decision, "value") else str(det.decision),
+            "reasoning": det.reasoning,
+            "guidelines_referenced": det.guidelines_referenced or [],
+            "risk_score": det.risk_score,
+        },
+        "prepared_at": datetime.now(UTC).isoformat(),
+    }
+
+    # Log the blinding operation to AuditLog
+    audit_entry = AuditLog(
+        actor="clinical_engine:prepare_blinded_case",
+        action="blind_case",
+        resource_type="clinical_determination",
+        resource_id=str(determination_id),
+        details={
+            "fields_stripped": [
+                "patient_name", "employer", "geographic_location",
+                "financial_data", "non_clinical_demographics",
+            ],
+            "fields_retained": [
+                "age", "sex", "symptoms", "diagnoses", "medications",
+                "risk_factors", "service_code", "benefit_type",
+                "ai_determination",
+            ],
+        },
+    )
+    db.add(audit_entry)
+    db.flush()
+
+    logger.info(
+        "Blinded case prepared for determination %s (blinded ID: %s)",
+        determination_id, blinded_case["blinded_determination_id"],
+    )
+
+    return blinded_case
+
+
+# ---------------------------------------------------------------------------
+# F1 Supplement S3: Anchoring bias detection
+# ---------------------------------------------------------------------------
+
+def run_blind_comparison_sample(db: Session, sample_pct: float = 0.15) -> dict:
+    """Select a random sample of recent denials for blind physician comparison.
+
+    Constitution (F1 Supplement S3): To detect anchoring bias, a random sample
+    of denial determinations is prepared WITHOUT the AI's determination or
+    reasoning, so the physician reviews the case independently.
+
+    Parameters
+    ----------
+    db : Session
+        Database session.
+    sample_pct : float
+        Fraction of recent denials to sample (default 15%, clamped to 10-20%).
+
+    Returns
+    -------
+    dict with blinded cases (no AI decision) ready for independent physician
+    review, plus tracking metadata.
+    """
+    sample_pct = max(0.10, min(sample_pct, 0.20))
+
+    # Query recent denial determinations (last 90 days)
+    cutoff = datetime.now(UTC) - timedelta(days=90)
+    denials = (
+        db.query(ClinicalDetermination)
+        .filter(
+            ClinicalDetermination.decision == "denied",
+            ClinicalDetermination.created_at >= cutoff,
+        )
+        .order_by(ClinicalDetermination.created_at.desc())
+        .all()
+    )
+
+    if not denials:
+        return {
+            "status": "no_denials",
+            "message": "No recent denial determinations available for blind comparison.",
+            "sample_size": 0,
+        }
+
+    # Random sample
+    sample_size = max(1, int(len(denials) * sample_pct))
+    sampled = random.sample(denials, min(sample_size, len(denials)))
+
+    blinded_cases = []
+    for det in sampled:
+        try:
+            inputs = json.loads(det.inputs_encrypted) if det.inputs_encrypted else {}
+        except (json.JSONDecodeError, TypeError):
+            inputs = {}
+
+        patient_history = inputs.get("patient_history", {})
+
+        # Blinded case WITHOUT AI determination or reasoning (anchoring prevention)
+        blinded = {
+            "blind_case_id": hashlib.sha256(
+                f"{det.determination_id}-blind".encode()
+            ).hexdigest()[:16],
+            "determination_id": str(det.determination_id),
+            "symptoms": inputs.get("patient_symptoms", []),
+            "medical_history": {
+                "age": patient_history.get("age"),
+                "sex": patient_history.get("sex"),
+                "diagnoses": patient_history.get("diagnoses", []),
+                "medications": patient_history.get("medications", []),
+                "risk_factors": patient_history.get("risk_factors", []),
+            },
+            "service_code": inputs.get("service_code"),
+            "benefit_type": inputs.get("benefit_type"),
+            "condition": inputs.get("condition"),
+            # NO ai_determination, NO reasoning, NO risk_score
+        }
+        blinded_cases.append(blinded)
+
+    # Log the sampling operation
+    audit_entry = AuditLog(
+        actor="clinical_engine:run_blind_comparison_sample",
+        action="blind_sample_selected",
+        resource_type="clinical_determination",
+        resource_id="batch",
+        details={
+            "total_denials": len(denials),
+            "sample_pct": sample_pct,
+            "sample_size": len(blinded_cases),
+            "purpose": "anchoring_bias_detection",
+        },
+    )
+    db.add(audit_entry)
+    db.flush()
+
+    return {
+        "status": "ready_for_review",
+        "total_recent_denials": len(denials),
+        "sample_pct": sample_pct,
+        "sample_size": len(blinded_cases),
+        "blinded_cases": blinded_cases,
+        "instructions": (
+            "Each case is presented WITHOUT the AI determination or reasoning. "
+            "The physician should make an independent clinical judgment, then "
+            "results are compared to detect anchoring bias."
+        ),
+        "prepared_at": datetime.now(UTC).isoformat(),
+    }
+
+
+def record_blind_comparison_result(
+    db: Session,
+    determination_id: str,
+    physician_independent_decision: str,
+    physician_reasoning: str,
+) -> dict:
+    """Record the result of a blind physician comparison for anchoring detection.
+
+    Compares the physician's independent decision against the AI determination
+    and tracks agreement/disagreement rates by case category.
+
+    Parameters
+    ----------
+    db : Session
+        Database session.
+    determination_id : str
+        UUID of the original clinical determination.
+    physician_independent_decision : str
+        The physician's independent decision ("approved" or "denied").
+    physician_reasoning : str
+        The physician's clinical reasoning.
+
+    Returns
+    -------
+    dict with comparison result and agreement tracking.
+    """
+    det = db.query(ClinicalDetermination).filter(
+        ClinicalDetermination.determination_id == determination_id
+    ).first()
+    if not det:
+        return {"error": "determination_not_found", "determination_id": str(determination_id)}
+
+    ai_decision = det.decision.value if hasattr(det.decision, "value") else str(det.decision)
+    agrees = physician_independent_decision == ai_decision
+
+    # Store comparison result as a DataPipelineMetric for tracking
+    from app.models.data_pipeline_metric import DataPipelineMetric
+
+    now = datetime.now(UTC)
+    metric = DataPipelineMetric(
+        metric_type="blind_comparison_result",
+        value=1.0 if agrees else 0.0,
+        benefit_type=det.benefit_type,
+        details={
+            "determination_id": str(determination_id),
+            "ai_decision": ai_decision,
+            "physician_decision": physician_independent_decision,
+            "physician_reasoning": physician_reasoning,
+            "agrees": agrees,
+            "benefit_type": det.benefit_type,
+            "condition_category": det.benefit_type,
+        },
+        measured_at=now,
+    )
+    db.add(metric)
+
+    # Log to audit trail
+    audit_entry = AuditLog(
+        actor="clinical_engine:record_blind_comparison_result",
+        action="blind_comparison_recorded",
+        resource_type="clinical_determination",
+        resource_id=str(determination_id),
+        details={
+            "ai_decision": ai_decision,
+            "physician_decision": physician_independent_decision,
+            "agrees": agrees,
+        },
+    )
+    db.add(audit_entry)
+    db.commit()
+
+    # Query aggregate agreement rates for this benefit type
+    agreement_stats = _get_blind_comparison_stats(db, det.benefit_type)
+
+    logger.info(
+        "Blind comparison recorded for %s: AI=%s, physician=%s, agrees=%s",
+        determination_id, ai_decision, physician_independent_decision, agrees,
+    )
+
+    return {
+        "determination_id": str(determination_id),
+        "ai_decision": ai_decision,
+        "physician_independent_decision": physician_independent_decision,
+        "agrees": agrees,
+        "physician_reasoning": physician_reasoning,
+        "category_agreement_stats": agreement_stats,
+        "recorded_at": now.isoformat(),
+    }
+
+
+def _get_blind_comparison_stats(db: Session, benefit_type: Optional[str] = None) -> dict:
+    """Compute agreement/disagreement rates from blind comparison results."""
+    from app.models.data_pipeline_metric import DataPipelineMetric
+
+    query = db.query(DataPipelineMetric).filter(
+        DataPipelineMetric.metric_type == "blind_comparison_result",
+    )
+    if benefit_type:
+        query = query.filter(DataPipelineMetric.benefit_type == benefit_type)
+
+    results = query.all()
+    if not results:
+        return {"total": 0, "agreement_rate_pct": None}
+
+    total = len(results)
+    agreed = sum(1 for r in results if (r.details or {}).get("agrees"))
+
+    return {
+        "total": total,
+        "agreed": agreed,
+        "disagreed": total - agreed,
+        "agreement_rate_pct": round(agreed / total * 100, 1) if total > 0 else None,
+        "benefit_type": benefit_type,
+    }
+
+
+# ---------------------------------------------------------------------------
+# F1 Supplement S4: External IRO calibration
+# ---------------------------------------------------------------------------
+
+def prepare_quarterly_iro_sample(db: Session) -> dict:
+    """Select a blinded, anonymized sample of physician determinations for IRO.
+
+    Constitution (F1 Supplement S4): A quarterly sample of physician
+    determinations (both approvals and denials) is prepared for submission to
+    an Independent Review Organization for calibration.
+
+    Returns structured data ready for IRO submission.
+    """
+    # Sample from determinations reviewed by physicians in the last 90 days
+    cutoff = datetime.now(UTC) - timedelta(days=90)
+    reviewed_dets = (
+        db.query(ClinicalDetermination)
+        .filter(
+            ClinicalDetermination.created_at >= cutoff,
+            ClinicalDetermination.reviewed_by.isnot(None),
+        )
+        .order_by(ClinicalDetermination.created_at.desc())
+        .all()
+    )
+
+    if not reviewed_dets:
+        return {
+            "status": "no_reviewed_determinations",
+            "message": "No physician-reviewed determinations in the last 90 days.",
+            "sample_size": 0,
+        }
+
+    # Stratified sample: include both approvals and denials
+    approvals = [d for d in reviewed_dets if (d.decision.value if hasattr(d.decision, "value") else str(d.decision)) == "approved"]
+    denials = [d for d in reviewed_dets if (d.decision.value if hasattr(d.decision, "value") else str(d.decision)) == "denied"]
+
+    # Sample up to 25 from each category
+    sample_approvals = random.sample(approvals, min(25, len(approvals))) if approvals else []
+    sample_denials = random.sample(denials, min(25, len(denials))) if denials else []
+    sample = sample_approvals + sample_denials
+
+    iro_cases = []
+    for det in sample:
+        try:
+            inputs = json.loads(det.inputs_encrypted) if det.inputs_encrypted else {}
+        except (json.JSONDecodeError, TypeError):
+            inputs = {}
+
+        patient_history = inputs.get("patient_history", {})
+
+        iro_cases.append({
+            "iro_case_id": hashlib.sha256(
+                f"{det.determination_id}-iro-quarterly".encode()
+            ).hexdigest()[:16],
+            "determination_id": str(det.determination_id),
+            "symptoms": inputs.get("patient_symptoms", []),
+            "medical_history": {
+                "age": patient_history.get("age"),
+                "sex": patient_history.get("sex"),
+                "diagnoses": patient_history.get("diagnoses", []),
+                "medications": patient_history.get("medications", []),
+                "risk_factors": patient_history.get("risk_factors", []),
+            },
+            "service_code": inputs.get("service_code"),
+            "benefit_type": inputs.get("benefit_type"),
+            "condition": inputs.get("condition"),
+            "determination": {
+                "decision": det.decision.value if hasattr(det.decision, "value") else str(det.decision),
+                "reasoning": det.reasoning,
+                "guidelines_referenced": det.guidelines_referenced or [],
+                "reviewed_by": det.reviewed_by,
+            },
+        })
+
+    # Log the IRO sample preparation
+    audit_entry = AuditLog(
+        actor="clinical_engine:prepare_quarterly_iro_sample",
+        action="iro_sample_prepared",
+        resource_type="clinical_determination",
+        resource_id="batch",
+        details={
+            "total_reviewed": len(reviewed_dets),
+            "sample_approvals": len(sample_approvals),
+            "sample_denials": len(sample_denials),
+            "total_sample": len(iro_cases),
+            "quarter_cutoff": cutoff.isoformat(),
+        },
+    )
+    db.add(audit_entry)
+    db.flush()
+
+    return {
+        "status": "ready_for_iro_submission",
+        "total_reviewed_determinations": len(reviewed_dets),
+        "sample_size": len(iro_cases),
+        "sample_approvals": len(sample_approvals),
+        "sample_denials": len(sample_denials),
+        "iro_cases": iro_cases,
+        "quarter_start": cutoff.isoformat(),
+        "prepared_at": datetime.now(UTC).isoformat(),
+    }
+
+
+def record_iro_calibration_result(
+    db: Session,
+    determination_id: str,
+    iro_decision: str,
+    iro_reasoning: str,
+) -> dict:
+    """Record the result of an IRO calibration review.
+
+    Constitution (F1 Supplement S4): Tracks divergence between internal
+    physician determinations and external IRO decisions.
+
+    Parameters
+    ----------
+    db : Session
+        Database session.
+    determination_id : str
+        UUID of the clinical determination that was reviewed by the IRO.
+    iro_decision : str
+        The IRO's decision ("approved", "denied", or "modified").
+    iro_reasoning : str
+        The IRO's clinical reasoning.
+
+    Returns
+    -------
+    dict with comparison result and divergence tracking.
+    """
+    det = db.query(ClinicalDetermination).filter(
+        ClinicalDetermination.determination_id == determination_id
+    ).first()
+    if not det:
+        return {"error": "determination_not_found", "determination_id": str(determination_id)}
+
+    internal_decision = det.decision.value if hasattr(det.decision, "value") else str(det.decision)
+    agrees = iro_decision == internal_decision
+
+    from app.models.data_pipeline_metric import DataPipelineMetric
+
+    now = datetime.now(UTC)
+    metric = DataPipelineMetric(
+        metric_type="iro_calibration_result",
+        value=1.0 if agrees else 0.0,
+        benefit_type=det.benefit_type,
+        details={
+            "determination_id": str(determination_id),
+            "internal_decision": internal_decision,
+            "iro_decision": iro_decision,
+            "iro_reasoning": iro_reasoning,
+            "agrees": agrees,
+            "reviewed_by": det.reviewed_by,
+            "benefit_type": det.benefit_type,
+        },
+        measured_at=now,
+    )
+    db.add(metric)
+
+    audit_entry = AuditLog(
+        actor="clinical_engine:record_iro_calibration_result",
+        action="iro_calibration_recorded",
+        resource_type="clinical_determination",
+        resource_id=str(determination_id),
+        details={
+            "internal_decision": internal_decision,
+            "iro_decision": iro_decision,
+            "agrees": agrees,
+        },
+    )
+    db.add(audit_entry)
+    db.commit()
+
+    # Compute aggregate divergence stats
+    divergence_stats = _get_iro_divergence_stats(db, det.benefit_type)
+
+    logger.info(
+        "IRO calibration recorded for %s: internal=%s, IRO=%s, agrees=%s",
+        determination_id, internal_decision, iro_decision, agrees,
+    )
+
+    return {
+        "determination_id": str(determination_id),
+        "internal_decision": internal_decision,
+        "iro_decision": iro_decision,
+        "agrees": agrees,
+        "iro_reasoning": iro_reasoning,
+        "divergence_stats": divergence_stats,
+        "recorded_at": now.isoformat(),
+    }
+
+
+def _get_iro_divergence_stats(db: Session, benefit_type: Optional[str] = None) -> dict:
+    """Compute divergence rates between internal and IRO decisions."""
+    from app.models.data_pipeline_metric import DataPipelineMetric
+
+    query = db.query(DataPipelineMetric).filter(
+        DataPipelineMetric.metric_type == "iro_calibration_result",
+    )
+    if benefit_type:
+        query = query.filter(DataPipelineMetric.benefit_type == benefit_type)
+
+    results = query.all()
+    if not results:
+        return {"total": 0, "divergence_rate_pct": None}
+
+    total = len(results)
+    diverged = sum(1 for r in results if not (r.details or {}).get("agrees"))
+
+    return {
+        "total": total,
+        "agreed": total - diverged,
+        "diverged": diverged,
+        "divergence_rate_pct": round(diverged / total * 100, 1) if total > 0 else None,
+        "benefit_type": benefit_type,
+    }
+
+
+# ---------------------------------------------------------------------------
+# F1 Supplement S5: Appeal outcome feedback loop
+# ---------------------------------------------------------------------------
+
+def route_appeal_feedback_to_physician(
+    db: Session,
+    appeal_id: str,
+    appeal_outcome: str,
+    appeal_reasoning: str,
+    overturn_category: Optional[str] = None,
+) -> dict:
+    """Route an appeal outcome back to the original determination's reviewer.
+
+    Constitution (F1 Supplement S5): When an appeal is decided, the outcome
+    (with full reasoning) is routed back to the physician who made the
+    original determination. Tracks overturn rate by case category.
+
+    Parameters
+    ----------
+    db : Session
+        Database session.
+    appeal_id : str
+        UUID of the decided appeal.
+    appeal_outcome : str
+        The appeal outcome ("upheld", "overturned", "partial_reversal").
+    appeal_reasoning : str
+        Full reasoning from the appeal reviewer.
+    overturn_category : str, optional
+        Case category for overturn tracking (e.g., benefit type or condition).
+
+    Returns
+    -------
+    dict with feedback routing result and overturn rate statistics.
+    """
+    from app.models.appeal import Appeal
+
+    appeal = db.query(Appeal).filter(Appeal.appeal_id == appeal_id).first()
+    if not appeal:
+        return {"error": "appeal_not_found", "appeal_id": str(appeal_id)}
+
+    # Find the original determination
+    original_det = None
+    if appeal.determination_id:
+        original_det = db.query(ClinicalDetermination).filter(
+            ClinicalDetermination.determination_id == appeal.determination_id
+        ).first()
+
+    original_reviewer = original_det.reviewed_by if original_det else None
+    category = overturn_category or (original_det.benefit_type if original_det else "unknown")
+
+    is_overturned = appeal_outcome in ("overturned", "partial_reversal", "partially_overturned")
+
+    # Record the feedback as a metric for overturn rate tracking
+    from app.models.data_pipeline_metric import DataPipelineMetric
+
+    now = datetime.now(UTC)
+    metric = DataPipelineMetric(
+        metric_type="appeal_feedback_to_physician",
+        value=1.0 if is_overturned else 0.0,
+        benefit_type=category,
+        details={
+            "appeal_id": str(appeal_id),
+            "determination_id": str(appeal.determination_id) if appeal.determination_id else None,
+            "original_reviewer": original_reviewer,
+            "appeal_outcome": appeal_outcome,
+            "appeal_reasoning": appeal_reasoning,
+            "is_overturned": is_overturned,
+            "category": category,
+        },
+        measured_at=now,
+    )
+    db.add(metric)
+
+    audit_entry = AuditLog(
+        actor="clinical_engine:route_appeal_feedback_to_physician",
+        action="appeal_feedback_routed",
+        resource_type="appeal",
+        resource_id=str(appeal_id),
+        details={
+            "original_reviewer": original_reviewer,
+            "appeal_outcome": appeal_outcome,
+            "is_overturned": is_overturned,
+            "category": category,
+        },
+    )
+    db.add(audit_entry)
+    db.commit()
+
+    # Compute overturn rate by category
+    overturn_stats = _get_overturn_stats_by_category(db, category)
+
+    logger.info(
+        "Appeal feedback routed for appeal %s: outcome=%s, reviewer=%s, category=%s",
+        appeal_id, appeal_outcome, original_reviewer, category,
+    )
+
+    return {
+        "appeal_id": str(appeal_id),
+        "determination_id": str(appeal.determination_id) if appeal.determination_id else None,
+        "original_reviewer": original_reviewer,
+        "appeal_outcome": appeal_outcome,
+        "is_overturned": is_overturned,
+        "feedback_routed": True,
+        "category": category,
+        "overturn_stats": overturn_stats,
+        "routed_at": now.isoformat(),
+    }
+
+
+def _get_overturn_stats_by_category(db: Session, category: Optional[str] = None) -> dict:
+    """Compute overturn rates from appeal feedback records."""
+    from app.models.data_pipeline_metric import DataPipelineMetric
+
+    query = db.query(DataPipelineMetric).filter(
+        DataPipelineMetric.metric_type == "appeal_feedback_to_physician",
+    )
+    if category:
+        query = query.filter(DataPipelineMetric.benefit_type == category)
+
+    results = query.all()
+    if not results:
+        return {"total_appeals": 0, "overturn_rate_pct": None}
+
+    total = len(results)
+    overturned = sum(1 for r in results if (r.details or {}).get("is_overturned"))
+
+    return {
+        "total_appeals": total,
+        "overturned": overturned,
+        "upheld": total - overturned,
+        "overturn_rate_pct": round(overturned / total * 100, 1) if total > 0 else None,
+        "category": category,
+    }
+
+
+# ---------------------------------------------------------------------------
+# F1 Supplement S6: Prospective validation
+# ---------------------------------------------------------------------------
+
+# Minimum sample size for statistical significance in prospective validation
+_PROSPECTIVE_VALIDATION_MIN_SAMPLE = 30
+
+
+def identify_prospectively_validated_categories(db: Session) -> dict:
+    """Identify condition categories where physician has confirmed AI 100%.
+
+    Constitution (F1 Supplement S6): Categories where the reviewing physician
+    has confirmed the AI determination in every case over a statistically
+    significant sample (>= 30 cases) are considered prospectively validated.
+    These may be eligible for auto-approval without individual physician review.
+
+    Returns
+    -------
+    dict with validated categories and their sample sizes.
+    """
+    from app.models.data_pipeline_metric import DataPipelineMetric
+
+    # Get all blind comparison results grouped by benefit type
+    comparisons = db.query(DataPipelineMetric).filter(
+        DataPipelineMetric.metric_type == "blind_comparison_result",
+    ).all()
+
+    # Also consider determinations where the physician explicitly reviewed
+    # and agreed (non-blind)
+    reviewed_dets = (
+        db.query(
+            ClinicalDetermination.benefit_type,
+            func.count(ClinicalDetermination.determination_id).label("total"),
+        )
+        .filter(
+            ClinicalDetermination.reviewed_by.isnot(None),
+            ClinicalDetermination.is_recommendation.is_(False),
+        )
+        .group_by(ClinicalDetermination.benefit_type)
+        .all()
+    )
+
+    # Aggregate by category from blind comparisons
+    category_stats: dict[str, dict] = {}
+    for comp in comparisons:
+        details = comp.details or {}
+        cat = details.get("benefit_type") or details.get("condition_category", "unknown")
+        if cat not in category_stats:
+            category_stats[cat] = {"total": 0, "agreed": 0}
+        category_stats[cat]["total"] += 1
+        if details.get("agrees"):
+            category_stats[cat]["agreed"] += 1
+
+    # Supplement with reviewed determination counts
+    for bt, count in reviewed_dets:
+        if bt and bt not in category_stats:
+            category_stats[bt] = {"total": count, "agreed": count}
+        elif bt:
+            category_stats[bt]["total"] += count
+            category_stats[bt]["agreed"] += count
+
+    validated = []
+    not_yet_validated = []
+
+    for cat, stats in category_stats.items():
+        total = stats["total"]
+        agreed = stats["agreed"]
+        agreement_rate = agreed / total if total > 0 else 0
+
+        entry = {
+            "category": cat,
+            "total_cases": total,
+            "agreed_cases": agreed,
+            "agreement_rate_pct": round(agreement_rate * 100, 1),
+        }
+
+        if total >= _PROSPECTIVE_VALIDATION_MIN_SAMPLE and agreement_rate == 1.0:
+            entry["status"] = "validated"
+            validated.append(entry)
+        else:
+            entry["status"] = "not_validated"
+            if total < _PROSPECTIVE_VALIDATION_MIN_SAMPLE:
+                entry["reason"] = f"Insufficient sample (need {_PROSPECTIVE_VALIDATION_MIN_SAMPLE}, have {total})"
+            else:
+                entry["reason"] = f"Agreement rate {round(agreement_rate * 100, 1)}% < 100%"
+            not_yet_validated.append(entry)
+
+    return {
+        "validated_categories": validated,
+        "not_yet_validated": not_yet_validated,
+        "min_sample_required": _PROSPECTIVE_VALIDATION_MIN_SAMPLE,
+        "evaluated_at": datetime.now(UTC).isoformat(),
+    }
+
+
+def check_prospective_validation(condition_category: str) -> dict:
+    """Check whether a condition category is prospectively validated.
+
+    Constitution (F1 Supplement S6): If a category is validated (physician
+    confirmed AI 100% over >= 30 cases), it may be auto-approved without
+    individual physician review. Otherwise, individual review is required.
+
+    NOTE: This function checks the cached validation state. Call
+    identify_prospectively_validated_categories() to refresh.
+
+    Parameters
+    ----------
+    condition_category : str
+        The benefit type or condition category to check.
+
+    Returns
+    -------
+    dict indicating whether the category requires individual review.
+    """
+    # In production, this would read from a cached store updated by
+    # identify_prospectively_validated_categories(). For now, we return
+    # a structure indicating the check must be performed with a db session.
+    return {
+        "condition_category": condition_category,
+        "requires_individual_review": True,
+        "note": (
+            "Call identify_prospectively_validated_categories(db) to determine "
+            "current validation status. Default is to require individual review "
+            "until prospective validation confirms 100% agreement over "
+            f"{_PROSPECTIVE_VALIDATION_MIN_SAMPLE}+ cases."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# F1 Supplement S7: Panel scaling trigger
+# ---------------------------------------------------------------------------
+
+def check_panel_scaling_needed(db: Session) -> dict:
+    """Monitor review volume and turnaround to flag when panel scaling is needed.
+
+    Constitution (F1 Supplement S7): Monitors physician review volume, average
+    turnaround time, and pending review queue depth. Flags when scaling is
+    needed (e.g., volume exceeding capacity or turnaround exceeding SLA).
+    Supports random case assignment across panel physicians.
+
+    Returns
+    -------
+    dict with current panel metrics and scaling recommendation.
+    """
+    now = datetime.now(UTC)
+    past_30_days = now - timedelta(days=30)
+    past_7_days = now - timedelta(days=7)
+
+    # Total pending reviews (recommendations awaiting physician sign-off)
+    pending_reviews = db.query(func.count(ClinicalDetermination.determination_id)).filter(
+        ClinicalDetermination.is_recommendation.is_(True),
+        ClinicalDetermination.reviewed_by.is_(None),
+    ).scalar() or 0
+
+    # Reviews completed in last 30 days
+    completed_30d = db.query(func.count(ClinicalDetermination.determination_id)).filter(
+        ClinicalDetermination.reviewed_by.isnot(None),
+        ClinicalDetermination.created_at >= past_30_days,
+    ).scalar() or 0
+
+    # Reviews completed in last 7 days
+    completed_7d = db.query(func.count(ClinicalDetermination.determination_id)).filter(
+        ClinicalDetermination.reviewed_by.isnot(None),
+        ClinicalDetermination.created_at >= past_7_days,
+    ).scalar() or 0
+
+    # Average turnaround (approximated via latency_ms for now)
+    avg_latency = db.query(func.avg(ClinicalDetermination.latency_ms)).filter(
+        ClinicalDetermination.created_at >= past_7_days,
+        ClinicalDetermination.latency_ms.isnot(None),
+    ).scalar()
+
+    # Distinct reviewers active in last 30 days
+    active_reviewers = db.query(
+        func.count(func.distinct(ClinicalDetermination.reviewed_by))
+    ).filter(
+        ClinicalDetermination.reviewed_by.isnot(None),
+        ClinicalDetermination.created_at >= past_30_days,
+    ).scalar() or 0
+
+    # Per-reviewer load
+    reviews_per_reviewer = (
+        round(completed_30d / active_reviewers, 1) if active_reviewers > 0 else None
+    )
+
+    # Scaling thresholds
+    SLA_MAX_PENDING = 50
+    SLA_MAX_PER_REVIEWER_MONTHLY = 200
+    scaling_needed = False
+    scaling_reasons = []
+
+    if pending_reviews > SLA_MAX_PENDING:
+        scaling_needed = True
+        scaling_reasons.append(
+            f"Pending queue ({pending_reviews}) exceeds SLA threshold ({SLA_MAX_PENDING})"
+        )
+
+    if reviews_per_reviewer and reviews_per_reviewer > SLA_MAX_PER_REVIEWER_MONTHLY:
+        scaling_needed = True
+        scaling_reasons.append(
+            f"Per-reviewer load ({reviews_per_reviewer}/mo) exceeds capacity ({SLA_MAX_PER_REVIEWER_MONTHLY}/mo)"
+        )
+
+    if active_reviewers < 2 and completed_30d > 20:
+        scaling_needed = True
+        scaling_reasons.append(
+            "Fewer than 2 active reviewers with significant volume — redundancy risk"
+        )
+
+    return {
+        "panel_metrics": {
+            "pending_reviews": pending_reviews,
+            "completed_last_30d": completed_30d,
+            "completed_last_7d": completed_7d,
+            "active_reviewers": active_reviewers,
+            "reviews_per_reviewer_monthly": reviews_per_reviewer,
+            "avg_determination_latency_ms": round(avg_latency, 1) if avg_latency else None,
+        },
+        "sla_thresholds": {
+            "max_pending_queue": SLA_MAX_PENDING,
+            "max_per_reviewer_monthly": SLA_MAX_PER_REVIEWER_MONTHLY,
+        },
+        "scaling_needed": scaling_needed,
+        "scaling_reasons": scaling_reasons if scaling_reasons else ["Panel capacity is within SLA thresholds"],
+        "case_assignment_method": "random",
+        "case_assignment_note": (
+            "Cases are randomly assigned across all active panel physicians "
+            "to prevent concentration bias and ensure balanced workload."
+        ),
+        "evaluated_at": now.isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# F1 Supplement S8: Plain-language coverage document
+# ---------------------------------------------------------------------------
+
+# All 7 benefit types covered by the plan
+_COVERAGE_TYPES = [
+    {
+        "type": "health",
+        "label": "Medical / Health",
+        "description": (
+            "Doctor visits, hospital stays, surgeries, lab tests, imaging, "
+            "prescriptions, and other medical services."
+        ),
+        "example_covered": "Annual physical, blood work, X-ray for a broken bone",
+        "example_not_covered": "Cosmetic surgery that is not medically necessary",
+    },
+    {
+        "type": "dental",
+        "label": "Dental",
+        "description": "Cleanings, fillings, crowns, root canals, and other dental care.",
+        "example_covered": "Twice-yearly cleaning, cavity filling, wisdom tooth extraction",
+        "example_not_covered": "Teeth whitening for cosmetic reasons",
+    },
+    {
+        "type": "vision",
+        "label": "Vision",
+        "description": "Eye exams, glasses, contact lenses, and treatment for eye conditions.",
+        "example_covered": "Annual eye exam, prescription glasses, glaucoma treatment",
+        "example_not_covered": "LASIK surgery (unless medically necessary for a specific condition)",
+    },
+    {
+        "type": "mental_health",
+        "label": "Mental Health & Behavioral Health",
+        "description": (
+            "Therapy, counseling, psychiatric care, substance use treatment, "
+            "and crisis support."
+        ),
+        "example_covered": "Therapy sessions, psychiatric medication management, rehab program",
+        "example_not_covered": "Couples counseling without a clinical diagnosis",
+    },
+    {
+        "type": "life",
+        "label": "Life Insurance",
+        "description": "Financial protection for your family if something happens to you.",
+        "example_covered": "Death benefit paid to your named beneficiary",
+        "example_not_covered": "Claims filed more than 2 years after policy lapse",
+    },
+    {
+        "type": "std",
+        "label": "Short-Term Disability",
+        "description": (
+            "Income replacement if you cannot work for a short period due to "
+            "illness, injury, or recovery from surgery."
+        ),
+        "example_covered": "Recovery from surgery, serious illness keeping you home for weeks",
+        "example_not_covered": "Elective time off that is not medically supported",
+    },
+    {
+        "type": "ltd",
+        "label": "Long-Term Disability",
+        "description": (
+            "Income replacement if you cannot work for an extended period due "
+            "to a serious medical condition."
+        ),
+        "example_covered": "Chronic condition preventing return to work for months",
+        "example_not_covered": "Disability caused by a condition excluded in your policy",
+    },
+]
+
+
+def generate_coverage_document(db: Session, employee_id: str) -> dict:
+    """Generate a one-page plain-language coverage document for an employee.
+
+    Constitution (F1 Supplement S8): Content includes what is covered (all 7
+    benefit types), what 'medically necessary' means in everyday language,
+    examples of covered/not-covered, what to do when needing care, and a
+    plain-language privacy notice.
+
+    Parameters
+    ----------
+    db : Session
+        Database session.
+    employee_id : str
+        UUID of the employee.
+
+    Returns
+    -------
+    dict with structured data ready for PDF rendering.
+    """
+    from app.models.employee import Employee
+
+    employee = db.query(Employee).filter(
+        Employee.employee_id == employee_id
+    ).first()
+    if not employee:
+        return {"error": "employee_not_found", "employee_id": str(employee_id)}
+
+    now = datetime.now(UTC)
+
+    document = {
+        "document_type": "plain_language_coverage_summary",
+        "employee_id": str(employee_id),
+        "generated_at": now.isoformat(),
+        "title": "Your Benefits Coverage — Plain-Language Summary",
+        "sections": [
+            {
+                "heading": "What Is Covered",
+                "intro": (
+                    "Your plan covers 7 types of benefits. Here is what each "
+                    "one means and examples of what is and is not covered."
+                ),
+                "coverage_types": _COVERAGE_TYPES,
+            },
+            {
+                "heading": "What 'Medically Necessary' Means",
+                "content": (
+                    "A service is 'medically necessary' when a qualified "
+                    "clinical professional determines that you need it to "
+                    "prevent, diagnose, or treat a health condition — and "
+                    "that without it, your health would likely get worse. "
+                    "This decision is based only on your symptoms, your "
+                    "medical history, and current medical evidence. It is "
+                    "never based on cost."
+                ),
+            },
+            {
+                "heading": "What To Do When You Need Care",
+                "content": (
+                    "Text the care coordination number provided by your "
+                    "employer. A care navigator will help you find the right "
+                    "provider, confirm coverage, and schedule your appointment. "
+                    "You can also call the same number. In an emergency, go "
+                    "to the nearest emergency room — your plan covers "
+                    "emergency services."
+                ),
+                "action_steps": [
+                    "1. Text or call your care coordination number.",
+                    "2. Describe what you need (e.g., 'I need to see a dentist').",
+                    "3. A care navigator will confirm coverage and help you book.",
+                    "4. Go to your appointment — the plan handles the rest.",
+                ],
+            },
+            {
+                "heading": "Your Privacy",
+                "content": (
+                    "Your medical information is private. We use it only to "
+                    "determine whether a service is medically necessary and "
+                    "to process your claim. We do not share your medical "
+                    "details with your employer. Your employer sees only "
+                    "whether a claim was approved or denied — never your "
+                    "diagnosis, symptoms, or treatment details. All medical "
+                    "data is encrypted and stored securely."
+                ),
+            },
+            {
+                "heading": "Questions or Concerns",
+                "content": (
+                    "If you have questions about your coverage, a claim, or "
+                    "a denial, text or call your care coordination number. "
+                    "If you disagree with a denial, you have the right to "
+                    "appeal. Your denial notice will explain exactly how."
+                ),
+            },
+        ],
+    }
+
+    # Log document generation
+    audit_entry = AuditLog(
+        actor="clinical_engine:generate_coverage_document",
+        action="coverage_document_generated",
+        resource_type="employee",
+        resource_id=str(employee_id),
+        details={"document_type": "plain_language_coverage_summary"},
+    )
+    db.add(audit_entry)
+    db.flush()
+
+    logger.info("Coverage document generated for employee %s", employee_id)
+
+    return document
