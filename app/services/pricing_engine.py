@@ -1069,3 +1069,81 @@ def _zero_rate_response(employer: Employer) -> dict:
         "total_rate": {"pepm": 0.00, "annual": 0.00},
         "note": "No active employees. Rate will be computed when employees are enrolled.",
     }
+
+
+# ── F7 Supplement S1: Cost Change Decomposition ──────────────────────────────
+
+
+def decompose_cost_change(
+    db: Session,
+    employer_id: str,
+    employee_count: int = 1,
+) -> dict:
+    """Decompose pass-through cost changes by causal source.
+
+    F7 Supplement S1: Every recalculation produces a decomposition showing
+    how much came from each causal source (platform volume, provider competition,
+    prediction accuracy, service-level discovery, external).
+    """
+    from app.services.cost_attribution import get_employer_cost_attribution, CausalSource
+
+    attribution = get_employer_cost_attribution(db, employer_id)
+    by_source = attribution["attribution_by_source"]
+
+    # Convert to per-employee-per-month
+    months = max(attribution["period_months"], 1)
+    emp = max(employee_count, 1)
+
+    def pepm(total):
+        return round(total / emp / months, 2)
+
+    decomposition = {
+        "platform_volume_effect": {
+            "total_dollars": by_source.get(CausalSource.PLATFORM_VOLUME, 0.0),
+            "pepm": pepm(by_source.get(CausalSource.PLATFORM_VOLUME, 0.0)),
+            "description": "More employers on the platform driving provider price reductions, better stop-loss terms, and tighter cost predictions",
+        },
+        "provider_competition_response": {
+            "total_dollars": by_source.get(CausalSource.PROVIDER_COMPETITION, 0.0),
+            "pepm": pepm(by_source.get(CausalSource.PROVIDER_COMPETITION, 0.0)),
+            "description": "Specific providers actively lowering prices in response to competitive pressure from the platform",
+        },
+        "prediction_accuracy_improvement": {
+            "total_dollars": by_source.get(CausalSource.PREDICTION_ACCURACY, 0.0),
+            "pepm": pepm(by_source.get(CausalSource.PREDICTION_ACCURACY, 0.0)),
+            "description": "Buffer in pass-through shrinking as cost prediction confidence intervals narrow",
+        },
+        "service_level_price_discovery": {
+            "total_dollars": by_source.get(CausalSource.SERVICE_PRICE_DISCOVERY, 0.0),
+            "pepm": pepm(by_source.get(CausalSource.SERVICE_PRICE_DISCOVERY, 0.0)),
+            "description": "System finding lower-cost providers or pricing channels for specific services",
+        },
+        "external_unrelated": {
+            "total_dollars": by_source.get(CausalSource.EXTERNAL, 0.0),
+            "pepm": pepm(by_source.get(CausalSource.EXTERNAL, 0.0)),
+            "description": "Changes unrelated to platform growth — independent provider pricing, regulatory changes, seasonal patterns",
+        },
+    }
+
+    cumulative_platform = round(
+        attribution["platform_driven_total"], 2
+    )
+    cumulative_platform_pepm = pepm(cumulative_platform)
+
+    return {
+        "employer_id": employer_id,
+        "employee_count": employee_count,
+        "period_months": months,
+        "decomposition": decomposition,
+        "cumulative_platform_impact": {
+            "total_dollars": cumulative_platform,
+            "pepm": cumulative_platform_pepm,
+            "annual_per_employee": round(cumulative_platform_pepm * 12, 2),
+        },
+        "independently_verifiable": True,
+        "verification_path": (
+            "Every attributed dollar traces: F7 decomposition → F8 tagged data → "
+            "specific causal event (feed view, new employer, price record, etc.)"
+        ),
+        "feeding_f6b": True,
+    }
