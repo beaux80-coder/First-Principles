@@ -5,7 +5,9 @@ care execution metrics, employee outcomes, verified savings, network effects,
 and frictionless referral capability.
 """
 
-from fastapi import APIRouter, Depends, HTTPException
+from typing import Optional
+
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from app.database import get_db
@@ -96,5 +98,26 @@ def share_dashboard(employer_id: str, db: Session = Depends(get_db)):
 
     try:
         return generate_referral_link(db, employer_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.get("/{employer_id}/monthly-summary")
+def get_monthly_summary(
+    employer_id: str,
+    year: Optional[int] = Query(None, description="Year for summary (defaults to current)"),
+    month: Optional[int] = Query(None, ge=1, le=12, description="Month for summary (defaults to current)"),
+    db: Session = Depends(get_db),
+):
+    """Monthly performance summary for delivery alongside an invoice.
+
+    Constitution F6B: standalone summary covering total cost, verified savings,
+    care episodes handled, employee complaints (target: zero), compliance
+    deadlines, cost-per-employee trend, and link to full dashboard.
+    """
+    from app.services.employer_dashboard import generate_monthly_summary
+
+    try:
+        return generate_monthly_summary(db, employer_id, year=year, month=month)
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

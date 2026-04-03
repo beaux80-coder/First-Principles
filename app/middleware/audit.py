@@ -8,7 +8,6 @@ Constitution: "Every read/write of PII/PHI is logged here."
 
 import logging
 import time
-from datetime import datetime, UTC
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request

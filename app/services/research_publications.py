@@ -35,7 +35,6 @@ def generate_research_report(db: Session) -> dict:
     Optimized for large datasets (11M+ rows) using sampled averages
     and approximate counts to avoid full-table scans.
     """
-    from sqlalchemy import text
 
     report = {
         "generated_at": datetime.now(UTC).isoformat(),

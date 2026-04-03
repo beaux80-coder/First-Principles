@@ -1,9 +1,8 @@
 """Data pipeline API endpoints for managing public data ingestion."""
 
 import logging
-from datetime import datetime, UTC
 
-from fastapi import APIRouter, BackgroundTasks, Depends, UploadFile, File, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, UploadFile, File
 from sqlalchemy.orm import Session
 
 from app.auth import get_current_user
@@ -16,9 +15,6 @@ from app.services.data_ingestion import (
     get_ingestion_stats,
 )
 from app.services.data_downloaders import (
-    download_nadac,
-    download_medicare_pfs,
-    download_hospital_transparency,
     download_hospital_compare,
     download_physician_quality,
     match_quality_to_providers,
@@ -279,7 +275,7 @@ def goodrx_status(db: Session = Depends(get_db)):
 
     Shows scraped prices, comparison results vs NADAC, and any barriers.
     """
-    from app.services.goodrx_scraper import scrape_goodrx_batch, TOP_PRESCRIBED_DRUGS
+    from app.services.goodrx_scraper import TOP_PRESCRIBED_DRUGS
     from app.models.price_data import PriceData, PriceSource
     from app.models.data_pipeline_metric import DataPipelineMetric
     from sqlalchemy import func
@@ -450,3 +446,126 @@ def cross_type_signals(db: Session = Depends(get_db)):
         "signals_by_function": {k: len(v) for k, v in by_function.items()},
         "signals": signals,
     }
+
+
+@router.get("/competition-data")
+def competition_data(db: Session = Depends(get_db)):
+    """Aggregate provider competition data across markets.
+
+    Constitution F8: aggregate pricing and provider data to understand
+    competitive dynamics across benefit types and geographies.
+    """
+    from app.models.price_data import PriceData
+    from sqlalchemy import func
+
+    # Aggregate price data by source and state
+    rows = (
+        db.query(
+            PriceData.source,
+            PriceData.state,
+            func.count(PriceData.price_id).label("records"),
+            func.avg(PriceData.price).label("avg_price"),
+            func.min(PriceData.price).label("min_price"),
+            func.max(PriceData.price).label("max_price"),
+        )
+        .group_by(PriceData.source, PriceData.state)
+        .all()
+    )
+
+    by_source: dict = {}
+    for row in rows:
+        src = row.source.value if row.source else "unknown"
+        if src not in by_source:
+            by_source[src] = []
+        by_source[src].append({
+            "state": row.state,
+            "records": row.records,
+            "avg_price": round(float(row.avg_price or 0), 2),
+            "min_price": round(float(row.min_price or 0), 2),
+            "max_price": round(float(row.max_price or 0), 2),
+        })
+
+    return {
+        "sources": by_source,
+        "total_sources": len(by_source),
+        "total_state_markets": len(rows),
+    }
+
+
+@router.get("/tipping-points")
+def tipping_points():
+    """Get service-level thresholds that trigger employer switching.
+
+    Constitution F12/F8: understanding switching tipping points allows
+    targeted outreach when employers are most likely to change providers.
+    """
+    from app.services.distribution_engine import get_service_level_thresholds
+
+    return get_service_level_thresholds()
+
+
+@router.get("/employer-export/{employer_id}")
+def export_employer_data(employer_id: str, db: Session = Depends(get_db)):
+    """Export all of an employer's raw data. Constitution F8 items 34-36.
+
+    Employers own their raw data and may export it at any time.
+    AI models and aggregated datasets are company assets and are NOT exported.
+    """
+    from app.models.claim import Claim
+    from app.models.employee import Employee
+
+    claims = db.query(Claim).filter(Claim.employer_id == employer_id).all()
+    employees = db.query(Employee).filter(Employee.employer_id == employer_id).all()
+
+    return {
+        "employer_id": employer_id,
+        "data_ownership": "Employer owns all raw data. May export at any time.",
+        "company_assets_note": (
+            "AI models, aggregated datasets, and derived insights are company "
+            "assets and are not included in this export."
+        ),
+        "claims_count": len(claims),
+        "employees_count": len(employees),
+        "claims": [
+            {
+                "claim_id": str(c.claim_id),
+                "benefit_type": c.benefit_type.value if c.benefit_type else None,
+                "status": c.status.value if c.status else None,
+                "amount_billed": float(c.amount_billed) if c.amount_billed else None,
+                "amount_paid": float(c.amount_paid) if c.amount_paid else None,
+                "submitted_at": c.submitted_at.isoformat() if c.submitted_at else None,
+            }
+            for c in claims
+        ],
+        "employees": [
+            {
+                "employee_id": str(e.employee_id),
+                "status": e.status.value if e.status else None,
+                "enrolled_at": e.enrolled_at.isoformat() if e.enrolled_at else None,
+            }
+            for e in employees
+        ],
+        "proprietary_data_never_exposed": True,
+    }
+
+
+@router.get("/scale-patterns")
+def scale_dependent_patterns(db: Session = Depends(get_db)):
+    """Track patterns only detectable at current data density.
+
+    Constitution F8 item 40: measures compounding advantage.
+    """
+    from app.services.cross_type_analytics import detect_scale_dependent_patterns
+
+    return detect_scale_dependent_patterns(db)
+
+
+@router.get("/conventional-wisdom")
+def conventional_wisdom_contradictions(db: Session = Depends(get_db)):
+    """Find pricing anomalies that contradict industry assumptions.
+
+    Constitution F8 item 41: identifies structural inefficiencies.
+    """
+    from app.services.cross_type_analytics import detect_conventional_wisdom_contradictions
+
+    return detect_conventional_wisdom_contradictions(db)

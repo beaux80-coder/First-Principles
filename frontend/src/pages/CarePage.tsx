@@ -66,7 +66,8 @@ export default function CarePage() {
   const [benefitType, setBenefitType] = useState('health')
   const [result, setResult] = useState<CareResult | null>(null)
   const [error, setError] = useState('')
-  const [episodes, setEpisodes] = useState<any[]>([])
+  const [episodes, setEpisodes] = useState<Record<string, unknown>[]>([])
+  const [showOnboarding, setShowOnboarding] = useState(true)
 
   // TODO: Get from auth context
   const employeeId = '22222222-2222-2222-2222-222222222221'
@@ -96,8 +97,8 @@ export default function CarePage() {
       const data = await resp.json()
       setResult(data)
       setStep('result')
-    } catch (e: any) {
-      setError(e.message)
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'Unknown error')
       setStep('describe')
     }
   }
@@ -109,7 +110,7 @@ export default function CarePage() {
         const data = await resp.json()
         setEpisodes(data.active_episodes || [])
       }
-    } catch {}
+    } catch (_) { /* ignore fetch errors for episode loading */ }
   }
 
   return (
@@ -125,6 +126,49 @@ export default function CarePage() {
           Your cost: $0 copay. $0 deductible. $0 out-of-pocket. Always.
         </p>
       </div>
+
+      {/* First-time user onboarding / help section (F9 Q11) */}
+      {showOnboarding && step === 'describe' && (
+        <div
+          className="bg-blue-50 border border-blue-200 rounded-lg p-5 mb-6 relative"
+          role="region"
+          aria-label="How it works"
+        >
+          <button
+            onClick={() => setShowOnboarding(false)}
+            className="absolute top-2 right-3 text-blue-400 hover:text-blue-600 text-sm"
+            aria-label="Dismiss help section"
+          >
+            Got it
+          </button>
+          <h2 className="text-lg font-semibold text-blue-900 mb-3">
+            Here's how it works
+          </h2>
+          <ul className="space-y-2 text-blue-800 text-sm">
+            <li className="flex items-start gap-2">
+              <span className="font-bold text-blue-600 mt-0.5" aria-hidden="true">1.</span>
+              <span>
+                <strong>Tell us what's wrong.</strong> We handle everything else &mdash;
+                finding a provider, scheduling, verifying the price, and coordinating your care.
+              </span>
+            </li>
+            <li className="flex items-start gap-2">
+              <span className="font-bold text-blue-600 mt-0.5" aria-hidden="true">2.</span>
+              <span>
+                <strong>No phone calls, no searching, no scheduling.</strong> Just describe your
+                issue in plain language and we take care of it.
+              </span>
+            </li>
+            <li className="flex items-start gap-2">
+              <span className="font-bold text-blue-600 mt-0.5" aria-hidden="true">3.</span>
+              <span>
+                <strong>Zero copays. Zero deductibles. Zero bills.</strong> Your employer covers
+                everything &mdash; you will never receive a bill for covered care.
+              </span>
+            </li>
+          </ul>
+        </div>
+      )}
 
       {step === 'describe' && (
         <div>
@@ -199,11 +243,11 @@ export default function CarePage() {
           </button>
           {episodes.length > 0 && (
             <div className="mt-4 space-y-2">
-              {episodes.map((ep: any, i: number) => (
+              {episodes.map((ep: Record<string, unknown>, i: number) => (
                 <div key={i} className="border rounded-lg p-3 bg-gray-50">
-                  <p className="font-medium">{ep.condition || 'Care episode'}</p>
+                  <p className="font-medium">{String(ep.condition) || 'Care episode'}</p>
                   <p className="text-sm text-gray-600">
-                    Status: {ep.status} | Type: {ep.benefit_type}
+                    Status: {String(ep.status)} | Type: {String(ep.benefit_type)}
                   </p>
                 </div>
               ))}

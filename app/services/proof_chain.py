@@ -24,16 +24,15 @@ The proof summary gives coverage metrics per layer.
 """
 
 import logging
-import uuid
 from datetime import datetime, UTC
 
-from sqlalchemy import func, and_, distinct
+from sqlalchemy import func, and_
 from sqlalchemy.orm import Session
 
 from app.models.claim import Claim, ClaimStatus, ClaimMode
 from app.models.benchmark_query import BenchmarkQuery, BenchmarkStage
 from app.models.price_data import PriceData
-from app.models.employer import Employer, EmployerStatus
+from app.models.employer import Employer
 
 logger = logging.getLogger(__name__)
 
@@ -100,19 +99,64 @@ def tag_proof_layer(
     layers: dict[int, dict] = {}
 
     # --- Layer 1: Price verification ---
+    # Constitution: "Every price is independently verifiable"
+    # Must validate that the claim's ACTUAL paid amount matches a published price
     layer1_evidence = []
+    price_verified = False
     if service_code:
         price_count = db.query(func.count(PriceData.price_id)).filter(
             PriceData.service_code == service_code,
         ).scalar() or 0
         if price_count > 0:
             layer1_evidence.append(
-                f"{price_count} verified price records for code {service_code}"
+                f"{price_count} published price records for code {service_code}"
             )
+
+    # Validate the claim's paid amount against published prices
+    if claim_id:
+        claim = db.query(Claim).filter(Claim.claim_id == claim_id).first()
+        if claim and claim.amount_paid and claim.amount_paid > 0:
+            # Check if this exact price exists in public sources
+            from app.models.provider import Provider
+            provider_npi = None
+            if claim.provider_id:
+                provider = db.query(Provider).filter(Provider.provider_id == claim.provider_id).first()
+                if provider:
+                    provider_npi = provider.npi
+
+            # Look for matching published price (within $0.01 tolerance)
+            match_query = db.query(PriceData).filter(
+                PriceData.service_code == (service_code or ""),
+            )
+            if provider_npi:
+                match_query = match_query.filter(PriceData.provider_npi == provider_npi)
+
+            matching_prices = match_query.limit(20).all()
+            for mp in matching_prices:
+                if abs(float(mp.price) - float(claim.amount_paid)) < 0.01:
+                    price_verified = True
+                    layer1_evidence.append(
+                        f"VERIFIED: Paid ${float(claim.amount_paid):.2f} matches "
+                        f"{mp.source.value} published price from "
+                        f"{mp.ingested_at.strftime('%Y-%m-%d') if mp.ingested_at else 'unknown'}"
+                    )
+                    break
+
+            if not price_verified and matching_prices:
+                lowest = min(float(p.price) for p in matching_prices if p.price > 0)
+                layer1_evidence.append(
+                    f"UNVERIFIED: Paid ${float(claim.amount_paid):.2f} does not match "
+                    f"any published price (lowest published: ${lowest:.2f})"
+                )
+            elif not price_verified:
+                layer1_evidence.append(
+                    "UNVERIFIED: No published prices found for this provider/service combination"
+                )
 
     layers[1] = {
         **PROOF_LAYERS[1],
         "applies": len(layer1_evidence) > 0,
+        "verified": price_verified,
         "evidence": layer1_evidence,
     }
 
@@ -188,7 +232,7 @@ def tag_proof_layer(
         "evidence": layer4_evidence,
     }
 
-    layers_covered = sum(1 for l in layers.values() if l["applies"])
+    layers_covered = sum(1 for layer in layers.values() if layer["applies"])
 
     return {
         "claim_id": claim_id,

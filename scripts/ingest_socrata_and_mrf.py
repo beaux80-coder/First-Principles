@@ -18,7 +18,6 @@ import json
 import logging
 import os
 import sys
-import uuid
 from datetime import datetime, timedelta, UTC
 
 # Add parent dir to path
@@ -87,7 +86,7 @@ def try_socrata_dataset(host: str, dataset_id: str, name: str, limit: int = 1000
                 return data
             return []
         elif resp.status_code == 403:
-            logger.warning(f"    403 Forbidden -- Socrata blocked without app_token")
+            logger.warning("    403 Forbidden -- Socrata blocked without app_token")
             return None
         else:
             logger.warning(f"    Unexpected status: {resp.status_code}")
@@ -534,7 +533,7 @@ def download_and_parse_mrf(url: str, insurer_name: str) -> tuple[list[dict], str
     records = []
 
     try:
-        logger.info(f"    Downloading MRF...")
+        logger.info("    Downloading MRF...")
         resp = httpx.get(
             url,
             timeout=httpx.Timeout(60.0, read=300.0),
@@ -805,7 +804,7 @@ def main():
         print("SUMMARY")
         print("=" * 70)
 
-        print(f"\nTask 1 -- Socrata/CMS Ingestion:")
+        print("\nTask 1 -- Socrata/CMS Ingestion:")
         print(f"  Socrata datasets tried:      {report1['socrata_datasets_tried']}")
         print(f"  Socrata datasets successful:  {report1['socrata_datasets_successful']}")
         print(f"  Socrata records ingested:     {report1['socrata_records_ingested']}")
@@ -814,7 +813,7 @@ def main():
         print(f"  CMS records ingested:         {report1['cms_records_ingested']}")
         print(f"  TOTAL records ingested:       {report1['total_records_ingested']}")
 
-        print(f"\nTask 2 -- MRF File Download (BCBS Wyoming):")
+        print("\nTask 2 -- MRF File Download (BCBS Wyoming):")
         print(f"  Index fetched:                {report2['index_fetched']}")
         print(f"  MRF files in index:           {report2['mrf_files_in_index']}")
         print(f"  Files size-checked:           {report2['files_size_checked']}")

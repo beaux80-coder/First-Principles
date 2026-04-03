@@ -17,9 +17,8 @@ import math
 import random
 import uuid
 from datetime import datetime, UTC
-from typing import Optional
 
-from sqlalchemy import func, and_
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.claim import Claim, ClaimStatus
@@ -470,7 +469,7 @@ def run_monte_carlo_simulation(
 
     # Actuarial parameters derived from risk profile
     claims_pepm = risk_profile["claims_pepm"] or 450.0
-    annual_expected = claims_pepm * employee_count * 12
+    claims_pepm * employee_count * 12
 
     # Claim size distribution parameters (lognormal)
     # Mean claim ~$2,500, with heavy right tail for catastrophic
@@ -598,6 +597,7 @@ def evaluate_stop_loss(db: Session, employer_id: uuid.UUID) -> dict:
         "monte_carlo_simulation": simulation,
         "predictions_for_downstream": predictions,
         "evaluation_date": datetime.now(UTC).isoformat(),
+        "feeding_f8": True,
     }
 
 
@@ -1126,4 +1126,137 @@ def _build_predictions(
                 risk_profile.get("aggregate_risk_score", 50) >= 60
             ),
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# Re-evaluate on new employer join (Build Manifest item 6)
+# ---------------------------------------------------------------------------
+
+def re_evaluate_group_terms(db: Session) -> dict:
+    """Re-evaluate group purchasing terms when a new employer joins.
+
+    Constitution F7A item 6: As each new employer joins, the system
+    re-evaluates whether better group terms are now available.
+
+    Called automatically when an employer transitions to shadow or active.
+    """
+    leverage = compute_group_purchasing_leverage(db)
+    total_lives = leverage.get("total_platform_lives", 0)
+
+    # Get all active/shadow employers
+    employers = db.query(Employer).filter(
+        Employer.status.in_(["active", "shadow"])
+    ).all()
+
+    updated = []
+    for emp in employers:
+        try:
+            evaluation = evaluate_stop_loss(db, emp.employer_id)
+            rec = evaluation.get("recommended_carrier")
+            updated.append({
+                "employer_id": str(emp.employer_id),
+                "employer_name": emp.name,
+                "recommended_carrier": rec.get("carrier") if rec else None,
+                "estimated_pepm": rec.get("adjusted_rate_pepm") if rec else None,
+            })
+        except Exception as e:
+            logger.warning(f"Re-evaluation failed for {emp.employer_id}: {e}")
+
+    return {
+        "re_evaluation_trigger": "new_employer_joined",
+        "total_platform_lives": total_lives,
+        "employers_re_evaluated": len(updated),
+        "updated_evaluations": updated,
+        "re_evaluated_at": datetime.now(UTC).isoformat(),
+        "feeding_f8": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Group Captive Readiness (Build Manifest item 12)
+# ---------------------------------------------------------------------------
+
+# Actuarial credibility thresholds for group captive viability
+_CAPTIVE_MIN_LIVES = 5_000
+_CAPTIVE_MIN_EMPLOYERS = 20
+_CAPTIVE_MIN_CLAIMS_HISTORY_MONTHS = 24
+_CAPTIVE_MIN_LOSS_RATIO_DATA_POINTS = 1_000
+
+
+def assess_group_captive_readiness(db: Session) -> dict:
+    """Track whether the platform has reached sufficient scale for a group captive.
+
+    Constitution F7A item 12: The system tracks when the platform's total employer
+    base reaches sufficient size and actuarial credibility to support a group
+    captive structure for self-insuring stop-loss risk. When that threshold is
+    reached, the system flags it as an available cost reduction mechanism.
+    """
+    # Current platform metrics
+    total_lives = _get_total_platform_lives(db)
+    total_employers = db.query(func.count(Employer.employer_id)).filter(
+        Employer.status.in_(["active", "shadow"])
+    ).scalar() or 0
+
+    total_claims = db.query(func.count(Claim.claim_id)).filter(
+        Claim.status.in_([ClaimStatus.paid, ClaimStatus.approved])
+    ).scalar() or 0
+
+    # Estimate months of claims history from earliest claim
+    earliest_claim = db.query(func.min(Claim.submitted_at)).scalar()
+    if earliest_claim:
+        months_history = max(1, (datetime.now(UTC) - earliest_claim).days // 30)
+    else:
+        months_history = 0
+
+    # Check each threshold
+    lives_met = total_lives >= _CAPTIVE_MIN_LIVES
+    employers_met = total_employers >= _CAPTIVE_MIN_EMPLOYERS
+    history_met = months_history >= _CAPTIVE_MIN_CLAIMS_HISTORY_MONTHS
+    data_met = total_claims >= _CAPTIVE_MIN_LOSS_RATIO_DATA_POINTS
+
+    all_met = lives_met and employers_met and history_met and data_met
+
+    # Estimated savings from captive (industry benchmark: 10-20% of stop-loss premium)
+    estimated_savings_pct = 0.15 if all_met else None
+
+    return {
+        "captive_ready": all_met,
+        "thresholds": {
+            "total_lives": {
+                "required": _CAPTIVE_MIN_LIVES,
+                "current": total_lives,
+                "met": lives_met,
+                "gap": max(0, _CAPTIVE_MIN_LIVES - total_lives),
+            },
+            "total_employers": {
+                "required": _CAPTIVE_MIN_EMPLOYERS,
+                "current": total_employers,
+                "met": employers_met,
+                "gap": max(0, _CAPTIVE_MIN_EMPLOYERS - total_employers),
+            },
+            "claims_history_months": {
+                "required": _CAPTIVE_MIN_CLAIMS_HISTORY_MONTHS,
+                "current": months_history,
+                "met": history_met,
+                "gap": max(0, _CAPTIVE_MIN_CLAIMS_HISTORY_MONTHS - months_history),
+            },
+            "loss_ratio_data_points": {
+                "required": _CAPTIVE_MIN_LOSS_RATIO_DATA_POINTS,
+                "current": total_claims,
+                "met": data_met,
+                "gap": max(0, _CAPTIVE_MIN_LOSS_RATIO_DATA_POINTS - total_claims),
+            },
+        },
+        "estimated_savings_pct": estimated_savings_pct,
+        "recommendation": (
+            "Platform has reached sufficient actuarial credibility for a group "
+            "captive structure. This would allow self-insuring stop-loss risk, "
+            "eliminating ~15% of stop-loss premiums across all employers."
+            if all_met else
+            "Platform has not yet reached group captive readiness. "
+            "Continue growing employer base and accumulating claims history."
+        ),
+        "assessed_at": datetime.now(UTC).isoformat(),
+        "feeding_f8": True,
     }

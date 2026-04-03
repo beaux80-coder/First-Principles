@@ -16,18 +16,16 @@ This engine automates:
 
 import logging
 import math
-import uuid
 from datetime import datetime, UTC
-from typing import Optional
 
-from sqlalchemy import func, and_, text, distinct
+from sqlalchemy import func, and_, distinct
 from sqlalchemy.orm import Session
 
 from app.models.price_data import PriceData, PriceSource
 from app.models.employer import Employer, EmployerStatus
 from app.models.employee import Employee, EmployeeStatus
 from app.models.benchmark_query import BenchmarkQuery, BenchmarkStage
-from app.models.claim import Claim, ClaimStatus, ClaimMode
+from app.models.claim import Claim, ClaimMode
 
 logger = logging.getLogger(__name__)
 
@@ -121,6 +119,147 @@ METRO_AREAS = {
         "employer_segments": ["healthcare", "finance", "retail", "manufacturing"],
     },
 }
+
+# ---------------------------------------------------------------------------
+# Service-type volume thresholds (F8 Q11)
+#
+# Per-service-type breakdown of the platform volume at which providers begin
+# actively competing on price. These thresholds vary by service type because
+# provider density, commoditization, and price transparency differ across
+# care categories. When platform claims in a metro exceed the threshold for
+# a given service type, competitive price pressure kicks in.
+# ---------------------------------------------------------------------------
+
+SERVICE_TYPE_THRESHOLDS = {
+    "primary_care": {
+        "description": "Office visits, wellness exams, preventive care",
+        "volume_threshold": 100,
+        "rationale": "High provider density — competitive pressure begins early",
+        "cpt_range": "99201-99215",
+        "price_sensitivity": "high",
+    },
+    "specialty_care": {
+        "description": "Specialist consultations, referral-based care",
+        "volume_threshold": 200,
+        "rationale": "Moderate provider density; requires more volume for leverage",
+        "cpt_range": "99241-99245",
+        "price_sensitivity": "moderate",
+    },
+    "surgical": {
+        "description": "Inpatient and outpatient surgical procedures",
+        "volume_threshold": 50,
+        "rationale": "High-cost procedures; even modest volume creates negotiating power",
+        "cpt_range": "10000-69999",
+        "price_sensitivity": "very_high",
+    },
+    "imaging": {
+        "description": "X-rays, MRIs, CT scans, ultrasounds",
+        "volume_threshold": 75,
+        "rationale": "Highly commoditized; price competition responds quickly to volume",
+        "cpt_range": "70000-79999",
+        "price_sensitivity": "very_high",
+    },
+    "lab_pathology": {
+        "description": "Blood work, urinalysis, pathology",
+        "volume_threshold": 150,
+        "rationale": "Very high provider density but low per-unit cost; needs volume for significance",
+        "cpt_range": "80000-89999",
+        "price_sensitivity": "moderate",
+    },
+    "mental_health": {
+        "description": "Therapy sessions, psychiatric evaluations",
+        "volume_threshold": 120,
+        "rationale": "Growing provider base; parity mandates increase supply",
+        "cpt_range": "90791-90899",
+        "price_sensitivity": "moderate",
+    },
+    "dental": {
+        "description": "Dental procedures (preventive, restorative, surgical)",
+        "volume_threshold": 100,
+        "rationale": "High provider density in metro areas",
+        "cpt_range": "D0100-D9999",
+        "price_sensitivity": "high",
+    },
+    "vision": {
+        "description": "Eye exams, corrective lenses, refractive procedures",
+        "volume_threshold": 80,
+        "rationale": "Commoditized market with strong retail competition",
+        "cpt_range": "92000-92499",
+        "price_sensitivity": "high",
+    },
+    "pharmacy": {
+        "description": "Prescription drugs (retail, specialty, mail-order)",
+        "volume_threshold": 200,
+        "rationale": "PBM contracts require significant volume for spread elimination",
+        "cpt_range": "N/A (NDC-based)",
+        "price_sensitivity": "high",
+    },
+    "physical_therapy": {
+        "description": "PT, OT, rehabilitation services",
+        "volume_threshold": 60,
+        "rationale": "Moderate density; price variation is high — volume helps quickly",
+        "cpt_range": "97000-97799",
+        "price_sensitivity": "high",
+    },
+}
+
+
+def get_service_level_thresholds(metro_code: str | None = None) -> dict:
+    """Combine metro-level density data with per-service-type thresholds.
+
+    Returns a unified view showing, for each service type, the volume
+    threshold at which competitive pricing activates and the metro-level
+    context (provider density, priority score) if a metro is specified.
+
+    Args:
+        metro_code: Optional metro area code (e.g., "NYC", "DFW").
+                    If provided, includes metro density context.
+
+    Returns:
+        Dict with combined metro + service-type threshold data.
+    """
+    metro_info = None
+    if metro_code:
+        metro_info = METRO_AREAS.get(metro_code.upper())
+
+    service_thresholds = {}
+    for svc_type, svc_data in SERVICE_TYPE_THRESHOLDS.items():
+        entry = {
+            "service_type": svc_type,
+            "description": svc_data["description"],
+            "volume_threshold": svc_data["volume_threshold"],
+            "price_sensitivity": svc_data["price_sensitivity"],
+            "rationale": svc_data["rationale"],
+        }
+        if metro_info:
+            # Adjust threshold based on metro density — denser metros
+            # reach competitive pressure faster (threshold reduced by up to 25%)
+            density_factor = min(metro_info["priority_score"] / 100.0, 1.0)
+            adjusted_threshold = max(
+                10,
+                int(svc_data["volume_threshold"] * (1.0 - 0.25 * density_factor)),
+            )
+            entry["metro_adjusted_threshold"] = adjusted_threshold
+            entry["metro_density_factor"] = round(density_factor, 2)
+
+        service_thresholds[svc_type] = entry
+
+    result = {
+        "service_type_thresholds": service_thresholds,
+        "total_service_types": len(SERVICE_TYPE_THRESHOLDS),
+    }
+
+    if metro_info:
+        result["metro"] = {
+            "code": metro_code.upper() if metro_code else None,
+            "name": metro_info["name"],
+            "states": metro_info["states"],
+            "density_threshold": metro_info["density_threshold"],
+            "priority_score": metro_info["priority_score"],
+        }
+
+    return result
+
 
 # Distribution channel weights for optimization
 CHANNEL_WEIGHTS = {
@@ -306,7 +445,7 @@ def _analyze_topic(db: Session, topic: str, states: list, state_filter) -> dict:
         return _topic_employer_overpayment(db, states, state_filter)
     else:
         return {
-            "title": f"General Price Analysis",
+            "title": "General Price Analysis",
             "findings": [{"note": f"Topic '{topic}' not recognized. Use: hospital_pricing, pharmacy_costs, mental_health_access, price_variation, employer_overpayment."}],
         }
 
@@ -830,7 +969,7 @@ def generate_broker_specific_content(
         annual_spend = industry_pepm * size * 12
         overhead = annual_spend * INDUSTRY_COST_BREAKDOWN["carrier_overhead_pct"]
         waste = annual_spend * INDUSTRY_COST_BREAKDOWN["waste_pct"]
-        broker_comm = annual_spend * INDUSTRY_COST_BREAKDOWN["broker_commission_pct"]
+        annual_spend * INDUSTRY_COST_BREAKDOWN["broker_commission_pct"]
         estimated_savings = overhead + waste + (annual_spend * price_gap_pct / 100 * 0.5)
         savings_models.append({
             "employee_count": size,
@@ -1049,7 +1188,7 @@ def run_distribution_optimization(db: Session) -> dict:
     optimization_actions = []
 
     for channel, config in CHANNEL_WEIGHTS.items():
-        base_rate = config["conversion_rate"]
+        config["conversion_rate"]
         current_weight = config["initial_weight"]
 
         # Adjust weight based on funnel performance
@@ -1280,3 +1419,342 @@ def automate_full_funnel(db: Session) -> dict:
             "activation_candidates": len(activation_candidates),
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# Form 5500 Ingestion (F12 Q4)
+#
+# DOL EFAST2 public data provides Form 5500 filings for every ERISA-covered
+# plan in the US. Ingesting this data enables proactive benchmarking: we can
+# identify employers, their plan sizes, carriers, and costs — then generate
+# targeted outreach showing how they'd benefit from the platform.
+# ---------------------------------------------------------------------------
+
+class Form5500Ingester:
+    """Ingest and parse DOL EFAST2 Form 5500 public filing data.
+
+    The DOL publishes all Form 5500 filings via the EFAST2 system.
+    Bulk data is available as annual ZIP files containing CSV/fixed-width
+    records for each form section.
+
+    This class:
+    1. Defines the DOL EFAST2 download URL structure
+    2. Parses key fields from Form 5500 filings
+    3. Generates a proactive benchmark for each parsed filing
+    4. Integrates with the benchmark service for outreach
+    """
+
+    # DOL EFAST2 bulk data download URLs
+    EFAST2_BASE_URL = "https://www.dol.gov/agencies/ebsa/about-ebsa/our-activities/public-disclosure/foia/form-5500-datasets"
+    EFAST2_DOWNLOAD_TEMPLATE = (
+        "https://askebsa.dol.gov/FOIA%20Files/{year}/Latest/"
+        "f_5500_sf_latest.zip"  # Small filer (SF) and standard
+    )
+    EFAST2_FULL_DOWNLOAD_TEMPLATE = (
+        "https://askebsa.dol.gov/FOIA%20Files/{year}/Latest/"
+        "f_5500_latest.zip"  # Full Form 5500
+    )
+    EFAST2_SCHEDULE_A_TEMPLATE = (
+        "https://askebsa.dol.gov/FOIA%20Files/{year}/Latest/"
+        "f_sch_a_latest.zip"  # Schedule A — insurance info
+    )
+
+    # Key fields to extract from Form 5500 filings
+    PARSED_FIELDS = [
+        "ack_id",              # EFAST2 acknowledgment ID
+        "plan_name",           # Name of the benefit plan
+        "sponsor_name",        # Plan sponsor (employer) name
+        "sponsor_ein",         # Plan sponsor EIN
+        "sponsor_state",       # Sponsor state
+        "sponsor_zip",         # Sponsor ZIP code
+        "plan_year_begin",     # Plan year start date
+        "plan_year_end",       # Plan year end date
+        "plan_type",           # Welfare, pension, etc.
+        "total_participants",  # Total plan participants
+        "active_participants", # Active participants
+        "total_assets",        # Total plan assets (if any)
+        "total_expenses",      # Total plan expenses (benefit costs)
+        "insurance_carriers",  # Carrier names from Schedule A
+        "total_premiums",      # Total insurance premiums
+        "broker_commissions",  # Commissions paid to brokers
+        "admin_expenses",      # Administrative expenses
+    ]
+
+    def __init__(self):
+        self.parsed_filings: list[dict] = []
+
+    def get_download_urls(self, year: int) -> dict:
+        """Get DOL EFAST2 download URLs for a given filing year.
+
+        Args:
+            year: Filing year (e.g., 2024)
+
+        Returns:
+            Dict with download URLs for each data file.
+        """
+        return {
+            "year": year,
+            "base_url": self.EFAST2_BASE_URL,
+            "downloads": {
+                "form_5500_full": self.EFAST2_FULL_DOWNLOAD_TEMPLATE.format(year=year),
+                "form_5500_sf": self.EFAST2_DOWNLOAD_TEMPLATE.format(year=year),
+                "schedule_a": self.EFAST2_SCHEDULE_A_TEMPLATE.format(year=year),
+            },
+            "format": "ZIP containing pipe-delimited CSV files",
+            "documentation": (
+                "https://www.dol.gov/agencies/ebsa/about-ebsa/our-activities/"
+                "public-disclosure/foia/form-5500-datasets"
+            ),
+        }
+
+    def parse_filing(self, raw_record: dict) -> dict:
+        """Parse key fields from a single Form 5500 filing record.
+
+        In production, raw_record comes from the CSV data after download.
+        This method normalizes field names and extracts the fields needed
+        for proactive benchmarking.
+
+        Args:
+            raw_record: Dict of raw CSV column values from EFAST2 data.
+
+        Returns:
+            Parsed filing dict with standardized field names.
+        """
+        # Map EFAST2 CSV column names to our standardized fields
+        # (EFAST2 uses uppercase column names like SPONS_DFE_PN,
+        #  ACK_ID, PLAN_NAME, etc.)
+        parsed = {
+            "ack_id": raw_record.get("ACK_ID", raw_record.get("ack_id", "")),
+            "plan_name": raw_record.get("PLAN_NAME", raw_record.get("plan_name", "")),
+            "sponsor_name": raw_record.get(
+                "SPONS_DFE_MAIL_US_NAME",
+                raw_record.get("sponsor_name", ""),
+            ),
+            "sponsor_ein": raw_record.get(
+                "SPONS_DFE_EIN",
+                raw_record.get("sponsor_ein", ""),
+            ),
+            "sponsor_state": raw_record.get(
+                "SPONS_DFE_MAIL_US_STATE",
+                raw_record.get("sponsor_state", ""),
+            ),
+            "sponsor_zip": raw_record.get(
+                "SPONS_DFE_MAIL_US_ZIP",
+                raw_record.get("sponsor_zip", ""),
+            ),
+            "plan_year_begin": raw_record.get(
+                "PLAN_EFF_DATE",
+                raw_record.get("plan_year_begin", ""),
+            ),
+            "plan_year_end": raw_record.get(
+                "PLAN_EFF_DATE_END",
+                raw_record.get("plan_year_end", ""),
+            ),
+            "total_participants": _safe_int(
+                raw_record.get(
+                    "TOT_PARTCP_BOY_CNT",
+                    raw_record.get("total_participants", 0),
+                )
+            ),
+            "active_participants": _safe_int(
+                raw_record.get(
+                    "TOT_ACT_PARTCP_BOY_CNT",
+                    raw_record.get("active_participants", 0),
+                )
+            ),
+            "total_assets": _safe_float(
+                raw_record.get(
+                    "TOT_ASSETS_BOY_AMT",
+                    raw_record.get("total_assets", 0),
+                )
+            ),
+            "total_expenses": _safe_float(
+                raw_record.get(
+                    "BENEFIT_EXP",
+                    raw_record.get("total_expenses", 0),
+                )
+            ),
+            "admin_expenses": _safe_float(
+                raw_record.get(
+                    "TOT_ADMIN_EXP",
+                    raw_record.get("admin_expenses", 0),
+                )
+            ),
+            "insurance_carriers": raw_record.get(
+                "insurance_carriers",
+                raw_record.get("CARRIER_NAME", ""),
+            ),
+            "total_premiums": _safe_float(
+                raw_record.get(
+                    "TOT_PREMIUM",
+                    raw_record.get("total_premiums", 0),
+                )
+            ),
+            "broker_commissions": _safe_float(
+                raw_record.get(
+                    "BROKER_COMMISSION",
+                    raw_record.get("broker_commissions", 0),
+                )
+            ),
+        }
+
+        # Derive plan type from plan characteristics
+        plan_type_code = raw_record.get("TYPE_PLAN_ENTITY_CD", "")
+        if plan_type_code in ("1", "4"):
+            parsed["plan_type"] = "welfare"
+        elif plan_type_code in ("2", "3"):
+            parsed["plan_type"] = "pension"
+        else:
+            parsed["plan_type"] = raw_record.get("plan_type", "welfare")
+
+        self.parsed_filings.append(parsed)
+        return parsed
+
+    def generate_proactive_benchmark(self, parsed_filing: dict) -> dict:
+        """Generate a proactive benchmark for a parsed Form 5500 filing.
+
+        Uses the filing data to estimate what the employer is currently
+        paying and what they could save on the platform.
+
+        Args:
+            parsed_filing: Output of parse_filing()
+
+        Returns:
+            Benchmark comparison showing savings opportunity.
+        """
+        participants = parsed_filing.get("total_participants", 0)
+        total_expenses = parsed_filing.get("total_expenses", 0)
+        admin_expenses = parsed_filing.get("admin_expenses", 0)
+        total_premiums = parsed_filing.get("total_premiums", 0)
+        broker_commissions = parsed_filing.get("broker_commissions", 0)
+
+        # Calculate per-employee-per-month (PEPM) costs
+        if participants > 0 and total_expenses > 0:
+            pepm_total = total_expenses / participants / 12
+        elif participants > 0 and total_premiums > 0:
+            pepm_total = total_premiums / participants / 12
+        else:
+            pepm_total = 0
+
+        # Estimate savings components
+        # 1. Carrier overhead elimination (typically 15-20% of premiums)
+        carrier_overhead_est = total_premiums * 0.17 if total_premiums else 0
+        # 2. Broker commission elimination
+        commission_savings = broker_commissions
+        # 3. Admin cost reduction (system automates admin)
+        admin_savings = admin_expenses * 0.80  # 80% of admin costs eliminated
+        # 4. Price discovery savings (typically 20-35% of claims)
+        claims_est = total_expenses - admin_expenses if total_expenses > admin_expenses else total_expenses
+        price_discovery_savings = claims_est * 0.25
+
+        total_estimated_savings = (
+            carrier_overhead_est
+            + commission_savings
+            + admin_savings
+            + price_discovery_savings
+        )
+
+        savings_pct = (
+            round(total_estimated_savings / total_expenses * 100, 1)
+            if total_expenses > 0 else 0
+        )
+
+        return {
+            "filing_source": "DOL EFAST2 Form 5500",
+            "sponsor_name": parsed_filing.get("sponsor_name", ""),
+            "sponsor_ein": parsed_filing.get("sponsor_ein", ""),
+            "sponsor_state": parsed_filing.get("sponsor_state", ""),
+            "plan_name": parsed_filing.get("plan_name", ""),
+            "total_participants": participants,
+            "current_costs": {
+                "total_plan_expenses": round(total_expenses, 2),
+                "total_premiums": round(total_premiums, 2),
+                "admin_expenses": round(admin_expenses, 2),
+                "broker_commissions": round(broker_commissions, 2),
+                "pepm": round(pepm_total, 2),
+            },
+            "estimated_savings": {
+                "carrier_overhead_elimination": round(carrier_overhead_est, 2),
+                "commission_elimination": round(commission_savings, 2),
+                "admin_automation": round(admin_savings, 2),
+                "price_discovery": round(price_discovery_savings, 2),
+                "total_estimated_annual_savings": round(total_estimated_savings, 2),
+                "savings_pct": savings_pct,
+            },
+            "outreach_recommendation": {
+                "priority": (
+                    "high" if savings_pct >= 25 and participants >= 50
+                    else "medium" if savings_pct >= 15
+                    else "low"
+                ),
+                "reason": (
+                    f"{participants} participants, {savings_pct}% estimated savings "
+                    f"(${round(total_estimated_savings):,}/year)"
+                ),
+                "suggested_channel": (
+                    "broker_outreach" if broker_commissions > 0
+                    else "direct_inbound"
+                ),
+            },
+        }
+
+    def ingest_batch(self, records: list[dict]) -> dict:
+        """Process a batch of raw Form 5500 records.
+
+        Args:
+            records: List of raw CSV record dicts from EFAST2 data.
+
+        Returns:
+            Summary of ingestion results with benchmarks.
+        """
+        results = []
+        high_priority = []
+
+        for record in records:
+            parsed = self.parse_filing(record)
+
+            # Only benchmark welfare plans (health/dental/vision/etc.)
+            if parsed.get("plan_type") != "welfare":
+                continue
+
+            # Only benchmark plans with meaningful participant counts
+            if parsed.get("total_participants", 0) < 10:
+                continue
+
+            benchmark = self.generate_proactive_benchmark(parsed)
+            results.append(benchmark)
+
+            if benchmark["outreach_recommendation"]["priority"] == "high":
+                high_priority.append(benchmark)
+
+        return {
+            "ingestion_summary": {
+                "total_records_processed": len(records),
+                "welfare_plans_parsed": len(results),
+                "high_priority_targets": len(high_priority),
+                "ingested_at": datetime.now(UTC).isoformat(),
+            },
+            "benchmarks": results,
+            "high_priority_targets": high_priority,
+            "data_source": {
+                "name": "DOL EFAST2 Form 5500 Public Disclosure",
+                "url": self.EFAST2_BASE_URL,
+                "fields_parsed": self.PARSED_FIELDS,
+            },
+        }
+
+
+def _safe_int(value) -> int:
+    """Safely convert a value to int, returning 0 on failure."""
+    try:
+        return int(float(str(value).replace(",", "").strip()))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _safe_float(value) -> float:
+    """Safely convert a value to float, returning 0.0 on failure."""
+    try:
+        return float(str(value).replace(",", "").strip())
+    except (ValueError, TypeError):
+        return 0.0

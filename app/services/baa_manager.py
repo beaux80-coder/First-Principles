@@ -7,7 +7,6 @@ that access, store, or transmit protected health information.
 """
 
 import logging
-import uuid
 from datetime import datetime, timedelta, UTC
 
 from sqlalchemy.orm import Session

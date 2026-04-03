@@ -9,7 +9,6 @@ third-party vendor assessment, and patch status tracking.
 import hashlib
 import importlib.metadata
 import logging
-import os
 import sys
 from datetime import datetime, timedelta, UTC
 

@@ -12,6 +12,7 @@ pharmacy, and quality ratings.
 """
 
 import logging
+import time
 from datetime import datetime, UTC
 
 from sqlalchemy import func
@@ -21,6 +22,10 @@ from app.models.price_data import PriceData, PriceSource
 
 logger = logging.getLogger(__name__)
 
+# Cache for ML evaluation results (10-minute TTL)
+_ML_EVAL_CACHE: dict = {}
+_ML_EVAL_CACHE_TTL = 600
+
 
 def evaluate_ml_techniques(db: Session) -> dict:
     """Evaluate all physically possible ML techniques on current data.
@@ -28,6 +33,10 @@ def evaluate_ml_techniques(db: Session) -> dict:
     Returns an assessment of each technique: applicable, implemented,
     evaluated, or deferred with reason.
     """
+    now = time.time()
+    if _ML_EVAL_CACHE.get("result") and (now - _ML_EVAL_CACHE.get("ts", 0)) < _ML_EVAL_CACHE_TTL:
+        return _ML_EVAL_CACHE["result"]
+
     total_records = db.query(func.count(PriceData.price_id)).scalar() or 0
 
     evaluations = {
@@ -239,6 +248,8 @@ def evaluate_ml_techniques(db: Session) -> dict:
         "feeds": ["F9 (Care Execution)", "F4 (Provider Selection)"],
     })
 
+    _ML_EVAL_CACHE["result"] = evaluations
+    _ML_EVAL_CACHE["ts"] = time.time()
     return evaluations
 
 
@@ -269,7 +280,7 @@ def validate_employer_improvement(db: Session, employer_id: str) -> dict:
     ).scalar() or 0
 
     # Price data verified by this employer's claims
-    price_data_points = db.query(func.count(PriceData.price_id)).filter(
+    db.query(func.count(PriceData.price_id)).filter(
         PriceData.provider_npi.isnot(None),
     ).scalar() or 0
 
@@ -583,7 +594,6 @@ def detect_model_bias(db: Session) -> dict:
     total_dets = db.query(func.count(ClinicalDetermination.determination_id)).scalar() or 0
 
     if total_dets > 0:
-        from sqlalchemy import case
         approval_by_type = db.execute(text(
             "SELECT benefit_type, "
             "COUNT(*) as total, "

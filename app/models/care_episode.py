@@ -88,6 +88,8 @@ class CareEpisode(Base):
     prescription_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     prescription_drug_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     prescription_pharmacy_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Dependent handling (item 4: "my daughter has an earache")
+    dependent_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     # Provider concern flag
     provider_concern_flag: Mapped[bool] = mapped_column(Boolean, default=False)
     provider_concern_note: Mapped[str | None] = mapped_column(Text, nullable=True)

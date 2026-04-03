@@ -510,9 +510,9 @@ def process_data_subject_request(
 
     if request_type == "access":
         request_record["action"] = (
-            f"Provide consumer with categories and specific pieces of personal "
-            f"information collected, sources, purposes, and third parties shared with. "
-            f"12-month lookback required under CCPA/CPRA."
+            "Provide consumer with categories and specific pieces of personal "
+            "information collected, sources, purposes, and third parties shared with. "
+            "12-month lookback required under CCPA/CPRA."
         )
         request_record["verification_required"] = True
         request_record["data_categories"] = [
@@ -522,9 +522,9 @@ def process_data_subject_request(
 
     elif request_type == "delete":
         request_record["action"] = (
-            f"Delete consumer's personal information from all systems. "
-            f"Notify service providers to delete as well. "
-            f"Document any exceptions (legal hold, ongoing transactions, security)."
+            "Delete consumer's personal information from all systems. "
+            "Notify service providers to delete as well. "
+            "Document any exceptions (legal hold, ongoing transactions, security)."
         )
         request_record["verification_required"] = True
         request_record["exceptions_check"] = [
@@ -541,26 +541,26 @@ def process_data_subject_request(
 
     elif request_type == "opt_out":
         request_record["action"] = (
-            f"Opt consumer out of sale/sharing of personal information. "
-            f"Process opt-out within 15 business days. "
-            f"Do not ask consumer to create account for opt-out."
+            "Opt consumer out of sale/sharing of personal information. "
+            "Process opt-out within 15 business days. "
+            "Do not ask consumer to create account for opt-out."
         )
         request_record["verification_required"] = False
         request_record["scope"] = details.get("scope", "all_sharing")
 
     elif request_type == "correct":
         request_record["action"] = (
-            f"Correct inaccurate personal information as specified by consumer. "
-            f"Instruct service providers to correct as well."
+            "Correct inaccurate personal information as specified by consumer. "
+            "Instruct service providers to correct as well."
         )
         request_record["verification_required"] = True
         request_record["corrections_requested"] = details.get("corrections", {})
 
     elif request_type == "port":
         request_record["action"] = (
-            f"Provide consumer's personal information in a portable, "
-            f"machine-readable format (JSON or CSV). "
-            f"Transmit directly to another entity if technically feasible."
+            "Provide consumer's personal information in a portable, "
+            "machine-readable format (JSON or CSV). "
+            "Transmit directly to another entity if technically feasible."
         )
         request_record["verification_required"] = True
         request_record["export_format"] = details.get("format", "json")
@@ -568,17 +568,17 @@ def process_data_subject_request(
 
     elif request_type == "consent_withdrawal":
         request_record["action"] = (
-            f"Process withdrawal of consent for health data collection/use. "
-            f"Cease processing within 15 days. Under WA MHMD, consent is "
-            f"required before collecting consumer health data."
+            "Process withdrawal of consent for health data collection/use. "
+            "Cease processing within 15 days. Under WA MHMD, consent is "
+            "required before collecting consumer health data."
         )
         request_record["verification_required"] = True
 
     elif request_type == "limit_sensitive":
         request_record["action"] = (
-            f"Limit use of sensitive personal information to purposes necessary "
-            f"to perform services reasonably expected by consumer. "
-            f"CPRA-specific right."
+            "Limit use of sensitive personal information to purposes necessary "
+            "to perform services reasonably expected by consumer. "
+            "CPRA-specific right."
         )
         request_record["verification_required"] = False
         request_record["sensitive_categories"] = [

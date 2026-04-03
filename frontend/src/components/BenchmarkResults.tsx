@@ -27,6 +27,7 @@ interface Props {
 }
 
 export default function BenchmarkResults({ result, onReset }: Props) {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const r = result as any
   const { current_cost, system_cost, comparison, experience_comparison, transparency, data_quality } = r
 
@@ -108,14 +109,17 @@ export default function BenchmarkResults({ result, onReset }: Props) {
                 </tr>
               </thead>
               <tbody>
-                {Object.entries(r.benefit_type_breakdown).map(([key, bt]: [string, any]) => (
+                {Object.entries(r.benefit_type_breakdown).map(([key, val]) => {
+                  const bt = val as Record<string, number>
+                  return (
                   <tr key={key} className="border-b">
                     <td className="py-3 pr-4 text-gray-700 font-medium">{benefitLabel(key)}</td>
                     <td className="py-3 px-2 text-right text-gray-900">{formatCurrency(bt.current_annual)}</td>
                     <td className="py-3 px-2 text-right text-primary-700 font-semibold">{formatCurrency(bt.system_annual)}</td>
                     <td className="py-3 px-2 text-right text-green-600 font-semibold">{formatPct(bt.savings_pct)}</td>
                   </tr>
-                ))}
+                  )
+                })}
               </tbody>
             </table>
           </div>
@@ -139,13 +143,13 @@ export default function BenchmarkResults({ result, onReset }: Props) {
                 </tr>
               </thead>
               <tbody>
-                {r.price_examples.map((ex: any) => (
-                  <tr key={ex.code} className="border-b">
-                    <td className="py-3 pr-4 text-gray-700">{ex.description}</td>
-                    <td className="py-3 px-2 text-right text-gray-900">{ex.hospital_price ? formatCurrency(ex.hospital_price) : '—'}</td>
-                    <td className="py-3 px-2 text-right text-gray-900">{ex.insurer_negotiated ? formatCurrency(ex.insurer_negotiated) : '—'}</td>
-                    <td className="py-3 px-2 text-right text-gray-900">{ex.medicare_price ? formatCurrency(ex.medicare_price) : '—'}</td>
-                    <td className="py-3 px-2 text-right text-primary-700 font-semibold">{ex.system_would_pay ? formatCurrency(ex.system_would_pay) : '—'}</td>
+                {r.price_examples.map((ex: Record<string, unknown>) => (
+                  <tr key={String(ex.code)} className="border-b">
+                    <td className="py-3 pr-4 text-gray-700">{String(ex.description)}</td>
+                    <td className="py-3 px-2 text-right text-gray-900">{ex.hospital_price ? formatCurrency(Number(ex.hospital_price)) : '—'}</td>
+                    <td className="py-3 px-2 text-right text-gray-900">{ex.insurer_negotiated ? formatCurrency(Number(ex.insurer_negotiated)) : '—'}</td>
+                    <td className="py-3 px-2 text-right text-gray-900">{ex.medicare_price ? formatCurrency(Number(ex.medicare_price)) : '—'}</td>
+                    <td className="py-3 px-2 text-right text-primary-700 font-semibold">{ex.system_would_pay ? formatCurrency(Number(ex.system_would_pay)) : '—'}</td>
                   </tr>
                 ))}
               </tbody>
@@ -160,10 +164,10 @@ export default function BenchmarkResults({ result, onReset }: Props) {
           <h2 className="text-lg font-semibold text-gray-900 mb-2">Top-rated hospitals in your state</h2>
           <p className="text-sm text-gray-500 mb-4">{r.local_quality.hospitals_with_ratings_in_state} hospitals rated by CMS in your state</p>
           <div className="space-y-2">
-            {r.local_quality.top_rated_hospitals.map((h: any, i: number) => (
+            {r.local_quality.top_rated_hospitals.map((h: Record<string, unknown>, i: number) => (
               <div key={i} className="flex justify-between text-sm py-2 border-b border-gray-100">
-                <span className="text-gray-700">{h.name}</span>
-                <span className="text-yellow-600 font-semibold">{'★'.repeat(h.rating)}{'☆'.repeat(5 - h.rating)}</span>
+                <span className="text-gray-700">{String(h.name)}</span>
+                <span className="text-yellow-600 font-semibold">{'★'.repeat(Number(h.rating))}{'☆'.repeat(5 - Number(h.rating))}</span>
               </div>
             ))}
           </div>

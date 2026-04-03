@@ -165,7 +165,7 @@ def ingest(csv_path):
         after = conn.execute(text("SELECT COUNT(*) FROM providers")).scalar()
     print(f"Providers after:  {after:,}")
     print(f"New providers:    {after - before:,}")
-    print(f"Target: ~7.4M")
+    print("Target: ~7.4M")
 
 def cleanup(csv_path):
     if os.path.exists(csv_path):

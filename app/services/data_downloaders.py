@@ -669,7 +669,6 @@ def download_physician_quality(db: Session) -> int:
     """
     logger.info("Downloading CMS MIPS clinician performance scores...")
 
-    from sqlalchemy import text as sa_text
 
     # --- Strategy 1: Bulk CSV download (fast, ~41 MB, ~1-3 seconds) ---
     updated = _download_mips_via_csv(db)
@@ -1157,7 +1156,7 @@ def download_insurer_tic(db: Session, max_files: int = 5) -> int:
 
         for entry in data.get("in_network", []):
             billing_code = (entry.get("billing_code") or "").strip()
-            code_type = (entry.get("billing_code_type") or "").strip()
+            (entry.get("billing_code_type") or "").strip()
             description = (entry.get("description") or entry.get("name") or "").strip()
 
             if not billing_code:
@@ -1345,7 +1344,6 @@ def download_samhsa_data(db: Session) -> int:
 
     # SAMHSA publishes facility data via their Locator API
     # We query state-by-state for mental health and substance abuse facilities
-    SAMHSA_LOCATOR_URL = "https://findtreatment.gov/locator/listing"
     count = 0
 
     # Use the SAMHSA NSDUH data API for treatment utilization data
@@ -2936,7 +2934,7 @@ def download_dmepos_rates() -> dict:
     }
 
 
-def download_asp_drug_pricing() -> dict:
+def download_asp_drug_pricing_summary() -> dict:
     """Download Average Sales Price (ASP) drug pricing from CMS.
 
     ASP is the average price paid to manufacturers for drugs covered under

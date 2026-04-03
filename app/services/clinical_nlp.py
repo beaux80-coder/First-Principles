@@ -19,6 +19,7 @@ The ONNX model is loaded once and cached in memory.
 """
 
 import logging
+import os
 import re
 from typing import Optional
 
@@ -69,7 +70,7 @@ def _load_onnx_model() -> bool:
     try:
         import os
         if not os.path.exists(ONNX_MODEL_PATH):
-            logger.info(f"ONNX model not found at {ONNX_MODEL_PATH} — using TF-IDF only")
+            logger.error(f"ONNX model not found at {ONNX_MODEL_PATH} — DEGRADED ACCURACY: using TF-IDF only. Download ClinicalBERT ONNX to restore full accuracy.")
             _onnx_available = False
             return False
 
@@ -96,11 +97,11 @@ def _load_onnx_model() -> bool:
         return True
 
     except ImportError:
-        logger.info("onnxruntime or tokenizers not installed — using TF-IDF only")
+        logger.error("onnxruntime or tokenizers not installed — DEGRADED ACCURACY: using TF-IDF only. Install: pip install onnxruntime tokenizers")
         _onnx_available = False
         return False
     except Exception as e:
-        logger.warning(f"Failed to load ONNX model: {e} — using TF-IDF only")
+        logger.error(f"Failed to load ONNX model: {e} — DEGRADED ACCURACY: using TF-IDF only")
         _onnx_available = False
         return False
 
@@ -157,7 +158,7 @@ def _ensure_bert_embeddings(db: Session, guideline_ids: list[str]) -> None:
     logger.info("Computing ClinicalBERT embeddings for guidelines...")
     embeddings = {}
     guidelines = db.query(ClinicalGuideline).filter(
-        ClinicalGuideline.is_active == True
+        ClinicalGuideline.is_active
     ).all()
 
     for g in guidelines:
@@ -195,16 +196,20 @@ def _build_guideline_corpus(guidelines: list[ClinicalGuideline]) -> list[str]:
     return corpus
 
 
+_TFIDF_CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "models", "tfidf_cache")
+
+
 def _ensure_model(db: Session) -> bool:
     """Ensure the TF-IDF model is trained on current guidelines.
 
     Retrains if guideline count has changed (new guidelines ingested).
+    Uses disk cache to avoid retraining on every server restart.
     """
     global _vectorizer, _tfidf_matrix, _guideline_ids, _guideline_count
 
     from sqlalchemy import func
     current_count = db.query(func.count(ClinicalGuideline.guideline_id)).filter(
-        ClinicalGuideline.is_active == True
+        ClinicalGuideline.is_active
     ).scalar() or 0
 
     if current_count == _guideline_count and _vectorizer is not None:
@@ -213,9 +218,33 @@ def _ensure_model(db: Session) -> bool:
     if current_count == 0:
         return False
 
-    # Load all active guidelines
+    # Try loading from disk cache first
+    cache_count_file = os.path.join(_TFIDF_CACHE_DIR, "count.txt")
+    cache_vectorizer_file = os.path.join(_TFIDF_CACHE_DIR, "vectorizer.pkl")
+    cache_matrix_file = os.path.join(_TFIDF_CACHE_DIR, "matrix.pkl")
+    cache_ids_file = os.path.join(_TFIDF_CACHE_DIR, "guideline_ids.pkl")
+
+    try:
+        import pickle
+        if (os.path.exists(cache_count_file) and os.path.exists(cache_vectorizer_file)):
+            with open(cache_count_file, "r") as f:
+                cached_count = int(f.read().strip())
+            if cached_count == current_count:
+                with open(cache_vectorizer_file, "rb") as f:
+                    _vectorizer = pickle.load(f)
+                with open(cache_matrix_file, "rb") as f:
+                    _tfidf_matrix = pickle.load(f)
+                with open(cache_ids_file, "rb") as f:
+                    _guideline_ids = pickle.load(f)
+                _guideline_count = current_count
+                logger.info(f"Clinical NLP model loaded from disk cache: {current_count} guidelines")
+                return True
+    except Exception as e:
+        logger.warning(f"Failed to load TF-IDF cache: {e} — retraining")
+
+    # Load all active guidelines and train
     guidelines = db.query(ClinicalGuideline).filter(
-        ClinicalGuideline.is_active == True
+        ClinicalGuideline.is_active
     ).all()
 
     corpus = _build_guideline_corpus(guidelines)
@@ -231,6 +260,22 @@ def _ensure_model(db: Session) -> bool:
     )
     _tfidf_matrix = _vectorizer.fit_transform(corpus)
     _guideline_count = current_count
+
+    # Save to disk cache for fast restart
+    try:
+        import pickle
+        os.makedirs(_TFIDF_CACHE_DIR, exist_ok=True)
+        with open(cache_count_file, "w") as f:
+            f.write(str(current_count))
+        with open(cache_vectorizer_file, "wb") as f:
+            pickle.dump(_vectorizer, f)
+        with open(cache_matrix_file, "wb") as f:
+            pickle.dump(_tfidf_matrix, f)
+        with open(cache_ids_file, "wb") as f:
+            pickle.dump(_guideline_ids, f)
+        logger.info(f"TF-IDF model cached to disk: {_TFIDF_CACHE_DIR}")
+    except Exception as e:
+        logger.warning(f"Failed to save TF-IDF cache: {e}")
 
     logger.info(
         f"Clinical NLP model trained: {current_count} guidelines, "
@@ -448,6 +493,12 @@ def match_symptoms_to_guidelines(
         else:
             final_score = tfidf_score
             scoring_method = "tfidf_only"
+
+        # Apply active learning boost from outcome feedback
+        # (Constitution: "every physically possible method to increase accuracy")
+        if gid in _outcome_boost:
+            final_score *= _outcome_boost[gid]
+            scoring_method += "+outcome_boost"
 
         guideline = db.query(ClinicalGuideline).filter(
             ClinicalGuideline.guideline_id == gid

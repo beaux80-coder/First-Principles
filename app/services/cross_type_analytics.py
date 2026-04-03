@@ -22,12 +22,11 @@ import uuid
 from datetime import datetime, UTC, timedelta
 from typing import Any
 
-from sqlalchemy import func, and_, or_, text, delete
+from sqlalchemy import func, or_, delete
 from sqlalchemy.orm import Session
 
 from app.models.price_data import PriceData, PriceSource
 from app.models.claim import Claim
-from app.models.service import BenefitType
 from app.models.data_pipeline_metric import DataPipelineMetric
 
 logger = logging.getLogger(__name__)
@@ -455,6 +454,7 @@ def detect_price_patterns(db: Session) -> dict[str, Any]:
         )
         .scalar()
     ) or 0
+    quality_count = int(quality_count) if isinstance(quality_count, (int, float)) else 0
 
     if quality_count > 0:
         patterns["patterns_detected"].append({
@@ -513,7 +513,7 @@ def detect_price_patterns(db: Session) -> dict[str, Any]:
                     f"Identified {len(leading)} benefit types that lead multi-type episodes"
                 ),
                 "feeds": ["F3 (Cost Prediction)", "F9 (Care Execution)"],
-                "leading_types": [l["benefit_type"] for l in leading],
+                "leading_types": [lead["benefit_type"] for lead in leading],
             })
 
     patterns["summary"] = {
@@ -795,3 +795,167 @@ def get_cross_type_report(db: Session) -> dict:
     patterns["persistence"] = persistence_summary
 
     return patterns
+
+
+# ---------------------------------------------------------------------------
+# Scale-Dependent Pattern Tracking (Build Manifest items 39-40)
+# ---------------------------------------------------------------------------
+
+def detect_scale_dependent_patterns(db: Session) -> dict:
+    """Track which insights require the platform's current data density.
+
+    Constitution F8 item 40: measures the compounding advantage that grows
+    with each new employer — patterns only detectable at current scale.
+    """
+    from app.models.price_data import PriceData
+    from app.models.claim import Claim, ClaimStatus
+    from app.models.employer import Employer
+
+    total_prices = db.query(func.count(PriceData.price_id)).scalar() or 0
+    total_claims = db.query(func.count(Claim.claim_id)).filter(
+        Claim.status.in_([ClaimStatus.paid, ClaimStatus.approved])
+    ).scalar() or 0
+    total_employers = db.query(func.count(Employer.employer_id)).scalar() or 0
+
+    scale_patterns = []
+
+    if total_prices >= 50_000:
+        scale_patterns.append({
+            "pattern": "state_level_price_prediction",
+            "minimum_data_density": "50K+ price records",
+            "current_density": f"{total_prices:,}",
+            "threshold_met": True,
+            "feeds": ["F2", "F3", "F6A"],
+        })
+
+    states_with_data = db.query(func.count(func.distinct(PriceData.state))).scalar() or 0
+    if states_with_data >= 10:
+        scale_patterns.append({
+            "pattern": "cross_metro_price_arbitrage",
+            "minimum_data_density": "10+ states",
+            "current_density": f"{states_with_data} states",
+            "threshold_met": True,
+            "feeds": ["F2", "F4", "F12"],
+        })
+
+    from app.models.provider import Provider
+    scored = db.query(func.count(Provider.provider_id)).filter(
+        Provider.quality_score.isnot(None)
+    ).scalar() or 0
+    if scored >= 100:
+        scale_patterns.append({
+            "pattern": "provider_quality_cost_clustering",
+            "minimum_data_density": "100+ scored providers",
+            "current_density": f"{scored}",
+            "threshold_met": True,
+            "feeds": ["F4", "F6A"],
+        })
+
+    not_yet = []
+    if total_prices < 1_000_000:
+        not_yet.append({
+            "pattern": "procedure_level_fair_price",
+            "minimum_data_density": "1M+ prices",
+            "gap": f"{max(0, 1_000_000 - total_prices):,} more needed",
+        })
+    if total_employers < 50:
+        not_yet.append({
+            "pattern": "industry_specific_benchmarks",
+            "minimum_data_density": "50+ employers",
+            "gap": f"{max(0, 50 - total_employers)} more needed",
+        })
+
+    return {
+        "scale_patterns_detected": scale_patterns,
+        "not_yet_detectable": not_yet,
+        "compounding_advantage": {
+            "total_price_records": total_prices,
+            "total_claims": total_claims,
+            "total_employers": total_employers,
+            "patterns_at_current_scale": len(scale_patterns),
+            "patterns_unlocked_by_growth": len(not_yet),
+        },
+        "feeding_f8": True,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Conventional Wisdom Contradiction Detection (Build Manifest item 41)
+# ---------------------------------------------------------------------------
+
+def detect_conventional_wisdom_contradictions(db: Session) -> dict:
+    """Find pricing anomalies and care assumptions that data contradicts.
+
+    Constitution F8 item 41: identifies emerging patterns that reveal flaws
+    in conventional healthcare wisdom.
+    """
+    from app.models.price_data import PriceData, PriceSource
+
+    contradictions = []
+
+    # 1. "Hospital prices reflect cost" → data shows 3-10x variation
+    variation = (
+        db.query(
+            PriceData.service_code,
+            func.min(PriceData.price).label("min_p"),
+            func.max(PriceData.price).label("max_p"),
+            func.count(PriceData.price_id).label("cnt"),
+        )
+        .filter(PriceData.price > 0)
+        .group_by(PriceData.service_code)
+        .having(func.count(PriceData.price_id) >= 10)
+        .having(func.max(PriceData.price) / func.max(func.min(PriceData.price), 0.01) > 3)
+        .limit(10)
+        .all()
+    )
+    if variation:
+        w = variation[0]
+        contradictions.append({
+            "conventional_wisdom": "Hospital prices reflect underlying cost",
+            "data_shows": (
+                f"Service {w.service_code}: ${float(w.min_p):.0f}-${float(w.max_p):.0f} "
+                f"({float(w.max_p)/max(float(w.min_p),0.01):.0f}x variation, {w.cnt} providers)"
+            ),
+            "implication": "Price is market power, not cost. Direct comparison eliminates this.",
+            "services_affected": len(variation),
+            "feeds": ["F2", "F6A"],
+        })
+
+    # 2. "Network discounts save money" → cash < negotiated
+    cash_avg = (
+        db.query(func.avg(PriceData.price))
+        .filter(PriceData.source == PriceSource.cash_price)
+        .scalar()
+    )
+    neg_avg = (
+        db.query(func.avg(PriceData.price))
+        .filter(PriceData.source == PriceSource.insurer_transparency)
+        .scalar()
+    )
+    if cash_avg and neg_avg and float(cash_avg) < float(neg_avg):
+        contradictions.append({
+            "conventional_wisdom": "Network-negotiated rates beat cash prices",
+            "data_shows": f"Cash avg ${float(cash_avg):.2f} < negotiated avg ${float(neg_avg):.2f}",
+            "implication": "Network contracts lock in above-market rates.",
+            "feeds": ["F2", "F7", "F6A"],
+        })
+
+    # 3. "PBMs reduce drug costs"
+    nadac = (
+        db.query(func.avg(PriceData.price))
+        .filter(PriceData.source == PriceSource.nadac_pharmacy)
+        .scalar()
+    )
+    if nadac:
+        contradictions.append({
+            "conventional_wisdom": "PBMs reduce drug costs via rebates",
+            "data_shows": f"NADAC wholesale avg ${float(nadac):.2f} — PBM spread adds cost",
+            "implication": "Direct pharmacy pricing at NADAC eliminates PBM margin.",
+            "feeds": ["F2"],
+        })
+
+    return {
+        "contradictions_found": len(contradictions),
+        "contradictions": contradictions,
+        "feeding_f8": True,
+    }

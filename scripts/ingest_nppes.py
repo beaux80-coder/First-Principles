@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.database import Base, engine, SessionLocal
 from app.models import *  # noqa: F401,F403
-from app.models.provider import Provider, ProviderType
+from app.models.provider import Provider
 from sqlalchemy import func
 
 # Configure logging
@@ -47,7 +47,7 @@ def print_provider_stats(db):
     """Print current provider database statistics."""
     total = db.query(Provider).count()
     print(f"\n{'=' * 60}")
-    print(f"PROVIDER DATABASE STATISTICS")
+    print("PROVIDER DATABASE STATISTICS")
     print(f"{'=' * 60}")
     print(f"Total providers: {total:,}")
     print()
@@ -130,7 +130,7 @@ def run_ingestion(bulk_only=False, api_only=False):
         new_providers = final_count - initial_count
 
         logger.info(f"{'=' * 60}")
-        logger.info(f"NPPES INGESTION COMPLETE")
+        logger.info("NPPES INGESTION COMPLETE")
         logger.info(f"  Time elapsed: {elapsed/60:.1f} minutes")
         logger.info(f"  Providers before: {initial_count:,}")
         logger.info(f"  Providers after:  {final_count:,}")

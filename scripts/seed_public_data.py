@@ -14,7 +14,6 @@ Run: cd beneflex && python -m scripts.seed_public_data
 
 import sys
 import os
-import uuid
 import random
 from datetime import datetime
 
@@ -331,20 +330,20 @@ def main():
         db.commit()
         print("Cleared existing data.")
 
-    hospital_count = seed_hospital_data(db)
-    medicare_count = seed_medicare_data(db)
+    seed_hospital_data(db)
+    seed_medicare_data(db)
 
     # Print stats
     from app.services.data_ingestion import get_ingestion_stats
     stats = get_ingestion_stats(db)
     print(f"\n{'=' * 60}")
-    print(f"SEED COMPLETE")
+    print("SEED COMPLETE")
     print(f"{'=' * 60}")
     print(f"Total records:     {stats['total_records']}")
     print(f"Unique providers:  {stats['unique_providers']}")
     print(f"Unique services:   {stats['unique_services']}")
     print(f"States covered:    {len(stats['by_state'])}")
-    print(f"By source:")
+    print("By source:")
     for source, count in stats['by_source'].items():
         print(f"  {source}: {count}")
     print()

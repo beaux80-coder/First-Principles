@@ -530,3 +530,43 @@ def fhir_bundle_endpoint(
         raise HTTPException(status_code=404, detail=result["error"])
 
     return result
+
+
+# -- F9: Reactivate departing employee recommendation -----------------------
+
+
+class ReactivateRequest(BaseModel):
+    """Request to reactivate a departing employee recommendation."""
+    employee_id: str
+    new_employer_name: str
+
+
+@router.post("/reactivate")
+def reactivate_recommendation(
+    request: ReactivateRequest,
+    db: Session = Depends(get_db),
+):
+    """Reactivate departing employee recommendation. F9 Q10.
+
+    Constitution F9: generate a portable recommendation for a former
+    employee to share with their new employer, including anonymized
+    care statistics and a link to the benchmark tool.
+    """
+    import uuid as uuid_mod
+    from app.services.care_execution import reactivate_recommendation as _reactivate
+
+    try:
+        employee_uuid = uuid_mod.UUID(request.employee_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid employee_id format")
+
+    result = _reactivate(
+        db,
+        former_employee_id=employee_uuid,
+        new_employer_name=request.new_employer_name,
+    )
+
+    if "error" in result:
+        raise HTTPException(status_code=404, detail=result["error"])
+
+    return result

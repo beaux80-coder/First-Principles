@@ -13,7 +13,7 @@ import base64
 import hashlib
 
 from cryptography.fernet import Fernet
-from sqlalchemy import String, Text
+from sqlalchemy import Text
 from sqlalchemy.types import TypeDecorator
 
 from app.config import settings
@@ -42,8 +42,8 @@ def decrypt_value(ciphertext: str) -> str:
     return f.decrypt(ciphertext.encode()).decode()
 
 
-import os
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+import os  # noqa: E402
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: E402
 
 
 class AES256GCMEncryptor:

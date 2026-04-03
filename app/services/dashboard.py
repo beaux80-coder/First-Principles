@@ -12,17 +12,16 @@ import logging
 import uuid
 from datetime import datetime, UTC
 
-from sqlalchemy import func, and_
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.models.claim import Claim, ClaimStatus, ClaimMode
+from app.models.claim import Claim, ClaimStatus
 from app.models.employer import Employer
 from app.models.employee import Employee, EmployeeStatus
 from app.models.care_episode import CareEpisode, EpisodeStatus
 from app.models.service import BenefitType
 from app.services.benchmark import (
     NATIONAL_AVG_PEPM,
-    BENEFIT_TYPE_ALLOCATION,
 )
 
 logger = logging.getLogger(__name__)
@@ -237,7 +236,7 @@ def get_line_item_audit(
     determination, price comparison, adjudication decision, payment,
     and all associated reasoning.
     """
-    employer = _get_employer_or_raise(db, employer_id)
+    _get_employer_or_raise(db, employer_id)
 
     claim = db.query(Claim).filter(
         Claim.claim_id == claim_id,
@@ -485,7 +484,6 @@ def _get_care_execution_metrics(db: Session, employer_id: uuid.UUID) -> dict:
     appointments scheduled, referrals coordinated, prescriptions routed,
     follow-ups completed — all without employee action."
     """
-    from app.models.care_episode import CareEpisode, EpisodeStatus
 
     # CareEpisode links through employee_id, join to get employer's episodes
     employer_episodes = db.query(CareEpisode).join(
@@ -511,12 +509,48 @@ def _get_care_execution_metrics(db: Session, employer_id: uuid.UUID) -> dict:
         if bt_count > 0:
             by_type[bt.value] = bt_count
 
+    # Referrals, prescriptions, follow-ups from care episode steps (item 7)
+    referrals_coordinated = 0
+    prescriptions_routed = 0
+    follow_ups_completed = 0
+    total_time_to_first_appt_hrs = 0.0
+    appt_count = 0
+
+    for ep in employer_episodes.all():
+        steps = ep.steps or {}
+        if steps.get("referral"):
+            referrals_coordinated += 1
+        if steps.get("prescription"):
+            prescriptions_routed += 1
+        if steps.get("follow_up") and ep.status == EpisodeStatus.resolved:
+            follow_ups_completed += 1
+        # Time from issue to first appointment (item 9)
+        if ep.created_at and steps.get("scheduling", {}).get("scheduled_at"):
+            try:
+                sched_str = steps["scheduling"]["scheduled_at"]
+                sched_dt = datetime.fromisoformat(sched_str.replace("Z", "+00:00"))
+                delta_hrs = (sched_dt - ep.created_at).total_seconds() / 3600
+                if delta_hrs >= 0:
+                    total_time_to_first_appt_hrs += delta_hrs
+                    appt_count += 1
+            except (ValueError, TypeError, AttributeError):
+                pass
+
+    avg_time_to_first_appt = (
+        round(total_time_to_first_appt_hrs / appt_count, 1)
+        if appt_count > 0 else None
+    )
+
     return {
         "total_episodes_managed": total_episodes,
         "appointments_scheduled": scheduled,
+        "referrals_coordinated": referrals_coordinated,
+        "prescriptions_routed": prescriptions_routed,
+        "follow_ups_completed": follow_ups_completed,
         "episodes_resolved": resolved,
         "by_benefit_type": by_type,
         "employee_actions_per_episode": 1,  # Describe issue only
+        "time_from_issue_to_first_appointment_hours": avg_time_to_first_appt,
         "zero_phone_calls_pct": 100.0,
         "zero_self_scheduling_pct": 100.0,
     }

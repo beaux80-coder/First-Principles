@@ -45,6 +45,12 @@ class ClinicalDetermination(Base):
     risk_factors: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     # Latency measurement (F1 completion test 3)
     latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Determination authority (Build Manifest items 3, 8, 17)
+    # "standing_protocol" = auto-approved via Medical Director standing orders
+    # "individual_review" = sent to Medical Director/UR for individual review
+    determination_authority: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    reviewed_by: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    is_recommendation: Mapped[bool | None] = mapped_column(nullable=True, default=True)
     # Outcome feedback loop for accuracy measurement (F1 completion test 4)
     outcome_feedback: Mapped[str | None] = mapped_column(String(50), nullable=True)
     outcome_recorded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

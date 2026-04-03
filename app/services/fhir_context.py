@@ -16,7 +16,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from app.models.care_episode import CareEpisode, EpisodeStatus
+from app.models.care_episode import CareEpisode
 from app.models.employee import Employee
 from app.models.provider import Provider
 

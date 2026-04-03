@@ -14,7 +14,6 @@ import json
 import logging
 from datetime import datetime
 
-import httpx
 from sqlalchemy.orm import Session
 
 from app.models.price_data import PriceData, PriceSource

@@ -299,7 +299,6 @@ def get_shadow_report(db: Session, employer_id: uuid.UUID) -> dict:
     total_billed = 0.0
     total_system_paid = 0.0
     total_carrier_est = 0.0
-    total_oop_eliminated = 0.0
     benefit_type_agg: dict[str, dict] = {}
     auto_count = 0
     adjudicated_count = 0
@@ -522,7 +521,7 @@ def get_shadow_confidence(db: Session, employer_id: uuid.UUID) -> dict:
         if c.processing_latency_ms is not None
     ]
     avg_latency = round(sum(latencies) / len(latencies), 1) if latencies else None
-    sub_second_count = sum(1 for l in latencies if l < 1000) if latencies else 0
+    sub_second_count = sum(1 for lat in latencies if lat < 1000) if latencies else 0
     layer_2_auto_rate = round(auto_count / n * 100, 1) if n > 0 else 0.0
     layer_2_speed_rate = round(sub_second_count / len(latencies) * 100, 1) if latencies else 0.0
 
@@ -843,7 +842,7 @@ def _tag_proof_layers(
 
     # ── Summary ──────────────────────────────────────────────────────────
     layers_verified = sum(
-        1 for l in layers.values() if l["verified"]
+        1 for layer in layers.values() if layer["verified"]
     )
 
     return {

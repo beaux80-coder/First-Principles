@@ -24,7 +24,7 @@ from datetime import datetime, UTC
 from sqlalchemy.orm import Session
 
 from app.models.employee import Employee, EmployeeStatus
-from app.models.claim import Claim, ClaimStatus
+from app.models.claim import Claim
 from app.models.care_episode import CareEpisode, EpisodeStatus
 from app.models.service import BenefitType
 
@@ -342,11 +342,11 @@ def answer_employee_question(
         if context["is_cobra"]:
             cobra = context["cobra_status"] or {}
             answer_text = (
-                f"You are currently on COBRA continuation coverage. "
-                f"Your coverage continues for all benefit types. "
-                f"COBRA premiums are based on the actual pass-through cost "
-                f"plus a 2% administration fee — significantly lower than "
-                f"traditional carrier COBRA rates."
+                "You are currently on COBRA continuation coverage. "
+                "Your coverage continues for all benefit types. "
+                "COBRA premiums are based on the actual pass-through cost "
+                "plus a 2% administration fee — significantly lower than "
+                "traditional carrier COBRA rates."
             )
             if cobra.get("continuation_end"):
                 answer_text += (
