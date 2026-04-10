@@ -91,6 +91,31 @@ class CareEpisode(Base):
     # Provider concern flag
     provider_concern_flag: Mapped[bool] = mapped_column(Boolean, default=False)
     provider_concern_note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # --- Orchestrator routing decision (Layer 2) ---
+    # Captures the full routing decision so that when a claim arrives in
+    # Layer 3 (verification), the engine can prove the care was authorized
+    # and that the billed price matches what the routing engine expected.
+    # Structure: {
+    #   "selection_id": str,             # audit ID from provider_selection
+    #   "selected_provider_id": str,
+    #   "selected_provider_name": str,
+    #   "quality_score": float,
+    #   "quality_floor_passed": bool,
+    #   "convenience_passed": bool,
+    #   "distance_miles": float|None,
+    #   "clinical_urgency": str,
+    #   "expected_price": float|None,
+    #   "price_channel": str|None,
+    #   "clinical_reason": str,
+    #   "guideline_references": [str],
+    #   "routed_at": iso8601,
+    # }
+    routing_decision: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # True when this episode was created by the proactive preventive
+    # scheduler (Layer 1) rather than by an employee-initiated request.
+    is_preventive: Mapped[bool] = mapped_column(Boolean, default=False)
+    # The USPSTF/ACIP rule that triggered a preventive episode, if any.
+    preventive_rule_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)

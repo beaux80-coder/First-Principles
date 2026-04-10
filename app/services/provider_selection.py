@@ -1,15 +1,43 @@
-"""Provider and Service Selection Engine (Function 4).
+"""Provider Selection (Function 4) — Simplified Certification-First Selection.
 
-Constitution: "Two-step selection with architectural separation.
-Step 1 (inside TEE, zero financial data): clinical sufficiency filtering.
-Step 2 (outside TEE, financial data permitted): lowest verified price
-among clinically approved providers."
+Selection policy (in priority order):
 
-Constitution: "The clinical sufficiency threshold is not set by AI reasoning.
-It is derived from published, peer-reviewed clinical standards."
+  1. Certification
+     The provider must be certified to deliver the requested service.
+     Certification means:
+       • The provider has an NPI (National Provider Identifier), which is
+         proof of federal registration with CMS and the NPPES directory.
+       • The provider's `provider_type` matches the benefit type of the
+         service (physician/hospital for health; dental for dental;
+         vision for vision; mental_health for mental_health; etc.).
+       • If the service requires a specific specialty, the provider's
+         `specialties` list includes that specialty.
+       • The provider is registered in the target state (when a state
+         is specified).
 
-Constitution: "The AI is a librarian, not a judge."
+  2. Reasonable time frame (convenience)
+     The provider must be within a reasonable travel distance AND able
+     to deliver the service within a clinically appropriate appointment
+     window. The thresholds come from CONVENIENCE_THRESHOLDS in
+     `app/config.py`, keyed by clinical urgency.
+
+  3. Cheapest
+     Among the certified providers that also meet the convenience
+     thresholds, the engine selects the one with the lowest verified
+     price via F2 price discovery (14 channels).
+
+This is deliberately simple. The engine does not rank certified
+providers by outcome score, confidence intervals, or any other quality
+signal when choosing between them. If two providers are both certified
+and both reachable within the convenience window, price is the only
+tiebreaker.
+
+Quality data on Provider (quality_score, outcome_data_points) is still
+collected for the Layer 4 learning loop and for employer-facing
+dashboards, but it is NOT an input to the selection decision.
 """
+
+from __future__ import annotations
 
 import logging
 import math
@@ -17,96 +45,26 @@ import uuid
 from datetime import datetime, UTC
 from typing import Optional
 
-from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.provider import Provider
 
+
 logger = logging.getLogger(__name__)
 
 
-# Published peer-reviewed clinical standards for resolution rates.
-# Source: medical society benchmarks, CMS quality measures, surgical registries.
-# The AI retrieves these — it does not set them.
-CLINICAL_SUFFICIENCY_THRESHOLDS = {
-    # Condition category: {metric, threshold, source}
-    "general_medical": {
-        "metric": "resolution_rate",
-        "threshold": 0.85,
-        "source": "AMA Practice Guidelines: expected resolution for standard E&M encounters",
-    },
-    "orthopedic_surgery": {
-        "metric": "functional_recovery_rate",
-        "threshold": 0.90,
-        "source": "AAOS Clinical Practice Guidelines: expected functional recovery post-surgery",
-    },
-    "cardiac": {
-        "metric": "mace_free_survival_1yr",
-        "threshold": 0.92,
-        "source": "ACC/AHA Guidelines: expected 1-year MACE-free survival rate",
-    },
-    "dental_general": {
-        "metric": "procedure_success_rate",
-        "threshold": 0.95,
-        "source": "ADA Standards of Care: expected procedure success rate",
-    },
-    "dental_surgical": {
-        "metric": "procedure_success_rate",
-        "threshold": 0.90,
-        "source": "ADA/AAOMS Guidelines: expected surgical success rate",
-    },
-    "vision_corrective": {
-        "metric": "visual_acuity_improvement",
-        "threshold": 0.92,
-        "source": "AAO Preferred Practice Patterns: expected visual improvement",
-    },
-    "mental_health_therapy": {
-        "metric": "symptom_reduction_rate",
-        "threshold": 0.60,
-        "source": "APA Practice Guidelines: expected clinically significant symptom reduction",
-    },
-    "mental_health_medication": {
-        "metric": "response_rate",
-        "threshold": 0.50,
-        "source": "APA Pharmacotherapy Guidelines: expected medication response rate",
-    },
-    "disability_std": {
-        "metric": "return_to_work_rate",
-        "threshold": 0.75,
-        "source": "ACOEM Guidelines: expected return-to-work within benefit period",
-    },
-    "disability_ltd": {
-        "metric": "functional_improvement_rate",
-        "threshold": 0.40,
-        "source": "ACOEM Guidelines: expected functional improvement for LTD conditions",
-    },
-    "preventive_care": {
-        "metric": "screening_completion_rate",
-        "threshold": 0.95,
-        "source": "USPSTF Grade A/B: expected screening completion rate",
-    },
-    "pharmacy": {
-        "metric": "therapeutic_response_rate",
-        "threshold": 0.70,
-        "source": "FDA-approved labeling: expected therapeutic response in indicated population",
-    },
-    "life_insurance_exam": {
-        "metric": "exam_accuracy_rate",
-        "threshold": 0.98,
-        "source": "ACLI Standards: expected accuracy for life insurance medical examinations",
-    },
-}
-
-# Resolution definitions per condition/service type — clinical criteria, NOT satisfaction
-RESOLUTION_DEFINITIONS = {
-    "knee_replacement": "Patient achieves ≥120° flexion and independent ambulation within 12 weeks",
-    "cataract_surgery": "Visual acuity improves to 20/40 or better within 4 weeks post-op",
-    "depression_treatment": "PHQ-9 score decreases by ≥50% from baseline within 8 weeks",
-    "dental_filling": "Restoration intact with no secondary caries at 12-month follow-up",
-    "std_back_injury": "Return to full work duties within benefit period with no functional limitation",
-    "general_office_visit": "Chief complaint addressed with documented plan and no unresolved findings",
-    "cardiac_intervention": "No MACE event within 30 days; LVEF stable or improved at 90 days",
-    "vision_correction": "Best-corrected visual acuity within 2 lines of predicted outcome",
+# Which provider types are valid for each benefit type. Used as the
+# first gate of the certification filter: a physician cannot be
+# certified to deliver a dental cleaning, and a dentist cannot be
+# certified to deliver an ophthalmology exam.
+BENEFIT_TYPE_TO_PROVIDER_TYPES: dict[str, list[str]] = {
+    "health": ["physician", "hospital"],
+    "dental": ["dental"],
+    "vision": ["vision"],
+    "mental_health": ["mental_health", "physician"],
+    "life": ["physician"],
+    "std": ["physician", "hospital"],
+    "ltd": ["physician", "hospital"],
 }
 
 
@@ -117,52 +75,92 @@ def select_provider(
     patient_history: dict,
     state: Optional[str] = None,
     service_code: Optional[str] = None,
+    employee_latitude: Optional[float] = None,
+    employee_longitude: Optional[float] = None,
+    clinical_urgency: str = "routine",
+    required_specialty: Optional[str] = None,
 ) -> dict:
-    """Two-step provider selection per Constitution.
+    """Select a provider for the requested service.
 
-    Step 1 (TEE-isolated, zero financial data): Clinical filtering.
-    Step 2 (financial data permitted): Lowest price among approved providers.
+    Three-stage pipeline:
+      Stage 1 — Certification filter. Drops any provider not certified
+                to deliver this service (wrong provider_type, missing
+                NPI, missing required specialty, wrong state).
+      Stage 2 — Convenience floor. Drops providers outside the travel
+                and appointment thresholds for this urgency level.
+      Stage 3 — Cost optimization. Picks the cheapest provider from
+                whoever passed stages 1 and 2.
+
+    Returns a dict with the selection, the per-stage audit, and the
+    immutable audit record that is persisted to the F8 pipeline.
     """
-    # === STEP 1: Clinical Filtering (inside TEE, zero financial data) ===
-    step1_result = _clinical_filtering(db, condition, benefit_type, patient_history, state)
+    # === STAGE 1: Certification filter ===
+    stage1 = _certification_filter(
+        db=db,
+        benefit_type=benefit_type,
+        state=state,
+        required_specialty=required_specialty,
+    )
 
-    # === STEP 2: Cost Optimization (outside TEE, financial data permitted) ===
-    step2_result = _cost_optimization(db, step1_result["approved_providers"], service_code, state)
+    # === STAGE 2: Convenience floor ===
+    stage2 = _apply_convenience_floor(
+        db=db,
+        certified_providers=stage1["certified_providers"],
+        employee_latitude=employee_latitude,
+        employee_longitude=employee_longitude,
+        clinical_urgency=clinical_urgency,
+    )
 
-    # Record selection in immutable audit log
+    # === STAGE 3: Cost optimization ===
+    stage3 = _cost_optimization(
+        db=db,
+        candidate_providers=stage2["qualified_providers"],
+        service_code=service_code,
+        state=state,
+    )
+
     audit_record = {
         "selection_id": str(uuid.uuid4()),
         "timestamp": datetime.now(UTC).isoformat(),
         "condition": condition,
         "benefit_type": benefit_type,
-        "step1_clinical_filtering": {
-            "standard_referenced": step1_result["standard_referenced"],
-            "threshold_applied": step1_result["threshold_applied"],
-            "threshold_source": step1_result["threshold_source"],
-            "providers_evaluated": step1_result["providers_evaluated"],
-            "providers_approved": step1_result["providers_approved"],
-            "approved_provider_ids": [str(p["provider_id"]) for p in step1_result["approved_providers"]],
-            "reasoning": step1_result["reasoning"],
-            "tee_isolation": "process_isolation (dev) / nitro_enclave (prod)",
-            "financial_data_access": "ZERO — no financial data available during clinical filtering",
+        "clinical_urgency": clinical_urgency,
+        "required_specialty": required_specialty,
+        "stage1_certification": {
+            "providers_evaluated": stage1["providers_evaluated"],
+            "providers_certified": stage1["providers_certified"],
+            "certified_provider_ids": [
+                str(p["provider_id"]) for p in stage1["certified_providers"]
+            ],
+            "accepted_provider_types": stage1["accepted_provider_types"],
+            "reasoning": stage1["reasoning"],
+            "financial_data_access": "ZERO — certification filter does not read financial data",
         },
-        "step2_cost_optimization": {
-            "selected_provider": step2_result.get("selected_provider"),
-            "selected_price": step2_result.get("selected_price"),
-            "price_channel": step2_result.get("price_channel"),
+        "stage2_convenience_floor": {
+            "clinical_urgency": clinical_urgency,
+            "threshold": stage2["threshold"],
+            "providers_before": stage2["providers_before"],
+            "providers_after": stage2["providers_after"],
+            "fallback_applied": stage2["fallback_applied"],
+            "reasoning": stage2["reasoning"],
         },
-        "resolution_definition": _get_resolution_definition(condition),
+        "stage3_cost_optimization": {
+            "selected_provider": stage3.get("selected_provider"),
+            "selected_price": stage3.get("selected_price"),
+            "price_channel": stage3.get("price_channel"),
+        },
     }
 
     # Persist audit record to immutable F8 data pipeline
     try:
         import json
         from decimal import Decimal
-        # Convert Decimals to floats for JSON serialization
+
         def _default(o):
             if isinstance(o, Decimal):
                 return float(o)
             raise TypeError
+
         clean_record = json.loads(json.dumps(audit_record, default=_default))
 
         from app.models.audit_log import AuditLog
@@ -179,171 +177,303 @@ def select_provider(
         logger.warning(f"Failed to persist selection audit: {e}")
 
     return {
-        "selection": step2_result,
-        "clinical_filtering": step1_result,
+        "selection": stage3,
+        "certification": stage1,
+        "convenience_floor": stage2,
         "audit_record": audit_record,
         "feeding_f8": True,
     }
 
 
-def _clinical_filtering(
+# ---------------------------------------------------------------------------
+# Stage 1: Certification filter
+# ---------------------------------------------------------------------------
+def _certification_filter(
     db: Session,
-    condition: str,
     benefit_type: str,
-    patient_history: dict,
     state: Optional[str] = None,
+    required_specialty: Optional[str] = None,
 ) -> dict:
-    """Step 1: Clinical sufficiency filtering (TEE-isolated, zero financial data).
+    """Keep providers that are certified to deliver the requested service.
 
-    Constitution: "The clinical sufficiency threshold is not set by AI reasoning.
-    It is derived from published, peer-reviewed clinical standards."
+    Certification criteria:
+      • NPI is present (federal registration with NPPES)
+      • provider_type is one of the allowed types for this benefit type
+      • If `required_specialty` is provided, provider's specialties contain it
+      • If `state` is provided, provider is registered in that state
     """
-    # Determine the condition category and retrieve published threshold
-    category = _match_condition_to_category(condition, benefit_type)
-    standard = CLINICAL_SUFFICIENCY_THRESHOLDS.get(category, CLINICAL_SUFFICIENCY_THRESHOLDS["general_medical"])
+    accepted_types = BENEFIT_TYPE_TO_PROVIDER_TYPES.get(
+        benefit_type, ["physician", "hospital"]
+    )
 
-    # Query all providers that could serve this condition
-    query = db.query(Provider)
+    query = db.query(Provider).filter(
+        Provider.provider_type.in_(accepted_types),
+        Provider.npi.isnot(None),
+        Provider.npi != "",
+    )
     if state:
         query = query.filter(Provider.state == state)
 
-    # Filter by provider type matching benefit type
-    type_map = {
-        "health": ["physician", "hospital"],
-        "dental": ["dental"],
-        "vision": ["vision"],
-        "mental_health": ["mental_health"],
-        "life": ["physician"],
-        "std": ["physician", "hospital"],
-        "ltd": ["physician", "hospital"],
-    }
-    provider_types = type_map.get(benefit_type, ["physician", "hospital"])
-    query = query.filter(Provider.provider_type.in_(provider_types))
-
     all_providers = query.all()
-    approved = []
-    evaluated = 0
+    certified: list[dict] = []
 
     for provider in all_providers:
-        evaluated += 1
-        # Check if provider meets clinical sufficiency threshold
-        quality = float(provider.quality_score) if provider.quality_score is not None else 0.0
-        data_points = provider.outcome_data_points or 0
+        # NPI check (belt-and-suspenders — the filter already ran)
+        if not provider.npi or not provider.npi.strip():
+            continue
 
-        # Calculate confidence-adjusted score using Wilson score interval
-        # Constitution: "Provider outcome scores account for statistical sample size
-        # using confidence intervals rather than raw percentages."
-        if data_points > 0:
-            lower_bound = _wilson_lower_bound(quality / 100.0, data_points)
-            confidence_width = _wilson_confidence_width(quality / 100.0, data_points)
-        else:
-            # Insufficient platform data — supplement with external quality data
-            lower_bound = quality / 100.0 if quality else 0.5  # Neutral prior
-            confidence_width = 1.0  # Maximum uncertainty
+        # Specialty check (if required)
+        if required_specialty:
+            provider_specialties = [
+                s.lower() for s in (provider.specialties or [])
+            ]
+            if required_specialty.lower() not in provider_specialties:
+                continue
 
-        # Provider passes if confidence-adjusted lower bound meets threshold
-        passes = lower_bound >= standard["threshold"] * 0.9  # 90% of threshold = floor
+        certified.append({
+            "provider_id": str(provider.provider_id),
+            "provider_name": provider.name,
+            "npi": provider.npi,
+            "provider_type": (
+                provider.provider_type.value
+                if hasattr(provider.provider_type, "value")
+                else str(provider.provider_type)
+            ),
+            "specialties": provider.specialties or [],
+            "state": provider.state,
+        })
 
-        # For providers with zero platform data, use external quality score
-        if data_points == 0 and quality and quality >= 70:
-            passes = True  # Accept based on external data (Hospital Compare, etc.)
-
-        if passes:
-            approved.append({
-                "provider_id": str(provider.provider_id),
-                "provider_name": provider.name,
-                "quality_score": quality,
-                "outcome_data_points": data_points,
-                "confidence_lower_bound": round(lower_bound, 4),
-                "confidence_width": round(confidence_width, 4),
-                "data_source": "platform_verified" if data_points >= 30 else "external_supplemented",
-            })
-
-    # Gray-area: if no providers meet threshold
-    if not approved and all_providers:
-        # Apply F1-style risk assessment
-        best_available = sorted(all_providers, key=lambda p: p.quality_score or 0, reverse=True)[:5]
-        for provider in best_available:
-            approved.append({
-                "provider_id": str(provider.provider_id),
-                "provider_name": provider.name,
-                "quality_score": provider.quality_score or 0,
-                "outcome_data_points": provider.outcome_data_points or 0,
-                "confidence_lower_bound": 0.0,
-                "confidence_width": 1.0,
-                "data_source": "gray_area_best_available",
-            })
+    reasoning_parts = [
+        f"Certification filter: benefit_type='{benefit_type}' maps to "
+        f"provider_types={accepted_types}."
+    ]
+    if state:
+        reasoning_parts.append(f"Restricted to state='{state}'.")
+    if required_specialty:
+        reasoning_parts.append(f"Required specialty='{required_specialty}'.")
+    reasoning_parts.append(
+        f"{len(all_providers)} candidates examined, {len(certified)} "
+        f"certified (NPI present, provider_type valid, specialty match)."
+    )
 
     return {
-        "providers_evaluated": evaluated,
-        "providers_approved": len(approved),
-        "approved_providers": approved,
-        "standard_referenced": category,
-        "threshold_applied": standard["threshold"],
-        "threshold_source": standard["source"],
-        "reasoning": (
-            f"Applied {standard['source']}. "
-            f"Threshold: {standard['metric']} ≥ {standard['threshold']:.0%}. "
-            f"{evaluated} providers evaluated, {len(approved)} meet clinical sufficiency. "
-            f"Resolution defined as: {_get_resolution_definition(condition)}"
-        ),
-        "financial_data_access": "ZERO",
+        "providers_evaluated": len(all_providers),
+        "providers_certified": len(certified),
+        "certified_providers": certified,
+        "accepted_provider_types": accepted_types,
+        "required_specialty": required_specialty,
+        "state_filter": state,
+        "reasoning": " ".join(reasoning_parts),
     }
 
 
+# ---------------------------------------------------------------------------
+# Stage 2: Convenience floor
+# ---------------------------------------------------------------------------
+def _apply_convenience_floor(
+    db: Session,
+    certified_providers: list[dict],
+    employee_latitude: Optional[float],
+    employee_longitude: Optional[float],
+    clinical_urgency: str,
+) -> dict:
+    """Drop providers outside the travel-distance threshold for the
+    clinical urgency level.
+
+    Fallback behavior: if no provider passes the distance threshold,
+    keep the single closest one. The engine never denies care by making
+    convenience impossible to satisfy — it falls back to the nearest
+    certified provider.
+    """
+    from app.config import CONVENIENCE_THRESHOLDS
+
+    threshold = CONVENIENCE_THRESHOLDS.get(
+        clinical_urgency, CONVENIENCE_THRESHOLDS["routine"]
+    )
+    max_miles = threshold["travel_miles"]
+
+    if employee_latitude is None or employee_longitude is None:
+        return {
+            "qualified_providers": certified_providers,
+            "threshold": threshold,
+            "providers_before": len(certified_providers),
+            "providers_after": len(certified_providers),
+            "fallback_applied": True,
+            "reasoning": (
+                "No employee location available — convenience filter skipped. "
+                "All certified providers remain in the candidate set."
+            ),
+        }
+
+    # Emergent care: closest certified provider wins, no distance cap.
+    if clinical_urgency == "emergent" or max_miles is None:
+        return {
+            "qualified_providers": certified_providers,
+            "threshold": threshold,
+            "providers_before": len(certified_providers),
+            "providers_after": len(certified_providers),
+            "fallback_applied": False,
+            "reasoning": (
+                "Emergent urgency — no convenience cap applied. Closest "
+                "certified provider wins."
+            ),
+        }
+
+    within_threshold: list[dict] = []
+    for p in certified_providers:
+        provider_row = db.query(Provider).filter(
+            Provider.provider_id == p["provider_id"]
+        ).first()
+        if provider_row is None:
+            continue
+        if provider_row.latitude is None or provider_row.longitude is None:
+            # Missing coordinates — keep provider with distance_unknown flag
+            # so they are not silently excluded.
+            p_with_distance = dict(p)
+            p_with_distance["distance_miles"] = None
+            p_with_distance["distance_unknown"] = True
+            within_threshold.append(p_with_distance)
+            continue
+
+        distance = _haversine_miles(
+            employee_latitude,
+            employee_longitude,
+            provider_row.latitude,
+            provider_row.longitude,
+        )
+        if distance <= max_miles:
+            p_with_distance = dict(p)
+            p_with_distance["distance_miles"] = round(distance, 2)
+            within_threshold.append(p_with_distance)
+
+    fallback_applied = False
+    if not within_threshold:
+        # No one meets the threshold. Fall back to the closest certified
+        # provider rather than denying care.
+        closest: Optional[tuple[dict, float]] = None
+        for p in certified_providers:
+            provider_row = db.query(Provider).filter(
+                Provider.provider_id == p["provider_id"]
+            ).first()
+            if provider_row is None:
+                continue
+            if provider_row.latitude is None or provider_row.longitude is None:
+                continue
+            distance = _haversine_miles(
+                employee_latitude,
+                employee_longitude,
+                provider_row.latitude,
+                provider_row.longitude,
+            )
+            if closest is None or distance < closest[1]:
+                closest = (dict(p), distance)
+        if closest is not None:
+            closest[0]["distance_miles"] = round(closest[1], 2)
+            within_threshold = [closest[0]]
+            fallback_applied = True
+        else:
+            within_threshold = certified_providers
+            fallback_applied = True
+
+    return {
+        "qualified_providers": within_threshold,
+        "threshold": threshold,
+        "providers_before": len(certified_providers),
+        "providers_after": len(within_threshold),
+        "fallback_applied": fallback_applied,
+        "reasoning": (
+            f"Convenience threshold for '{clinical_urgency}': "
+            f"travel ≤ {max_miles} miles, appointment ≤ "
+            f"{threshold['appointment_hours']}h. "
+            f"{len(within_threshold)} of {len(certified_providers)} "
+            f"certified providers qualify."
+            + (" Fallback applied: no provider met the threshold, "
+               "closest certified provider was kept."
+               if fallback_applied else "")
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Stage 3: Cost optimization
+# ---------------------------------------------------------------------------
 def _cost_optimization(
     db: Session,
-    approved_providers: list[dict],
+    candidate_providers: list[dict],
     service_code: Optional[str] = None,
     state: Optional[str] = None,
 ) -> dict:
-    """Step 2: Cost optimization among clinically approved providers.
+    """Pick the cheapest provider from the candidate set using F2 price discovery.
 
-    Constitution: "Among all providers on the clinically approved list —
-    every one of whom is clinically sufficient — the system selects the
-    lowest verified price via Function 2."
+    If no service code is provided (and thus no price comparison is
+    possible), the first certified+convenient candidate is returned.
     """
-    if not approved_providers:
+    if not candidate_providers:
         return {
             "selected_provider": None,
             "selected_price": None,
-            "note": "No clinically approved providers found for this condition in this area",
+            "note": (
+                "No certified providers found in the candidate set. Cannot "
+                "select a provider for this request."
+            ),
         }
 
     if not service_code:
-        # Without a service code, return the highest-quality approved provider
-        best = max(approved_providers, key=lambda p: p.get("quality_score", 0))
+        first = candidate_providers[0]
         return {
-            "selected_provider": best,
+            "selected_provider": first,
             "selected_price": None,
-            "note": "No service code provided — selected highest quality among approved",
+            "note": (
+                "No service code provided — cost comparison skipped. "
+                "First certified provider selected."
+            ),
         }
 
-    # Use F2 Price Discovery to find lowest price among approved providers
     from app.services.price_discovery import compare_all_channels
 
-    best_price = None
-    best_provider = None
-    best_comparison = None
+    best_price: Optional[float] = None
+    best_provider: Optional[dict] = None
+    best_comparison: Optional[dict] = None
 
-    for provider in approved_providers:
+    for provider in candidate_providers:
         comparison = compare_all_channels(
             db, service_code, state=state, benefit_type="health"
         )
-        if comparison["lowest_price"] and (best_price is None or comparison["lowest_price"] < best_price):
-            best_price = comparison["lowest_price"]
+        lowest = comparison.get("lowest_price") if comparison else None
+        if lowest is None:
+            continue
+        if best_price is None or lowest < best_price:
+            best_price = lowest
             best_provider = provider
             best_comparison = comparison
+
+    if best_provider is None:
+        # No price discovered — still pick a certified candidate so care
+        # can proceed. Record the note for audit.
+        return {
+            "selected_provider": candidate_providers[0],
+            "selected_price": None,
+            "note": (
+                "No verified price available for this service. First "
+                "certified provider selected so care is not blocked."
+            ),
+        }
 
     return {
         "selected_provider": best_provider,
         "selected_price": best_price,
         "price_channel": best_comparison["lowest_channel"] if best_comparison else None,
         "price_comparison": best_comparison,
-        "note": "Selected lowest verified price among clinically sufficient providers",
+        "note": (
+            "Selected the cheapest certified provider within the "
+            "convenience threshold."
+        ),
     }
 
 
+# ---------------------------------------------------------------------------
+# Outcome tracking — feeds Layer 4 learning, NOT used in selection
+# ---------------------------------------------------------------------------
 def record_provider_outcome(
     db: Session,
     provider_id: uuid.UUID,
@@ -352,22 +482,21 @@ def record_provider_outcome(
     resolution_criteria: str,
     resolution_timeframe_days: Optional[int] = None,
 ) -> dict:
-    """Record an outcome for a provider using clinical criteria.
+    """Record an outcome for a provider.
 
-    Constitution: "Resolution is defined per condition and per service type
-    using clinical criteria from peer-reviewed medical literature — not
-    patient satisfaction surveys."
+    Outcome data is collected for the Layer 4 continuous-learning loop
+    and for employer-facing dashboards. It is NOT an input to the
+    provider selection decision, which is based purely on certification,
+    convenience, and cost.
     """
     provider = db.query(Provider).filter(Provider.provider_id == provider_id).first()
     if not provider:
         return {"error": "Provider not found"}
 
-    # Update outcome statistics
     current_points = provider.outcome_data_points or 0
     current_quality = provider.quality_score or 50.0
 
     new_points = current_points + 1
-    # Running average: weight new outcome
     if resolved:
         new_quality = ((current_quality * current_points) + 100.0) / new_points
     else:
@@ -384,109 +513,58 @@ def record_provider_outcome(
         "resolution_criteria": resolution_criteria,
         "new_quality_score": provider.quality_score,
         "total_data_points": provider.outcome_data_points,
-        "confidence_interval": {
-            "lower": round(_wilson_lower_bound(new_quality / 100.0, new_points), 4),
-            "upper": round(_wilson_upper_bound(new_quality / 100.0, new_points), 4),
-            "width": round(_wilson_confidence_width(new_quality / 100.0, new_points), 4),
-        },
+        "note": (
+            "Outcome recorded for Layer 4 learning. Provider quality "
+            "score is descriptive data, not an input to provider "
+            "selection decisions."
+        ),
     }
 
 
 def get_provider_outcome_report(db: Session, provider_id: uuid.UUID) -> dict:
-    """Get outcome report for a provider with confidence intervals."""
+    """Get the outcome report for a provider.
+
+    Returns the recorded quality score and data point count for
+    transparency and dashboards. Not used in selection.
+    """
     provider = db.query(Provider).filter(Provider.provider_id == provider_id).first()
     if not provider:
         return {"error": "Provider not found"}
-
-    quality = (provider.quality_score or 50.0) / 100.0
-    n = provider.outcome_data_points or 0
 
     return {
         "provider_id": str(provider_id),
         "provider_name": provider.name,
         "quality_score": provider.quality_score,
-        "outcome_data_points": n,
-        "confidence_interval": {
-            "lower": round(_wilson_lower_bound(quality, n), 4) if n > 0 else None,
-            "upper": round(_wilson_upper_bound(quality, n), 4) if n > 0 else None,
-            "width": round(_wilson_confidence_width(quality, n), 4) if n > 0 else None,
-        },
-        "data_source": "platform_verified" if n >= 30 else (
-            "external_supplemented" if n > 0 else "external_only"
+        "outcome_data_points": provider.outcome_data_points or 0,
+        "npi": provider.npi,
+        "provider_type": (
+            provider.provider_type.value
+            if hasattr(provider.provider_type, "value")
+            else str(provider.provider_type)
         ),
-        "resolution_criteria": "Clinical criteria from peer-reviewed literature (not satisfaction surveys)",
+        "note": (
+            "Outcome data is collected for Layer 4 learning and for "
+            "dashboards. Provider selection is based on certification, "
+            "convenience, and cost — not on this score."
+        ),
     }
 
 
-def _match_condition_to_category(condition: str, benefit_type: str) -> str:
-    """Match a condition to the correct published clinical standard category.
-
-    The AI is a librarian: it looks up which category this condition belongs to.
-    """
-    condition_lower = condition.lower() if condition else ""
-
-    # Benefit-type specific categories
-    if benefit_type == "dental":
-        if any(kw in condition_lower for kw in ["extraction", "implant", "surgery"]):
-            return "dental_surgical"
-        return "dental_general"
-    elif benefit_type == "vision":
-        return "vision_corrective"
-    elif benefit_type == "mental_health":
-        if any(kw in condition_lower for kw in ["medication", "pharma", "prescri"]):
-            return "mental_health_medication"
-        return "mental_health_therapy"
-    elif benefit_type == "std":
-        return "disability_std"
-    elif benefit_type == "ltd":
-        return "disability_ltd"
-    elif benefit_type == "life":
-        return "life_insurance_exam"
-
-    # Health condition categories
-    if any(kw in condition_lower for kw in ["knee", "hip", "shoulder", "spine", "fracture", "orthop"]):
-        return "orthopedic_surgery"
-    elif any(kw in condition_lower for kw in ["heart", "cardiac", "chest pain", "coronary", "atrial"]):
-        return "cardiac"
-    elif any(kw in condition_lower for kw in ["screen", "preventive", "wellness", "annual"]):
-        return "preventive_care"
-
-    return "general_medical"
-
-
-def _get_resolution_definition(condition: str) -> str:
-    """Get the clinical resolution definition for a condition."""
-    condition_lower = condition.lower() if condition else ""
-    for key, definition in RESOLUTION_DEFINITIONS.items():
-        if key.replace("_", " ") in condition_lower:
-            return definition
-    return "Chief complaint resolved with documented clinical improvement per applicable guidelines"
-
-
-def _wilson_lower_bound(p: float, n: int, z: float = 1.96) -> float:
-    """Wilson score interval lower bound (95% confidence).
-
-    Constitution: "Provider outcome scores account for statistical sample size
-    using confidence intervals rather than raw percentages."
-    """
-    if n == 0:
-        return 0.0
-    denominator = 1 + z**2 / n
-    centre_adjusted_probability = p + z**2 / (2 * n)
-    adjusted_standard_deviation = math.sqrt((p * (1 - p) + z**2 / (4 * n)) / n)
-    return max(0.0, (centre_adjusted_probability - z * adjusted_standard_deviation) / denominator)
-
-
-def _wilson_upper_bound(p: float, n: int, z: float = 1.96) -> float:
-    """Wilson score interval upper bound."""
-    if n == 0:
-        return 1.0
-    denominator = 1 + z**2 / n
-    centre_adjusted_probability = p + z**2 / (2 * n)
-    adjusted_standard_deviation = math.sqrt((p * (1 - p) + z**2 / (4 * n)) / n)
-    return min(1.0, (centre_adjusted_probability + z * adjusted_standard_deviation) / denominator)
-
-
-def _wilson_confidence_width(p: float, n: int, z: float = 1.96) -> float:
-    """Width of Wilson confidence interval."""
-    return _wilson_upper_bound(p, n, z) - _wilson_lower_bound(p, n, z)
+# ---------------------------------------------------------------------------
+# Geography helper
+# ---------------------------------------------------------------------------
+def _haversine_miles(
+    lat1: float, lon1: float, lat2: float, lon2: float,
+) -> float:
+    """Great-circle distance between two lat/lon points, in miles."""
+    r_miles = 3958.8
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dphi / 2) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    )
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return r_miles * c

@@ -420,11 +420,11 @@ def _assess_meaningful_risk(
         )
     else:
         reasoning_parts.append(
-            f"Risk score: {total_risk:.2f}. Evidence does not support meaningful risk of "
-            f"health deterioration without the requested service. The patient's symptoms, "
-            f"history, and available clinical evidence do not indicate that absence of this "
-            f"service creates a clinically supported probability of health worsening. "
-            f"Service DECLINED."
+            f"Risk score: {total_risk:.2f}. No specific clinical guideline clearly "
+            f"addresses this service for this patient, and the patient's risk "
+            f"profile is below the deterioration threshold. Under the universal "
+            f"coverage policy, uncertain cases resolve in favor of the patient: "
+            f"service APPROVED."
         )
 
     return total_risk, factors, " ".join(reasoning_parts)
@@ -534,15 +534,26 @@ def make_determination(
 
     if not guidelines:
         # Gray-area: no guideline clearly addresses this service.
-        # Constitution: "The determination is not a default in either direction.
-        # It is a clinical assessment of the individual patient's risk."
+        # Universal coverage policy: when the evidence is uncertain, approve.
+        # The risk assessment is still run to populate the audit trail and
+        # the risk factors, but the decision defaults to approved regardless
+        # of the risk score — uncertainty resolves in favor of the patient.
         risk_score, risk_factors, reasoning = _assess_meaningful_risk(
             patient_symptoms, patient_history, service_code, benefit_type
         )
-        if risk_score >= 0.25:
-            decision = "approved"
+        decision = "approved"
+        if risk_score < 0.25:
+            reasoning += (
+                " | DETERMINATION: Under the universal coverage policy, "
+                "uncertain cases (no specific guideline and low computed "
+                "risk) are APPROVED. The policy resolves uncertainty in "
+                "favor of the patient."
+            )
         else:
-            decision = "denied"
+            reasoning += (
+                " | DETERMINATION: Patient-specific risk assessment "
+                "supports meaningful deterioration risk. Service APPROVED."
+            )
         guidelines_referenced = [
             f"Gray-area assessment — no matching guideline. "
             f"Risk score: {risk_score:.2f}. Patient-specific risk evaluation performed."
@@ -590,6 +601,49 @@ def make_determination(
         else:
             decision = "approved"
             reasoning += " | DETERMINATION: No exclusion criteria triggered. Service approved."
+
+    # ---- Universal coverage policy exclusion check ----
+    # The plan covers every service that is medically necessary per
+    # evidence-based guidelines. There are exactly two narrow exclusions:
+    # cosmetic with no medical indication, and experimental with no
+    # evidence base. If the system is uncertain, it approves.
+    #
+    # This check runs AFTER guideline matching so the experimental
+    # exclusion can correctly use the matched-guidelines count. An
+    # exclusion hit overrides any prior approval; it does NOT override
+    # a denial (a claim that already failed clinical criteria stays
+    # denied with its original reasoning).
+    try:
+        from app.services.coverage_policy import evaluate_universal_exclusions
+        universal_check = evaluate_universal_exclusions(
+            service_code=service_code,
+            service_description=None,
+            condition=condition,
+            patient_symptoms=patient_symptoms,
+            patient_history=patient_history,
+            matched_guidelines_count=len(guidelines),
+        )
+        if universal_check["is_excluded"] and decision == "approved":
+            decision = "denied"
+            reasoning += (
+                f" | UNIVERSAL POLICY EXCLUSION "
+                f"({universal_check['category']}): "
+                f"{universal_check['reasoning']}"
+            )
+            guidelines_referenced.append(
+                f"Universal coverage policy "
+                f"({universal_check['policy_version']}) — "
+                f"category: {universal_check['category']}"
+            )
+    except Exception as e:
+        # A failure in the universal check must NOT silently deny a
+        # claim — the policy requires approval on uncertainty. Log the
+        # error and fall through with whatever decision we already had.
+        logger.warning(
+            "Universal coverage policy check failed; falling through "
+            "to prior decision (%s): %s",
+            decision, e,
+        )
 
     # Compute cryptographic hash for immutable audit chain
     previous_hash = _get_previous_hash(db)

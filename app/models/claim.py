@@ -59,8 +59,32 @@ class Claim(Base):
     amount_paid: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
     amount_employee_oop: Mapped[float] = mapped_column(Numeric(12, 2), default=0.00)
     submitted_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    # Date the service was actually rendered. Eligibility is checked as of
+    # this date (not submission date) because an employee might submit a
+    # claim weeks after the visit. If absent, falls back to submitted_at.
+    date_of_service: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     adjudicated_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     paid_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    # --- Orchestrator routing linkage (Layer 2 → Layer 3) ---
+    # Links a claim back to the CareEpisode that routed it. If set, the
+    # claim is treated as "routed" in verification and auto-paid when the
+    # billed amount matches the routing's expected price within tolerance.
+    care_episode_id: Mapped[uuid.UUID | None] = mapped_column(
+        GUID(), ForeignKey("care_episodes.episode_id"), nullable=True, index=True
+    )
+    # Expected price captured at routing time. When the claim arrives,
+    # verification compares billed amount against this figure with a
+    # PRICE_TOLERANCE_PCT band — drift outside the band triggers fraud
+    # review instead of automatic payment.
+    routing_expected_price: Mapped[float | None] = mapped_column(Numeric(12, 2), nullable=True)
+    # Was this claim emergent (prudent layperson standard)? Emergent claims
+    # bypass the "unrouted = deny" rule and are always paid subject to
+    # fraud/duplicate checks.
+    is_emergent: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    # Signals that triggered the emergent classification (POS codes, ICD
+    # codes, self-attestation) — for audit.
+    emergent_signals: Mapped[dict | None] = mapped_column(JSON, nullable=True)
 
     # --- F5 Adjudication fields ---
     # Reasoning trace for the adjudication decision

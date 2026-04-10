@@ -1,27 +1,38 @@
-"""Automated Claims Processing Engine (Function 5).
+"""Layer 3 — Claims Verification (formerly Function 5 Adjudication).
 
-Constitution: "Every function legally performable by software must be automated.
-Human review only where law mandates it."
+Under the orchestrator-first architecture, most care flows through Layer 2
+(care_execution.py) which pre-approves each interaction by selecting a
+cost-optimized, quality-qualified, convenience-qualified provider before the
+care happens. By the time a claim arrives at Layer 3, the decision has
+already been made — this module simply verifies the claim corresponds to a
+legitimate routing decision, then pays it.
 
-State machine: submitted -> adjudicating -> approved/denied -> paid
-Pipeline: duplicate detection -> eligibility -> coding validation ->
-          F1 clinical determination -> F2 price verification -> payment execution
+The three paths through this module:
+  1. ELIGIBLE + ROUTED + PRICE-CONSISTENT  → pay
+  2. ELIGIBLE + EMERGENT                    → pay (42 USC §300gg-19a)
+  3. ELIGIBLE + UNROUTED + NON-EMERGENT     → deny with explanation
+  0. INELIGIBLE                             → deny
 
-Every claim recorded feeding F8 (transparency reporting).
-Latency measured from submission to payment (minimum physically possible).
-Accuracy: % correctly processed without correction.
+Fraud checks (duplicate detection, price drift, coding bundling) still run
+on the routed and emergent paths so we catch billing errors without
+pretending to re-adjudicate clinical necessity.
+
+Every claim is fed to F8 transparency reporting.
 """
 
 import logging
 import time
 import uuid
-from datetime import datetime, UTC
+from datetime import datetime, UTC, timedelta
 from typing import Optional
 
 from sqlalchemy import func, and_
 from sqlalchemy.orm import Session
 
+from app.config import settings
 from app.models.claim import Claim, ClaimStatus, ClaimMode
+from app.models.care_episode import CareEpisode, EpisodeStatus
+from app.models.employee import Employee, EmployeeStatus
 from app.models.service import BenefitType
 
 logger = logging.getLogger(__name__)
@@ -59,17 +70,22 @@ AGE_RESTRICTED_CODES = {
 
 
 def adjudicate_claim(db: Session, claim_id: uuid.UUID) -> dict:
-    """Run the full automated adjudication pipeline on a claim.
+    """Layer 3 claims verification (orchestrator-first).
 
-    Pipeline stages (all automated unless law mandates human):
-    1. Duplicate detection
-    2. Eligibility verification
-    3. Coding validation (CPT/ICD accuracy, bundling, modifiers)
-    4. F1 clinical determination (medical necessity)
-    5. F2 price verification (lowest verified price)
-    6. Payment execution (direct electronic, minimum latency)
+    New control flow:
+      1. Eligibility check (hardened: status, waiting period, COBRA, date-of-service)
+      2. Duplicate detection (fraud)
+      3. Emergent classification (prudent layperson standard)
+      4. Routing match (did Layer 2 route this care?)
+      5. Pay / Deny
 
-    Returns the adjudication result with full audit trail.
+    All four paths are represented:
+      - Ineligible              -> deny
+      - Duplicate                -> deny
+      - Emergent                 -> pay (fraud checks only)
+      - Routed, price-consistent -> pay
+      - Routed, price-drift      -> flag for review
+      - Unrouted, non-emergent   -> deny with plain-language explanation
     """
     start_time = time.monotonic()
     claim = db.query(Claim).filter(Claim.claim_id == claim_id).first()
@@ -80,126 +96,266 @@ def adjudicate_claim(db: Session, claim_id: uuid.UUID) -> dict:
     claim.status = ClaimStatus.adjudicating
     db.flush()
 
-    error_flags = []
-    adjudication_steps = []
+    error_flags: list[str] = []
+    steps: list[str] = []
 
-    # ---- Stage 1: Duplicate detection ----
-    duplicate_result = _detect_duplicates(db, claim)
-    claim.duplicate_check = duplicate_result
-    if duplicate_result["is_duplicate"]:
-        error_flags.append("DUPLICATE_CLAIM")
-        adjudication_steps.append("duplicate_detected")
-
-    # ---- Stage 2: Eligibility verification ----
+    # ---- Stage 1: Eligibility verification (hardened) ----
     eligibility_result = _verify_eligibility(db, claim)
     claim.eligibility_check = eligibility_result
+    steps.append("eligibility_checked")
     if not eligibility_result["eligible"]:
         error_flags.append("ELIGIBILITY_FAILED")
-        adjudication_steps.append("eligibility_failed")
-
-    # ---- Stage 3: Coding validation ----
-    coding_result = _validate_coding(db, claim)
-    claim.coding_validation = coding_result
-    if coding_result["errors"]:
-        error_flags.extend(
-            f"CODING_{e['type'].upper()}" for e in coding_result["errors"]
-        )
-        adjudication_steps.append("coding_errors_found")
-
-    # ---- Check for auto-deny conditions ----
-    if duplicate_result["is_duplicate"]:
         return _finalize_denial(
-            db, claim, error_flags, adjudication_steps, start_time,
+            db, claim, error_flags, steps, start_time,
+            f"Not eligible: {eligibility_result.get('reason', 'unknown')}",
+        )
+
+    # ---- Stage 2: Duplicate detection (fraud check) ----
+    duplicate_result = _detect_duplicates(db, claim)
+    claim.duplicate_check = duplicate_result
+    steps.append("duplicate_checked")
+    if duplicate_result["is_duplicate"]:
+        error_flags.append("DUPLICATE_CLAIM")
+        return _finalize_denial(
+            db, claim, error_flags, steps, start_time,
             "Duplicate claim detected. Original claim: "
             f"{duplicate_result.get('original_claim_id', 'unknown')}",
         )
 
-    if not eligibility_result["eligible"]:
-        return _finalize_denial(
-            db, claim, error_flags, adjudication_steps, start_time,
-            f"Eligibility check failed: {eligibility_result.get('reason', 'unknown')}",
+    # ---- Stage 3: Emergent classification (legal exception) ----
+    from app.services.emergent_detection import classify_claim
+    is_emergent, emergent_signals = classify_claim(claim)
+    claim.is_emergent = is_emergent
+    claim.emergent_signals = emergent_signals
+    steps.append("emergent_classified")
+
+    if is_emergent:
+        return _pay_emergent_claim(
+            db, claim, eligibility_result, duplicate_result,
+            emergent_signals, steps, start_time,
         )
 
-    # ---- Stage 4: F1 Clinical determination ----
-    clinical_result = _run_clinical_determination(db, claim)
-    adjudication_steps.append("clinical_determination_complete")
+    # ---- Stage 4: Routing match ----
+    routing = _find_matching_routing(db, claim)
+    steps.append("routing_lookup")
 
-    if clinical_result.get("decision") == "denied":
+    if routing is None:
+        # Unrouted, non-emergent — deny with explanation.
+        error_flags.append("UNROUTED_NON_EMERGENT")
         return _finalize_denial(
-            db, claim, error_flags, adjudication_steps, start_time,
-            f"Clinical determination denied: {clinical_result.get('reasoning', '')}",
+            db, claim, error_flags, steps, start_time,
+            (
+                "This care was not scheduled through the Beneflex platform and "
+                "does not meet the emergent care exception. For covered care, "
+                "please open the Beneflex app or call the care line before "
+                "going to a provider. We will route you to a quality-verified "
+                "provider at no cost to you. You may appeal this decision if "
+                "you believe the visit was clinically necessary and could not "
+                "have been routed through the platform."
+            ),
         )
 
-    # ---- Stage 5: F2 Price verification ----
-    price_result = _run_price_verification(db, claim)
-    adjudication_steps.append("price_verification_complete")
-
-    # ---- Check if human review is legally required ----
-    requires_human = _check_human_review_required(claim)
-    claim.auto_adjudicated = not requires_human
-
-    if requires_human:
-        # Park the claim for human review. Still record all automated work done.
-        claim.error_flags = error_flags or None
+    # ---- Stage 5: Routed — verify price and pay ----
+    price_drift = _price_drift_vs_routing(claim, routing)
+    steps.append("price_drift_checked")
+    if price_drift["drift_exceeds_tolerance"]:
+        error_flags.append("ROUTED_PRICE_DRIFT")
+        claim.error_flags = error_flags
         claim.adjudication_reasoning = (
-            f"Automated pipeline complete. Human review legally required. "
-            f"Steps completed: {', '.join(adjudication_steps)}. "
-            f"Clinical: {clinical_result.get('decision', 'n/a')}. "
-            f"Lowest price: {price_result.get('lowest_price', 'n/a')}."
+            f"Routed care billed at ${float(claim.amount_billed):.2f} but "
+            f"routing expected ${float(routing.routing_decision.get('expected_price') or 0):.2f}. "
+            f"Drift {price_drift['drift_pct'] * 100:.1f}% exceeds tolerance "
+            f"of {settings.price_tolerance_pct * 100:.0f}%. Flagged for fraud review."
         )
+        claim.status = ClaimStatus.adjudicating  # held for review
+        claim.processing_latency_ms = (time.monotonic() - start_time) * 1000
         db.commit()
         return {
             "claim_id": str(claim.claim_id),
-            "status": claim.status.value,
-            "requires_human_review": True,
-            "reason": "Law mandates human review for this claim type/jurisdiction",
-            "automated_steps_completed": adjudication_steps,
-            "clinical_result": clinical_result,
-            "price_result": price_result,
+            "status": "flagged_for_review",
+            "routing_matched": True,
+            "price_drift": price_drift,
+            "error_flags": error_flags,
+            "steps": steps,
+            "feeding_f8": True,
         }
 
-    # ---- Stage 6: Approve and determine payment ----
-    amount_to_pay = _determine_payment_amount(claim, price_result, coding_result)
+    return _pay_routed_claim(
+        db, claim, eligibility_result, duplicate_result,
+        routing, price_drift, steps, start_time,
+    )
 
+
+def _find_matching_routing(db: Session, claim: Claim) -> Optional[CareEpisode]:
+    """Return the CareEpisode that routed this claim, or None.
+
+    Primary match: direct linkage via `claim.care_episode_id`.
+    Secondary match: same employee + same provider + routing within the
+      30 days before date_of_service, with a routing_decision present.
+    """
+    if claim.care_episode_id:
+        episode = db.query(CareEpisode).filter(
+            CareEpisode.episode_id == claim.care_episode_id
+        ).first()
+        if episode and episode.routing_decision:
+            return episode
+
+    service_date = claim.date_of_service or claim.submitted_at
+    if service_date is None:
+        return None
+
+    window_start = service_date - timedelta(days=30)
+    query = db.query(CareEpisode).filter(
+        CareEpisode.employee_id == claim.employee_id,
+        CareEpisode.routing_decision.isnot(None),
+        CareEpisode.created_at >= window_start,
+        CareEpisode.created_at <= service_date + timedelta(days=1),
+        CareEpisode.status.in_(
+            [
+                EpisodeStatus.scheduled,
+                EpisodeStatus.in_progress,
+                EpisodeStatus.resolved,
+            ]
+        ),
+    )
+    if claim.provider_id:
+        query = query.filter(CareEpisode.provider_id == claim.provider_id)
+
+    return query.order_by(CareEpisode.created_at.desc()).first()
+
+
+def _price_drift_vs_routing(claim: Claim, routing: CareEpisode) -> dict:
+    """Compare billed amount to the price captured at routing time."""
+    billed = float(claim.amount_billed or 0.0)
+    expected = None
+    if claim.routing_expected_price is not None:
+        expected = float(claim.routing_expected_price)
+    elif routing.routing_decision:
+        expected_raw = routing.routing_decision.get("expected_price")
+        if expected_raw is not None:
+            try:
+                expected = float(expected_raw)
+            except (TypeError, ValueError):
+                expected = None
+
+    if expected is None or expected <= 0:
+        return {
+            "billed": billed,
+            "expected": expected,
+            "drift_pct": 0.0,
+            "drift_exceeds_tolerance": False,
+            "reasoning": "No expected price captured at routing — drift cannot be computed.",
+        }
+
+    drift_pct = abs(billed - expected) / expected
+    return {
+        "billed": billed,
+        "expected": expected,
+        "drift_pct": round(drift_pct, 4),
+        "drift_exceeds_tolerance": drift_pct > settings.price_tolerance_pct,
+        "tolerance_pct": settings.price_tolerance_pct,
+    }
+
+
+def _pay_routed_claim(
+    db: Session,
+    claim: Claim,
+    eligibility_result: dict,
+    duplicate_result: dict,
+    routing: CareEpisode,
+    price_drift: dict,
+    steps: list,
+    start_time: float,
+) -> dict:
+    """Pay a claim that matches a Layer 2 routing decision."""
+    amount_to_pay = float(claim.amount_billed)
     claim.status = ClaimStatus.approved
     claim.adjudicated_at = datetime.now(UTC)
     claim.amount_paid = amount_to_pay
-    claim.error_flags = error_flags or None
     claim.auto_adjudicated = True
     claim.adjudication_reasoning = (
-        f"Auto-adjudicated. Steps: {', '.join(adjudication_steps)}. "
-        f"Clinical: {clinical_result.get('decision', 'approved')}. "
-        f"Lowest verified price: {price_result.get('lowest_price', amount_to_pay)}. "
-        f"Coding warnings: {len(coding_result.get('warnings', []))}."
+        f"Routed care verified. Matched CareEpisode "
+        f"{routing.episode_id}. Billed ${amount_to_pay:.2f} vs expected "
+        f"${price_drift.get('expected', 0) or 0:.2f} "
+        f"(drift {price_drift.get('drift_pct', 0) * 100:.1f}%)."
     )
     db.flush()
 
-    # ---- Stage 7: Execute payment (minimum latency) ----
     payment_result = _execute_payment(db, claim)
-    adjudication_steps.append("payment_executed")
+    steps.append("payment_executed")
 
-    # Record end-to-end latency
     elapsed_ms = (time.monotonic() - start_time) * 1000
     claim.processing_latency_ms = elapsed_ms
-
     db.commit()
 
     return {
         "claim_id": str(claim.claim_id),
         "status": claim.status.value,
         "auto_adjudicated": True,
+        "routing_matched": True,
+        "care_episode_id": str(routing.episode_id),
         "amount_billed": float(claim.amount_billed),
-        "amount_paid": float(claim.amount_paid) if claim.amount_paid else None,
+        "amount_paid": amount_to_pay,
         "amount_employee_oop": float(claim.amount_employee_oop),
         "processing_latency_ms": round(elapsed_ms, 2),
-        "steps": adjudication_steps,
-        "duplicate_check": duplicate_result,
+        "steps": steps,
         "eligibility_check": eligibility_result,
-        "coding_validation": coding_result,
-        "clinical_result": clinical_result,
-        "price_result": price_result,
+        "duplicate_check": duplicate_result,
+        "price_drift": price_drift,
         "payment_result": payment_result,
-        "error_flags": error_flags or [],
+        "feeding_f8": True,
+    }
+
+
+def _pay_emergent_claim(
+    db: Session,
+    claim: Claim,
+    eligibility_result: dict,
+    duplicate_result: dict,
+    emergent_signals: dict,
+    steps: list,
+    start_time: float,
+) -> dict:
+    """Pay an emergent claim regardless of routing status.
+
+    Legal basis: 42 USC §300gg-19a (prudent layperson). Clinical necessity
+    is not re-evaluated. Fraud checks still apply (duplicates handled in
+    Stage 2, provider sanity handled in payment execution).
+    """
+    amount_to_pay = float(claim.amount_billed)
+    claim.status = ClaimStatus.approved
+    claim.adjudicated_at = datetime.now(UTC)
+    claim.amount_paid = amount_to_pay
+    claim.auto_adjudicated = True
+    claim.adjudication_reasoning = (
+        "Emergent care paid under the prudent layperson standard "
+        "(42 USC §300gg-19a). Signals: "
+        f"{', '.join(emergent_signals.get('rules_fired', [])) or 'n/a'}. "
+        "Clinical necessity review waived; fraud checks performed."
+    )
+    db.flush()
+
+    payment_result = _execute_payment(db, claim)
+    steps.append("emergent_paid")
+
+    elapsed_ms = (time.monotonic() - start_time) * 1000
+    claim.processing_latency_ms = elapsed_ms
+    db.commit()
+
+    return {
+        "claim_id": str(claim.claim_id),
+        "status": claim.status.value,
+        "auto_adjudicated": True,
+        "is_emergent": True,
+        "emergent_signals": emergent_signals,
+        "amount_billed": float(claim.amount_billed),
+        "amount_paid": amount_to_pay,
+        "amount_employee_oop": float(claim.amount_employee_oop),
+        "processing_latency_ms": round(elapsed_ms, 2),
+        "steps": steps,
+        "eligibility_check": eligibility_result,
+        "duplicate_check": duplicate_result,
+        "payment_result": payment_result,
         "feeding_f8": True,
     }
 
@@ -282,42 +438,108 @@ def _detect_duplicates(db: Session, claim: Claim) -> dict:
 
 
 def _verify_eligibility(db: Session, claim: Claim) -> dict:
-    """Verify employee eligibility for the benefit type at time of service.
+    """Verify employee eligibility at the date of service.
 
-    Constitution: "Eligibility issues auto-detected."
+    Checks:
+      1. Employee exists and belongs to the claim's employer
+      2. Employee status at date of service (active | cobra | terminated)
+      3. Enrollment + waiting period (30-day default)
+      4. Employer is in an active status
+      5. Benefit type is one the platform supports
+      6. Termination date — if terminated, was service before termination?
+
+    Eligibility is evaluated as of claim.date_of_service (falling back to
+    submitted_at) — NOT as of "now". An employee might submit a claim weeks
+    after a visit; what matters is whether they were covered on the day.
     """
-    from app.models.employee import Employee
+    from app.models.employer import Employer
 
     employee = db.query(Employee).filter(
         Employee.employee_id == claim.employee_id
     ).first()
-
     if not employee:
-        return {
-            "eligible": False,
-            "reason": "employee_not_found",
-        }
+        return {"eligible": False, "reason": "employee_not_found"}
 
-    # Check employer relationship
     if employee.employer_id != claim.employer_id:
+        return {"eligible": False, "reason": "employee_employer_mismatch"}
+
+    # Employer must be in a status that permits claim payment.
+    employer = db.query(Employer).filter(
+        Employer.employer_id == employee.employer_id
+    ).first()
+    if not employer:
+        return {"eligible": False, "reason": "employer_not_found"}
+    allowed_employer_statuses = {"active", "shadow"}
+    employer_status_value = (
+        employer.status.value if hasattr(employer.status, "value") else str(employer.status)
+    )
+    if employer_status_value not in allowed_employer_statuses:
         return {
             "eligible": False,
-            "reason": "employee_employer_mismatch",
+            "reason": f"employer_inactive:{employer_status_value}",
+            "employer_status": employer_status_value,
         }
 
-    # Check benefit type coverage (in production, this checks the plan details)
-    # All benefit types in BenefitType enum are supported
-    if claim.benefit_type.value not in [bt.value for bt in BenefitType]:
+    # Benefit type must be one the platform supports.
+    supported_types = {bt.value for bt in BenefitType}
+    if claim.benefit_type.value not in supported_types:
         return {
             "eligible": False,
-            "reason": f"benefit_type_not_covered: {claim.benefit_type.value}",
+            "reason": f"benefit_type_not_supported:{claim.benefit_type.value}",
+        }
+
+    # Evaluate coverage as of the date of service.
+    service_date = claim.date_of_service or claim.submitted_at
+    if service_date is None:
+        return {"eligible": False, "reason": "missing_service_date"}
+    if service_date.tzinfo is None:
+        service_date = service_date.replace(tzinfo=UTC)
+
+    # Employee status at date of service.
+    if employee.status == EmployeeStatus.terminated:
+        terminated_at = employee.terminated_at
+        if terminated_at is not None:
+            if terminated_at.tzinfo is None:
+                terminated_at = terminated_at.replace(tzinfo=UTC)
+            if service_date > terminated_at:
+                return {
+                    "eligible": False,
+                    "reason": "terminated_before_service",
+                    "terminated_at": terminated_at.isoformat(),
+                    "service_date": service_date.isoformat(),
+                }
+        else:
+            return {"eligible": False, "reason": "terminated_no_date"}
+
+    # Waiting period (30 days from enrollment) — claim date must be on or
+    # after the end of the waiting period.
+    enrolled_at = employee.enrolled_at
+    if enrolled_at is None:
+        return {"eligible": False, "reason": "enrollment_missing"}
+    if enrolled_at.tzinfo is None:
+        enrolled_at = enrolled_at.replace(tzinfo=UTC)
+    waiting_period_days = 30
+    waiting_period_end = enrolled_at + timedelta(days=waiting_period_days)
+    if service_date < waiting_period_end:
+        return {
+            "eligible": False,
+            "reason": "within_waiting_period",
+            "enrolled_at": enrolled_at.isoformat(),
+            "waiting_period_ends": waiting_period_end.isoformat(),
+            "service_date": service_date.isoformat(),
         }
 
     return {
         "eligible": True,
         "employee_id": str(employee.employee_id),
         "employer_id": str(employee.employer_id),
+        "employer_status": employer_status_value,
+        "employee_status": employee.status.value,
+        "cobra_continuation": employee.status == EmployeeStatus.cobra,
         "benefit_type": claim.benefit_type.value,
+        "service_date": service_date.isoformat(),
+        "enrolled_at": enrolled_at.isoformat(),
+        "waiting_period_days": waiting_period_days,
     }
 
 

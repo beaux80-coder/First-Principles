@@ -983,7 +983,11 @@ def _select_provider_for_episode(
     condition: str,
     benefit_type: str,
 ) -> dict:
-    """Select provider via F4 for initial episode."""
+    """Select a provider via F4 certification-first selection.
+
+    The engine picks the cheapest certified provider that meets the
+    convenience threshold for the episode's clinical urgency.
+    """
     try:
         from app.services.provider_selection import select_provider
         result = select_provider(
@@ -998,7 +1002,8 @@ def _select_provider_for_episode(
             return {
                 "provider_id": provider.get("provider_id"),
                 "provider_name": provider.get("provider_name"),
-                "quality_score": provider.get("quality_score"),
+                "npi": provider.get("npi"),
+                "distance_miles": provider.get("distance_miles"),
                 "price": selection.get("selected_price"),
                 "source": "F4_provider_selection",
             }
@@ -1008,7 +1013,7 @@ def _select_provider_for_episode(
     return {
         "provider_id": None,
         "provider_name": None,
-        "note": "Provider selection pending — no providers in database yet",
+        "note": "Provider selection pending — no certified providers found",
         "source": "pending",
     }
 
@@ -1019,16 +1024,11 @@ def _select_provider_for_chain_item(
     condition: str,
     episode: CareEpisode,
 ) -> dict:
-    """Select provider for a referral chain item (imaging, lab, specialist)."""
-    # Map chain item types to provider types for F4
-    type_map = {
-        "imaging": "hospital",
-        "lab": "lab",
-        "specialist_referral": "physician",
-        "referral": "physician",
-    }
-    provider_type = type_map.get(item_type, "physician")
+    """Select a provider for a referral chain item (imaging, lab, specialist).
 
+    Uses the same certification-first select_provider call as the primary
+    episode selection, scoped to the parent episode's benefit type.
+    """
     try:
         from app.services.provider_selection import select_provider
         result = select_provider(
@@ -1043,7 +1043,7 @@ def _select_provider_for_chain_item(
             return {
                 "provider_id": provider.get("provider_id"),
                 "provider_name": provider.get("provider_name"),
-                "quality_score": provider.get("quality_score"),
+                "npi": provider.get("npi"),
                 "source": "F4_provider_selection",
             }
     except Exception as e:

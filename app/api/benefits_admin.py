@@ -73,12 +73,24 @@ class CobraRequest(BaseModel):
 
 
 class PlanConfigRequest(BaseModel):
-    """Plan configuration request."""
+    """Plan configuration request — administrative parameters only.
+
+    The Beneflex coverage policy is universal. Employers cannot toggle
+    individual benefit types, add per-plan exclusions, or change the
+    scope of covered services. This endpoint accepts only administrative
+    parameters (plan year, waiting period, eligibility rules). Any
+    attempt to pass coverage-scoping keys (benefit_types_enabled,
+    coverage_exclusions, fertility_coverage, etc.) is rejected with a
+    400 error.
+    """
     employer_id: str = Field(description="Employer UUID")
     plan_config: dict = Field(
         description=(
-            "Plan configuration: benefit_types_enabled, plan_year_start, "
-            "waiting_period_days, eligibility_rules, contribution_strategy"
+            "Administrative plan configuration. Supported keys: "
+            "plan_year_start (str), waiting_period_days (int), "
+            "eligibility_rules (dict with min_hours_per_week and "
+            "employee_classes). Coverage scope is the universal "
+            "policy and cannot be configured here."
         )
     )
 
@@ -156,12 +168,19 @@ def manage_cobra(request: CobraRequest, db: Session = Depends(get_db)):
 
 @router.post("/plan-config")
 def configure_plan(request: PlanConfigRequest, db: Session = Depends(get_db)):
-    """Employer plan configuration.
+    """Employer plan configuration — administrative parameters only.
 
-    Constitution: "Standard benefits admin: plan configuration."
+    Configure administrative plan parameters: plan year start,
+    waiting period, and eligibility rules (min hours per week and
+    employee classes).
 
-    Configure benefit plan parameters including enabled benefit types,
-    plan year, waiting periods, and eligibility rules.
+    Coverage scope is NOT configurable. Every employer is bound by
+    the universal Beneflex coverage policy: all services that are
+    medically necessary per evidence-based clinical guidelines are
+    covered, with only two narrow exclusions (cosmetic with no
+    medical indication, experimental with no evidence base). The
+    response body includes the full universal policy statement for
+    transparency.
     """
     from app.services.benefits_admin import configure_plan as _configure
 

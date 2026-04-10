@@ -443,85 +443,125 @@ def configure_plan(
     employer_id: uuid.UUID,
     plan_config: dict,
 ) -> dict:
-    """Employer plan configuration.
+    """Employer plan configuration — administrative parameters only.
 
-    Constitution: "Standard benefits admin: plan configuration."
+    The Beneflex coverage policy is UNIVERSAL. Every employer on the
+    platform is bound by the same rules:
 
-    Allows employers to configure their benefit plan parameters.
-    Under beneflex, many traditional plan design elements are simplified
-    because there is zero employee cost-sharing.
+      The plan covers every service that is medically necessary per
+      evidence-based clinical guidelines. The only exclusions are
+      (1) cosmetic services with no medical indication and
+      (2) experimental/investigational services with no peer-reviewed
+      evidence base. If the system is uncertain, it approves.
 
-    Args:
-        db: Database session
-        employer_id: Employer UUID
-        plan_config: Dict with plan configuration:
-            - benefit_types_enabled: list of enabled benefit types
-            - plan_year_start: Plan year start date
-            - waiting_period_days: New hire waiting period
-            - eligibility_rules: Eligibility criteria
-            - contribution_strategy: Employer contribution approach
+    There are NO employer-level coverage toggles, NO optional benefit
+    packages, NO tiered plans, NO per-employer exclusion categories.
+    Whatever this function returns, the coverage scope is identical for
+    every employer.
+
+    What this function DOES let an employer configure:
+      • plan_year_start   — effective date of the plan year (admin/HR)
+      • waiting_period_days — new-hire waiting period (bounded by law)
+      • eligibility_rules — which employees qualify (min hours, classes)
+
+    What this function explicitly REJECTS:
+      • benefit_types_enabled, covered_benefit_types, opted_out_benefits
+      • coverage_exclusions, excluded_services, excluded_categories
+      • plan_tier, coverage_level, plan_design options
+      • anything ending in _opt_in, _opt_out, _toggle, _included,
+        _excluded, or similar
+
+    Passing any of the rejected keys in `plan_config` raises ValueError
+    so that an integration bug cannot silently degrade coverage for a
+    specific employer.
     """
+    from app.services.coverage_policy import get_universal_policy_statement
+
     employer = _get_employer_or_raise(db, employer_id)
 
-    benefit_types_enabled = plan_config.get(
-        "benefit_types_enabled", ALL_BENEFIT_TYPES
-    )
+    # Hard reject: coverage-scoping keys that would imply per-employer
+    # coverage differences. The universal policy has zero of these.
+    FORBIDDEN_KEYS = {
+        "benefit_types_enabled",
+        "covered_benefit_types",
+        "opted_out_benefits",
+        "coverage_exclusions",
+        "excluded_services",
+        "excluded_categories",
+        "service_exclusions",
+        "exclusion_list",
+        "plan_tier",
+        "coverage_level",
+        "coverage_options",
+        "fertility_coverage",
+        "bariatric_coverage",
+        "gender_affirming_coverage",
+        "glp1_coverage",
+        "mental_health_toggle",
+        "optional_benefits",
+    }
+    invalid_keys = sorted(k for k in plan_config.keys() if k in FORBIDDEN_KEYS)
+    if invalid_keys:
+        raise ValueError(
+            "Employer-level coverage toggles are not supported. The "
+            "Beneflex coverage policy is universal: every employer is "
+            "bound by the same rules, and per-employer coverage "
+            "differences cannot be configured. Offending keys: "
+            f"{invalid_keys}. See coverage_policy.get_universal_policy_"
+            "statement() for the policy document."
+        )
+
     plan_year_start = plan_config.get(
         "plan_year_start", datetime.now(UTC).strftime("%Y-01-01")
     )
-    waiting_period_days = plan_config.get("waiting_period_days", 0)
+    waiting_period_days = int(plan_config.get("waiting_period_days", 0))
     eligibility_rules = plan_config.get("eligibility_rules", {
         "min_hours_per_week": 30,
         "employee_classes": ["full_time", "part_time"],
     })
-    contribution_strategy = plan_config.get("contribution_strategy", {
-        "employer_pays": "100%",
-        "employee_contribution": "$0.00",
-    })
 
-    # Validate all requested benefit types exist
-    valid_types = []
-    for bt_str in benefit_types_enabled:
-        try:
-            BenefitType(bt_str)
-            valid_types.append(bt_str)
-        except ValueError:
-            logger.warning(f"Unknown benefit type in plan config: {bt_str}")
+    # Every employer's coverage scope is the universal policy. No
+    # employer input changes this — it's a constant returned for
+    # transparency and audit.
+    universal_policy = get_universal_policy_statement()
 
-    # Store configuration (in production, this would be a dedicated PlanConfig model)
-    # For now, we note the configuration is accepted
     config_record = {
         "employer_id": str(employer_id),
         "configured_at": datetime.now(UTC).isoformat(),
 
-        "plan_configuration": {
+        "plan_administration": {
             "plan_year_start": plan_year_start,
-            "benefit_types_enabled": valid_types,
-            "all_7_types_available": len(valid_types) == len(ALL_BENEFIT_TYPES),
             "waiting_period_days": waiting_period_days,
             "eligibility_rules": eligibility_rules,
-            "contribution_strategy": contribution_strategy,
         },
 
-        "beneflex_plan_design": {
-            "employee_cost_sharing": {
-                "deductible": "$0",
-                "copays": "$0",
-                "coinsurance": "0%",
-                "out_of_pocket_max": "$0",
-                "premium_contribution": "$0",
-                "constitutional_guarantee": (
-                    "Zero employee cost-sharing. The employer pays the "
-                    "pass-through cost plus value-share fee. Employees "
-                    "pay nothing."
-                ),
-            },
-            "rate_structure": {
-                "component_1": "Pass-through (care delivery + stop-loss + regulatory)",
-                "component_2": "Value-share fee (% of verified savings)",
-                "total_components": 2,
-                "hidden_fees": "$0",
-            },
+        "coverage_policy": universal_policy,
+
+        "covered_benefit_types": ALL_BENEFIT_TYPES,
+        "covered_benefit_types_note": (
+            "All 7 benefit types (health, dental, vision, life, STD, "
+            "LTD, mental_health) are covered for every employee in "
+            "every employer group. This list cannot be shortened."
+        ),
+
+        "employer_cost_sharing": {
+            "employee_deductible": "$0",
+            "employee_copays": "$0",
+            "employee_coinsurance": "0%",
+            "employee_out_of_pocket_max": "$0",
+            "employee_premium_contribution": "$0",
+            "constitutional_guarantee": (
+                "Zero employee cost-sharing. The employer pays the "
+                "pass-through cost plus value-share fee. Employees "
+                "pay nothing."
+            ),
+        },
+
+        "rate_structure": {
+            "component_1": "Pass-through (care delivery + stop-loss + regulatory)",
+            "component_2": "Value-share fee (% of verified savings)",
+            "total_components": 2,
+            "hidden_fees": "$0",
         },
 
         "compliance": {
