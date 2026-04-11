@@ -24,6 +24,10 @@ class Settings(BaseSettings):
     # Encryption key for PII/PHI fields (maps to AWS KMS in Phase 4)
     encryption_key: str = ""
 
+    # Anthropic API key for the clinical determination testing harness.
+    # Used only by `tests/harness/` — not by the production engine.
+    anthropic_api_key: str = ""
+
     # ---- Care Orchestration Engine parameters ----
     # Provider selection is certification-first: the engine does not rank
     # certified providers by a quality score or confidence interval. If a

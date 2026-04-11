@@ -415,6 +415,131 @@ def _is_category_iii_cpt(code: str) -> bool:
     return code[:4].isdigit()
 
 
+# Keywords in the patient's condition, symptoms, or diagnoses that
+# indicate the visit purpose is cosmetic or non-medical. These are
+# checked ONLY when the CPT code is not already on the cosmetic list
+# (Path B). A match means the engine found cosmetic intent in the
+# visit purpose; the exclusion then fires unless a medical indication
+# is also present.
+#
+# Deliberately narrow: we only flag clearly cosmetic language so that
+# ambiguous visits default to covered (uncertainty → approve).
+COSMETIC_PURPOSE_KEYWORDS: tuple[str, ...] = (
+    "cosmetic",
+    "aesthetic",
+    "beautification",
+    "appearance only",
+    "appearance enhancement",
+    "elective cosmetic",
+    "cosmetic consultation",
+    "cosmetic evaluation",
+    "cosmetic procedure",
+    "cosmetic surgery",
+    "cosmetic treatment",
+    "wrinkle",
+    "anti-aging",
+    "antiaging",
+    "botox cosmetic",
+    "filler cosmetic",
+    "liposuction cosmetic",
+    "nose job",
+    "face lift",
+    "facelift",
+    "tummy tuck",
+    "breast augmentation cosmetic",
+    "body contouring cosmetic",
+    "hair removal cosmetic",
+    "teeth whitening",
+    "tooth whitening",
+    "smile makeover",
+    "vanity",
+)
+
+# Keywords that indicate the visit has a medical purpose even if
+# cosmetic language is also present. If any of these appear alongside
+# a cosmetic keyword, the visit is NOT excluded (the medical indication
+# overrides the cosmetic signal).
+MEDICAL_OVERRIDE_KEYWORDS: tuple[str, ...] = (
+    "pain",
+    "obstruction",
+    "breathing",
+    "infection",
+    "trauma",
+    "cancer",
+    "tumor",
+    "burn",
+    "reconstruction",
+    "congenital",
+    "deformity",
+    "functional",
+    "impairment",
+    "disability",
+    "nerve",
+    "neuropathy",
+    "sleep apnea",
+    "vision loss",
+    "visual field",
+    "ptosis",
+    "ectropion",
+    "entropion",
+    "lymphedema",
+    "lipedema",
+    "gender affirmation",
+    "gender affirming",
+    "gender dysphoria",
+    "mastectomy",
+    "post-surgical",
+    "postsurgical",
+    "cleft",
+    "scar",
+    "scarring",
+    "disfigurement",
+    "medically necessary",
+)
+
+
+def _visit_purpose_is_cosmetic(
+    *,
+    condition: Optional[str],
+    patient_symptoms: Optional[list[str]],
+    patient_history: Optional[dict],
+) -> tuple[bool, list[str]]:
+    """Determine whether the visit's stated purpose is cosmetic/non-medical.
+
+    Returns (is_cosmetic, signals) where `signals` is the list of cosmetic
+    keywords that matched. Returns (False, []) if no cosmetic language is
+    found, or if medical-override keywords are also present (meaning the
+    visit has a medical component that protects it from exclusion).
+    """
+    condition_text = (condition or "").lower()
+    symptoms_text = " ".join(str(s).lower() for s in (patient_symptoms or []))
+    diagnoses_text = " ".join(
+        str(d).lower() for d in ((patient_history or {}).get("diagnoses") or [])
+    )
+
+    haystack = " ".join([condition_text, symptoms_text, diagnoses_text])
+    if not haystack.strip():
+        return False, []
+
+    # Check for cosmetic keywords
+    matched_cosmetic: list[str] = []
+    for kw in COSMETIC_PURPOSE_KEYWORDS:
+        if kw in haystack:
+            matched_cosmetic.append(kw)
+
+    if not matched_cosmetic:
+        return False, []
+
+    # Check for medical overrides — any medical keyword present means the
+    # visit has a medical component and should NOT be excluded.
+    for kw in MEDICAL_OVERRIDE_KEYWORDS:
+        if kw in haystack:
+            return False, []
+
+    return True, matched_cosmetic
+
+
+
 def _medical_indication_present(
     indications: list[str],
     patient_symptoms: list[str],
@@ -485,6 +610,21 @@ def evaluate_universal_exclusions(
     }
 
     # ---- Exclusion 1: Cosmetic with no medical indication ----
+    #
+    # Two detection paths:
+    #   Path A: The CPT code itself is on the COSMETIC_PROCEDURES list.
+    #   Path B: The CPT code is a generic service code (e.g., an E/M
+    #           office visit like 99213) but the patient's stated reason
+    #           for the visit is purely cosmetic. A standard office visit
+    #           used for a cosmetic consultation, an employment physical
+    #           unrelated to a health concern, or any non-medical purpose
+    #           is evaluated against the cosmetic exclusion based on the
+    #           visit's stated purpose — not just the CPT code.
+    #
+    # In both paths, the exclusion is overridden if any medical
+    # indication is present in the patient context.
+
+    # Path A: CPT code is explicitly cosmetic
     cosmetic_info = COSMETIC_PROCEDURES.get(service_code)
     if cosmetic_info is not None:
         indications = cosmetic_info["medical_indications"]
@@ -493,6 +633,7 @@ def evaluate_universal_exclusions(
         )
         signals["cosmetic_classification"] = {
             "listed_as_cosmetic": True,
+            "detection_path": "cpt_code",
             "description": cosmetic_info["description"],
             "matched_indications": matched,
         }
@@ -515,6 +656,39 @@ def evaluate_universal_exclusions(
                 "signals": signals,
             }
         # Medical indication present → NOT excluded. Fall through.
+
+    # Path B: Generic code but the visit purpose is cosmetic
+    # This catches the case where a standard office visit (99213, etc.)
+    # or other generic procedure code is used for a non-medical purpose.
+    if cosmetic_info is None:
+        purpose_is_cosmetic, cosmetic_purpose_signals = _visit_purpose_is_cosmetic(
+            condition=condition,
+            patient_symptoms=patient_symptoms,
+            patient_history=patient_history,
+        )
+        if purpose_is_cosmetic:
+            signals["cosmetic_classification"] = {
+                "listed_as_cosmetic": False,
+                "detection_path": "visit_purpose",
+                "cosmetic_purpose_signals": cosmetic_purpose_signals,
+            }
+            return {
+                "is_excluded": True,
+                "category": "cosmetic_no_indication",
+                "reasoning": (
+                    f"Service {service_code} is a standard procedure code, "
+                    f"but the stated purpose of the visit is cosmetic or "
+                    f"non-medical ({', '.join(cosmetic_purpose_signals[:3])}). "
+                    f"No medical indication was found in the patient's "
+                    f"symptoms, diagnoses, or risk factors. Under the "
+                    f"universal coverage policy, services performed for a "
+                    f"purely cosmetic or non-medical purpose are excluded "
+                    f"regardless of the billing code used. Coverage is "
+                    f"available if a medical indication is documented."
+                ),
+                "policy_version": POLICY_VERSION,
+                "signals": signals,
+            }
 
     # ---- Exclusion 2: Experimental with no peer-reviewed evidence base ----
     is_category_iii = _is_category_iii_cpt(service_code)

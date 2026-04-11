@@ -138,6 +138,110 @@ class TestCosmeticExclusion:
         )
 
 
+class TestCosmeticVisitPurposeDetection:
+    """Path B: generic CPT code (office visit, etc.) used for a cosmetic
+    or non-medical purpose. The cosmetic exclusion fires based on the
+    visit's stated purpose, not just the billing code."""
+
+    def test_office_visit_for_cosmetic_consultation_is_excluded(self):
+        """The exact bug from the harness: 99213 for cosmetic consultation."""
+        from app.services.coverage_policy import evaluate_universal_exclusions
+        result = evaluate_universal_exclusions(
+            service_code="99213",
+            condition="cosmetic consultation",
+            patient_symptoms=["wants cosmetic evaluation"],
+            patient_history={"diagnoses": ["cosmetic concerns"]},
+            matched_guidelines_count=1,
+        )
+        assert result["is_excluded"] is True
+        assert result["category"] == "cosmetic_no_indication"
+        assert result["signals"]["cosmetic_classification"]["detection_path"] == "visit_purpose"
+
+    def test_office_visit_for_real_medical_condition_is_not_excluded(self):
+        from app.services.coverage_policy import evaluate_universal_exclusions
+        result = evaluate_universal_exclusions(
+            service_code="99213",
+            condition="hypertension management",
+            patient_symptoms=["headache", "elevated blood pressure"],
+            patient_history={"diagnoses": ["hypertension"]},
+            matched_guidelines_count=1,
+        )
+        assert result["is_excluded"] is False
+
+    def test_cosmetic_purpose_with_medical_override_is_not_excluded(self):
+        """A visit that mentions cosmetic BUT also has a medical keyword
+        (pain, obstruction, trauma, etc.) is NOT excluded."""
+        from app.services.coverage_policy import evaluate_universal_exclusions
+        result = evaluate_universal_exclusions(
+            service_code="99213",
+            condition="cosmetic consultation for nasal obstruction",
+            patient_symptoms=["difficulty breathing"],
+            patient_history={"diagnoses": ["nasal obstruction"]},
+            matched_guidelines_count=0,
+        )
+        assert result["is_excluded"] is False
+
+    def test_teeth_whitening_consult_is_excluded(self):
+        from app.services.coverage_policy import evaluate_universal_exclusions
+        result = evaluate_universal_exclusions(
+            service_code="D0150",  # comprehensive oral evaluation
+            condition="teeth whitening consultation",
+            patient_symptoms=["wants whiter teeth"],
+            patient_history={"diagnoses": []},
+            matched_guidelines_count=0,
+        )
+        assert result["is_excluded"] is True
+        assert result["category"] == "cosmetic_no_indication"
+
+    def test_aesthetic_evaluation_is_excluded(self):
+        from app.services.coverage_policy import evaluate_universal_exclusions
+        result = evaluate_universal_exclusions(
+            service_code="99214",
+            condition="aesthetic evaluation for anti-aging treatment",
+            patient_symptoms=["wants anti-aging treatment"],
+            patient_history={"diagnoses": []},
+            matched_guidelines_count=1,
+        )
+        assert result["is_excluded"] is True
+
+    def test_cosmetic_with_gender_affirming_override_is_not_excluded(self):
+        """Gender-affirming care with cosmetic language is protected by
+        the medical override (gender affirmation keyword)."""
+        from app.services.coverage_policy import evaluate_universal_exclusions
+        result = evaluate_universal_exclusions(
+            service_code="99213",
+            condition="cosmetic surgery consultation for gender affirmation",
+            patient_symptoms=["gender dysphoria"],
+            patient_history={"diagnoses": ["gender dysphoria"]},
+            matched_guidelines_count=0,
+        )
+        assert result["is_excluded"] is False
+
+    def test_cosmetic_with_reconstruction_override_is_not_excluded(self):
+        from app.services.coverage_policy import evaluate_universal_exclusions
+        result = evaluate_universal_exclusions(
+            service_code="99213",
+            condition="cosmetic consultation for post-burn reconstruction",
+            patient_symptoms=["scarring from burn"],
+            patient_history={"diagnoses": ["burn reconstruction"]},
+            matched_guidelines_count=0,
+        )
+        assert result["is_excluded"] is False
+
+    def test_empty_condition_and_symptoms_not_excluded(self):
+        """If there's no condition or symptoms, we can't detect cosmetic
+        purpose — uncertainty → not excluded."""
+        from app.services.coverage_policy import evaluate_universal_exclusions
+        result = evaluate_universal_exclusions(
+            service_code="99213",
+            condition=None,
+            patient_symptoms=[],
+            patient_history={},
+            matched_guidelines_count=1,
+        )
+        assert result["is_excluded"] is False
+
+
 class TestExperimentalExclusion:
     def test_category_iii_code_with_no_guidelines_is_excluded(self):
         from app.services.coverage_policy import evaluate_universal_exclusions
